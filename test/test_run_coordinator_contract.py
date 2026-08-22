@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+import kiro_crew.run_coordinator.sqlite as sqlite_mod
+import kiro_crew.run_coordinator_anchor as anchor_mod
 from kiro_crew.run_coordinator import (
     CommandClaim,
     CommandOperation,
@@ -21,6 +24,7 @@ from kiro_crew.run_coordinator import (
     RunCoordinator,
     RunOutcome,
     RunRecord,
+    SQLiteRunCoordinator,
     SubmitRun,
 )
 
@@ -38,10 +42,17 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
-@pytest.fixture
-def coordinator(clock: FakeClock) -> RunCoordinator:
+@pytest.fixture(params=("memory", "sqlite"))
+def coordinator(
+    request: pytest.FixtureRequest,
+    clock: FakeClock,
+    tmp_path: Path,
+) -> RunCoordinator:
     ids = iter(("event-1", "event-2", "event-3"))
-    return MemoryRunCoordinator(clock=clock, id_factory=lambda: next(ids))
+    kwargs = {"clock": clock, "id_factory": lambda: next(ids)}
+    if request.param == "sqlite":
+        return SQLiteRunCoordinator(tmp_path / "coordinator.db", **kwargs)
+    return MemoryRunCoordinator(**kwargs)
 
 
 def _request(
@@ -49,6 +60,7 @@ def _request(
     run_id: str = "run-1",
     command_id: str = "command-1",
     idempotency_key: str = "key-1",
+    payload_json: str = '{"task":"compare the candidates","version":1}',
     payload_hash: str = "hash-1",
     accepted: bool = True,
     operation: CommandOperation = CommandOperation.SPAWN,
@@ -57,6 +69,7 @@ def _request(
         run_id=run_id,
         command_id=command_id,
         idempotency_key=idempotency_key,
+        payload_json=payload_json,
         payload_hash=payload_hash,
         parent_session="dashboard:parent",
         agent="researcher",
@@ -66,6 +79,107 @@ def _request(
         accepted=accepted,
         rejection_reason="governance denied" if not accepted else "",
     )
+
+
+def test_anchor_is_locked_down_before_payload_and_removed_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = tmp_path / "anchor"
+    anchored = tmp_path / "run-coordinator"
+    observed_payloads: list[bytes] = []
+
+    def fail_lockdown(path: Path) -> None:
+        observed_payloads.append(path.read_bytes())
+        raise OSError("lockdown failed")
+
+    monkeypatch.setattr(anchor_mod, "restrict_to_owner", fail_lockdown)
+
+    with pytest.raises(OSError, match="lockdown failed"):
+        anchor_mod._create_anchor(record, anchored)
+
+    assert observed_payloads == [b""]
+    assert not record.exists()
+
+
+@pytest.mark.asyncio
+async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing a supported data-home link must not split durable state."""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setattr(
+        sqlite_mod,
+        "canonical_run_coordinator_dir",
+        lambda: linked_home / "run-coordinator",
+    )
+    coordinator = SQLiteRunCoordinator()
+
+    created = await coordinator.submit(_request())
+    assert created.value is not None
+
+    linked_home.rename(tmp_path / "old-linked-home")
+    linked_home.mkdir()
+
+    assert await coordinator.get_run("run-1") == created.value.run
+    assert (real_home / "run-coordinator" / "coordinator.db").exists()
+    assert not (linked_home / "run-coordinator" / "coordinator.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_default_sqlite_path_survives_retarget_across_gateway_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable anchor must outlive the process-local path cache."""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    replacement_home = tmp_path / "replacement-home"
+    replacement_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.setattr(anchor_mod, "data_home", lambda: linked_home)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    first = anchor_mod.canonical_run_coordinator_dir()
+    assert first == real_home / "run-coordinator"
+
+    linked_home.unlink()
+    linked_home.symlink_to(replacement_home, target_is_directory=True)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert anchor_mod.canonical_run_coordinator_dir() == first
+    coordinator = SQLiteRunCoordinator()
+    created = await coordinator.submit(_request())
+
+    assert created.value is not None
+    assert (first / "coordinator.db").exists()
+    assert not (replacement_home / "run-coordinator" / "coordinator.db").exists()
+
+
+def test_default_real_home_needs_no_external_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary default path stays inside Kiro's protected data home."""
+    data_home = tmp_path / ".kiro" / "crew"
+    data_home.mkdir(parents=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setattr(anchor_mod, "data_home", lambda: data_home)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert anchor_mod.canonical_run_coordinator_dir() == data_home / "run-coordinator"
+    assert not anchor_mod.run_coordinator_anchor_dir().exists()
 
 
 async def _claimed_running(
@@ -109,6 +223,7 @@ async def test_submit_is_idempotent_and_detects_payload_conflicts(
     assert created.value.created is True
     assert created.value.run.run_id == "run-1"
     assert created.value.command.status is CommandStatus.PENDING
+    assert created.value.command.payload_json == _request().payload_json
 
     assert replay.decision is CoordinatorDecision.UNCHANGED
     assert replay.reason is CoordinatorReason.IDEMPOTENT_REPLAY
