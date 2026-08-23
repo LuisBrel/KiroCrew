@@ -6024,6 +6024,251 @@ class TestWindowsPathShapes:
         for cmd in cmds:
             assert is_sensitive_bash_command(cmd) is not None, cmd
 
+    def test_trailing_dot_and_space_segment_spellings_are_blocked(self) -> None:
+        # Win32 normalization strips trailing dots AND trailing spaces from a
+        # path segment, so ``kiro-cli.`` / ``kiro-cli `` resolve to the fenced
+        # ``kiro-cli`` while matching none of the literal branches (#5265).
+        # Both the home-anchored and the %APPDATA% alias branches leaked, so
+        # both are asserted.
+        cmds = [
+            # home-anchored, trailing dot on the fenced segment
+            "type 'C:\\Users\\u\\AppData\\Roaming\\kiro-cli.\\data.sqlite3'",
+            "type 'C:\\Users\\u\\.aws.\\credentials'",
+            # alias branches (cmd.exe and PowerShell spellings)
+            'del "%APPDATA%\\kiro-cli.\\data.sqlite3"',
+            'del "$env:APPDATA\\kiro-cli.\\data.sqlite3"',
+            # trailing dot on a NON-final segment of the fenced path
+            "type 'C:\\Users\\u\\AppData.\\Roaming\\kiro-cli\\data.sqlite3'",
+            # trailing dot on the anchor's fixed segment
+            "type 'C:\\Users.\\u\\.aws\\credentials'",
+            # trailing space spellings (stripped the same way as the dot)
+            "type 'C:\\Users\\u\\AppData\\Roaming\\kiro-cli \\data.sqlite3'",
+            'del "%APPDATA%\\kiro-cli \\data.sqlite3"',
+            # trailing space on the USERNAME segment — the anchor's own final
+            # segment, one to the right of the fixed-segment case above
+            # (found in review)
+            "type 'C:\\Users\\u \\.aws\\credentials'",
+            "echo x > 'C:\\Users\\u \\.kiro\\crew\\connections-tool-aliases.json'",
+            'copy evil.json "C:\\Users\\u \\.kiro\\agents\\evil.json"',
+            # trailing dot lands on the ANCHOR itself after variable expansion
+            # (found in review)
+            'type "%USERPROFILE%.\\.aws\\credentials"',
+            'del "%APPDATA%.\\kiro-cli\\data.sqlite3"',
+            'copy /Y evil.json "%KIRO_HOME%.\\agents\\evil.agent.json"',
+            # the AppData re-entry no-op with a re-spelled Roaming, and a
+            # trailing space on a traversal control segment (found in review)
+            'type "%APPDATA%\\..\\Roaming.\\kiro-cli\\data.sqlite3"',
+            "type 'C:\\Users\\u\\AppData\\junk\\.. \\Roaming\\kiro-cli\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_83_short_name_spellings_are_blocked(self) -> None:
+        # An 8.3 short name (filtered 6-char stem + ``~N``) resolves to the
+        # same long-named directory, so the short spelling names the fenced
+        # store without containing its literal text (#5265). Home-anchored and
+        # alias branches are both asserted, mirroring the measured leak.
+        cmds = [
+            # home-anchored
+            "type 'C:\\Users\\u\\AppData\\Roaming\\KIRO-C~1\\data.sqlite3'",
+            "type 'C:\\Users\\u\\AWS~1\\credentials'",
+            # collision tails beyond ~1 name the same class of entry
+            "type 'C:\\Users\\u\\AWS~2\\credentials'",
+            # alias branches (cmd.exe and PowerShell spellings)
+            'del "%APPDATA%\\KIRO-C~1\\data.sqlite3"',
+            'del "$env:APPDATA\\KIRO-C~1\\data.sqlite3"',
+            # short-name spelling of a NON-final segment of the fenced path
+            "type 'C:\\Users\\u\\APPDAT~1\\Roaming\\kiro-cli\\data.sqlite3'",
+            # short names are case-insensitive like every Windows branch
+            "type 'C:\\Users\\u\\appdata\\roaming\\kiro-c~1\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_normalization_allowances_do_not_widen_to_unfenced_paths(self) -> None:
+        # The trailing-[. ] run and the ~N alternation must not make an
+        # UNfenced path match: one negative per new form, per branch.
+        cmds = [
+            # trailing dot on a benign segment
+            "type 'C:\\Users\\u\\project.\\readme.md'",
+            # trailing space on the username segment of a benign path
+            "type 'C:\\Users\\u \\project\\readme.md'",
+            # trailing dot on the anchor of a benign remainder
+            'type "%APPDATA%.\\someapp\\config.txt"',
+            # benign 8.3 spellings, home-anchored and alias
+            "type 'C:\\Users\\u\\PROJEC~1\\readme.md'",
+            'type "%APPDATA%\\SOMEAP~1\\config.txt"',
+            # a tilde without digits is not a short name
+            "type 'C:\\Users\\u\\AppData\\Roaming\\kiro-c~x\\data.sqlite3'",
+            # a fenced name extended past the segment boundary stays a
+            # DIFFERENT entry, dot allowance or not
+            "type 'C:\\Users\\u\\.awsx\\credentials'",
+            "type 'C:\\Users\\u\\AppData\\Roaming\\kiro-cli.bak\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is None, cmd
+
+    def test_83_stem_substitutes_invalid_punctuation(self) -> None:
+        # RtlGenerate8dot3Name substitutes ``_`` for the 8.3-invalid
+        # punctuation rather than dropping it: ``foo+bar`` shortens to
+        # ``FOO_BA~1``, not ``FOOBAR~1``. No fenced constant carries these
+        # characters today; this pins the helper's contract so a future one
+        # does not re-open the bypass (found in review). Asserted
+        # BEHAVIOURALLY (does the pattern accept/reject the spelling) rather
+        # than on the exact regex string, so re-shaping the alternation
+        # cannot fail this test while the fence behaves identically.
+        import re as re_mod
+
+        from kiro_crew.security import _win_83_short_pattern
+
+        def matches(name: str, spelling: str) -> bool:
+            pat = _win_83_short_pattern(name)
+            assert pat is not None
+            return re_mod.fullmatch(pat, spelling, re_mod.IGNORECASE) is not None
+
+        assert matches("foo+bar", "FOO_BA~1")
+        assert not matches("foo+bar", "FOOBAR~1")
+        assert matches("a=b,c;d", "A_B_C_~2")
+        # dots and spaces are dropped, not substituted
+        assert matches("Application Support", "APPLIC~1")
+        assert not matches("Application Support", "APPLI_~1")
+        # the hash form (first 2 filtered chars + 4 hex + ~N) is a branch of
+        # every pattern; a non-hex middle is not
+        assert matches("kiro-cli", "KI0F3D~1")
+        assert not matches("kiro-cli", "KIZZZZ~1")
+
+    def test_83_hash_form_short_names_are_blocked(self) -> None:
+        # When ~4 truncated stems collide, RtlGenerate8dot3Name switches to
+        # the HASH form: first 2 filtered chars + 4 hex digits + ``~N``
+        # (``kiro-cli`` → ``KI0F3D~1``). A hash-form alias resolves to the
+        # same fenced store while matching neither the literal nor the
+        # plain-stem branch, so the shape must be fenced too (found in
+        # review). Home-anchored and alias branches both asserted, mirroring
+        # the plain-stem test above.
+        cmds = [
+            # home-anchored
+            "type 'C:\\Users\\u\\AppData\\Roaming\\KI0F3D~1\\data.sqlite3'",
+            "type 'C:\\Users\\u\\AW1A2B~1\\credentials'",
+            # collision tails beyond ~1 name the same class of entry
+            "type 'C:\\Users\\u\\AppData\\Roaming\\KI0F3D~2\\data.sqlite3'",
+            # alias branches (cmd.exe and PowerShell spellings)
+            'del "%APPDATA%\\KI0F3D~1\\data.sqlite3"',
+            'del "$env:APPDATA\\KI0F3D~1\\data.sqlite3"',
+            # hash-form spelling of a NON-final segment of the fenced path
+            "type 'C:\\Users\\u\\AP9C2E~1\\Roaming\\kiro-cli\\data.sqlite3'",
+            # hash forms are case-insensitive like every Windows branch
+            "type 'C:\\Users\\u\\appdata\\roaming\\ki0f3d~1\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_83_hash_form_does_not_widen_to_unfenced_names(self) -> None:
+        # The hash branch requires exactly 4 HEX digits between the 2-char
+        # prefix and the tilde: a same-prefix name whose middle is not hex is
+        # a DIFFERENT entry and must stay unfenced, per branch.
+        cmds = [
+            # Z is not a hex digit
+            "type 'C:\\Users\\u\\AppData\\Roaming\\KIZZZZ~1\\data.sqlite3'",
+            'del "%APPDATA%\\KIZZZZ~1\\data.sqlite3"',
+            # 3 hex digits, not 4
+            "type 'C:\\Users\\u\\AppData\\Roaming\\KI0F3~1\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is None, cmd
+
+    def test_localappdata_normalization_spellings_are_blocked(self) -> None:
+        # %LOCALAPPDATA% names the CURRENT kiro-cli store; its remainder
+        # segments must admit the same equivalent spellings as every other
+        # join site (plain 8.3, hash form, trailing dot) — this branch
+        # rendered its segments with re.escape alone and was blind to all of
+        # them (found in review).
+        cmds = [
+            'del "%LOCALAPPDATA%\\KIRO-C~1\\data.sqlite3"',
+            'del "%LOCALAPPDATA%\\KI0F3D~1\\data.sqlite3"',
+            'del "$env:LOCALAPPDATA\\KI0F3D~1\\data.sqlite3"',
+            'del "%LOCALAPPDATA%\\kiro-cli.\\data.sqlite3"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+        # a benign name under the same anchor stays unfenced
+        benign = 'del "%LOCALAPPDATA%\\SOMEAP~1\\config.txt"'
+        assert is_sensitive_bash_command(benign) is None, benign
+
+    def test_localappdata_anchor_pad_and_reentry_spellings_are_blocked(self) -> None:
+        # The %LOCALAPPDATA% ANCHOR itself must tolerate the trailing-run and
+        # re-entry spellings its %APPDATA% twin does — ``%LOCALAPPDATA%.\``
+        # strips back to the anchor and ``\..\Local.\`` is the anchor's
+        # canonical no-op in an equivalent spelling. Without the pad both
+        # reached the fenced store unmatched (found in review).
+        cmds = [
+            'del "%LOCALAPPDATA%.\\kiro-cli\\data.sqlite3"',
+            'del "%LOCALAPPDATA%\\..\\Local.\\kiro-cli\\data.sqlite3"',
+            'del "%LOCALAPPDATA%\\..\\LOCAL~1\\kiro-cli\\data.sqlite3"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_crew_variable_leaf_parent_spellings_are_blocked(self) -> None:
+        # The keystone variable-leaf branch anchors on the crew PARENT
+        # directory; its segments rendered with re.escape alone were blind to
+        # trailing-run and 8.3 spellings of that parent (found in review).
+        cmds = [
+            'type "%USERPROFILE%\\.kiro\\crew.\\%F%"',
+            'type "%USERPROFILE%\\.kiro.\\crew\\%F%"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_relative_traversal_spellings_are_blocked(self) -> None:
+        # The dot-slash traversal pass shares the declared root cause: its
+        # segment alternation compared literal text, so 8.3 and trailing-run
+        # spellings of the same stores walked through (found in review).
+        cmds = [
+            'cat "..\\..\\AWS~1\\credentials"',
+            'cat "..\\..\\.aws.\\credentials"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+        # a benign relative path with an 8.3-shaped but unfenced name stays
+        # unfenced
+        benign = 'cat "..\\..\\MYDATA~1\\notes.txt"'
+        assert is_sensitive_bash_command(benign) is None, benign
+
+    def test_long_segment_names_are_still_fenced(self) -> None:
+        # Any finite cap on a name run is attacker-defeatable by padding one
+        # character past it: a 65+-char username (or excursion segment)
+        # walked straight past the fence while shorter spellings were
+        # refused (found in review). Windows itself allows components up to
+        # 255 chars, so these are real, creatable names.
+        long_name = "u" * 80
+        cmds = [
+            f"type 'C:\\Users\\{long_name}\\.aws\\credentials'",
+            f"type 'C:\\Users\\u\\AppData\\Roaming\\{long_name}\\..\\kiro-cli\\data.sqlite3'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_excursion_chains_match_in_linear_time(self) -> None:
+        # The ``[. ]*`` run adjacent to win_gsep's name run backtracked
+        # exponentially on non-matching dot-run inputs before the runs were
+        # made disjoint — measured seconds at ~350 chars, through this very
+        # call (found in review). This input reaches ~600 chars, where the
+        # exponential shape needs minutes-to-hours; the fixed pattern
+        # answers in milliseconds, so a 1s bound stays deterministic on a
+        # loaded runner while any re-opened ambiguity fails it loudly.
+        cmd = "type 'C:\\Users\\u\\" + ("." * 60 + "\\..") * 8 + "\\NOPE\\file.txt'"
+        start = time.monotonic()
+        assert is_sensitive_bash_command(cmd) is None
+        assert time.monotonic() - start < 1.0
+        # A single ~24 KB non-separator component must also stay under the
+        # deadline: an UNBOUNDED name run let this drive a linear scan past
+        # the synchronous hook-path watchdog and terminate the gateway
+        # (found in review); the 254-char component cap bounds it.
+        big = "type 'C:\\Users\\u\\" + ("A" * 24000) + "\\NOPE\\file.txt'"
+        start = time.monotonic()
+        assert is_sensitive_bash_command(big) is None
+        assert time.monotonic() - start < 1.0
+
     @pytest.mark.skipif(
         os.name != "nt",
         reason="fence targets are os.sep-joined; the match is only real on Windows",
