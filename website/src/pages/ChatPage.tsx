@@ -67,7 +67,7 @@ import { useScrollManager } from './chat/useScrollManager'
 import { shouldPaginateOlder } from './chat/pagination'
 import EarlierMessagesBar from './chat/EarlierMessagesBar'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
-import { addPendingFile, parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens } from '../utils/fileTokens'
+import { addPendingFile, parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens, restoreQueuedContent } from '../utils/fileTokens'
 import { classifyDrop } from '../utils/dropClassify'
 import { makeRelative } from '../components/FilePickerMenu'
 import { type PasteBlock, expandAll as expandPasteTokens, findTokenRanges, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste, recollapsePastes } from '../utils/pasteTokens'
@@ -1724,6 +1724,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // get an entry (they have no token), so their remove stays state-only. A
   // ref, not state: it never drives rendering. Entries die with their chip.
   const pickedFileTokens = useRef<Record<string, string>>({})
+  /** Pre-serialization composer state of sends the server QUEUED, keyed by
+   *  the queue id the send receipt returns (`{queued: true, queue_id}` — the
+   *  same id `queue_push` broadcasts and the card's cancel button carries).
+   *  Queue identity is the ONLY sound key: the serialization is not injective
+   *  (image @-tokens are erased from the LLM-facing text), so content-keyed
+   *  records can collide across different captions, duplicate sends, and
+   *  other tabs. Each record also carries `sent`, the exact POSTed text, and
+   *  handleCancelQueued restores only while the card's content still equals
+   *  it — an entry edited after send keeps its queue id, and restoring the
+   *  pre-edit state would silently discard the edit. The restoreQueuedContent
+   *  parser is the fallback for what a same-tab stash cannot cover (reload,
+   *  another tab, an edited entry, a server-redacted echo). Same
+   *  restore-what-was-typed pattern as SideChat's submittedRaw. Deliberately
+   *  unevicted: entries die on the cancel that consumes them, and evicting a
+   *  live entry would degrade that card's cancel to the parser (see the
+   *  send-site comment). Sends carrying paste blocks are not stashed — their
+   *  collapsed tokens would restore as dead literals — so those fall through
+   *  to the parser, which keeps the expanded text. */
+  const queuedSendStash = useRef<Map<string, { raw: string; files: string[]; sent: string }>>(new Map())
   const [snipFrame, setSnipFrame] = useState<HTMLCanvasElement | null>(null)
   // The slot that INITIATED the current snip. getDisplayMedia + cropping is
   // async and the user may switch slots meanwhile, so the cropped image must
@@ -4009,6 +4028,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // this shape since long before this feature, and changing it here would widen
     // the PR into pre-existing attachment behaviour.
     const sentSessionRefs = optionText ? [] : pendingSessionsRef.current.slice()
+    // Snapshot the staged files BEFORE the optimistic clear below: if the
+    // server answers `queued`, this send's pre-serialization composer state
+    // is stashed so a cancel can restore it losslessly (see queuedSendStash).
+    const stagedFilesAtSend = [...new Set(pendingFilesRef.current)]
     const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = prepareSendPayload(raw, pendingFilesRef.current)
     // Folder references serialize like files but from the text alone: each
     // `@rel/` token becomes `[attached_dir N] /abs/path` in the LLM-facing
@@ -4344,6 +4367,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       const r = await api.sendChat(llmTxt, slot ?? undefined, colorThemeRef.current, controller.signal, metaPayload, steerNow)
       clearTimeout(timeout)
       const body = await r.json().catch(() => ({}))
+      if (body.queued && llmTxt === typedTxtDirs) {
+        // The server queued this send and its receipt names the entry:
+        // `queue_id` is the same id `queue_push` broadcasts and the card's
+        // cancel button carries, so the pre-send composer state binds to
+        // exactly this card — content plays no part in the key, which is what
+        // makes duplicate texts, serialization-colliding captions, and other
+        // tabs' cards structurally unable to consume someone else's record.
+        // A receipt without `queue_id` (an older gateway, a requeued steer)
+        // simply doesn't stash — the parser fallback covers those cards.
+        //
+        // Eligibility is DERIVED, not enumerated: stash only when the POSTed
+        // text is exactly what {raw, staged files} alone explain
+        // (`typedTxtDirs` — prepareSendPayload + dir-token serialization).
+        // Expanded paste blocks, appended session-ref links, a prepended
+        // knowledge block, and ANY FUTURE feature that diverges `llmTxt`
+        // from the composer state all fail this equality and fall to the
+        // parser — a stash hit for such a send would restore `raw` WITHOUT
+        // the context the user staged, silently dropping it, so the failure
+        // mode of forgetting is a conservative fallback, not silent loss.
+        //
+        // No size bound on purpose: an entry is deleted on the cancel that
+        // consumes it, and evicting a live entry would degrade that queued
+        // card's cancel to the parser fallback — for a spaced attachment path
+        // that is exactly the marker-in-composer data loss this PR exists to
+        // fix. Entries orphaned by normal delivery are three small strings
+        // and are bounded by how many sends a single tab queues in one
+        // session.
+        if (typeof body.queue_id === 'string' && body.queue_id) {
+          queuedSendStash.current.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: llmTxt })
+        }
+      }
       if (!body.queued && !body.ok) {
         dispatch(setSlotRunning(false))
         dispatch(appendMessage({ role: 'error', content: body.error || i18nT('pages.chatPage.send_failed'), cls: '' }))
@@ -5792,7 +5846,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const handleCancelQueued = useCallback((queueId: string) => {
     if (!activeSlot) return
     const msg = messagesRef.current.find(m => m.role === 'queued' && (m.meta?.queueId as string) === queueId)
-    if (msg?.content) setInput(msg.content)
+    if (msg?.content) {
+      // The queued card holds the LLM-facing serialization prepareSendPayload
+      // produced, not the typed text, and the queued row carries no meta.files.
+      // Prefer the pre-send composer state THIS tab stashed when the server
+      // queued the send — lossless for every path shape. Fall back to the
+      // strict parser (byte-exact round-trip claims only) for what a same-tab
+      // stash cannot cover: a reload, another tab, or an entry edited after
+      // send.
+      // Both halves MERGE into the composer, mirroring the failed-send restore
+      // ("MERGE, never overwrite"): text appends to any draft typed while the
+      // message sat queued, and paths join the staged chips — so a re-send
+      // serializes from the chips exactly once.
+      // Restore by QUEUE IDENTITY: the record was stored under the queue id
+      // the send receipt returned, which is the id this cancel carries — so
+      // a hit is this card's own pre-send state by construction, whatever
+      // its content collides with (duplicate texts, erased-image-token
+      // captions, other tabs). The record is consumed either way; `sent`
+      // guards the one same-id hazard: an entry edited after send keeps its
+      // queue id, and restoring the pre-edit state would silently discard
+      // the edit, so an edited card falls to the parser like a foreign one.
+      const stashed = queuedSendStash.current.get(queueId)
+      if (stashed) queuedSendStash.current.delete(queueId)
+      const { text, files } = stashed && stashed.sent === msg.content
+        ? { text: stashed.raw, files: stashed.files }
+        : restoreQueuedContent(msg.content)
+      setInput(mergeIntoDraft(inputRef.current, text))
+      if (files.length) setPendingFiles(prev => [...new Set([...prev, ...files])])
+    }
     // Optimistically remove the card; WS event is a no-op if already gone
     dispatch(cancelQueuedMessage({ slot: activeSlot, queue_id: queueId }))
     api.cancelQueuedMessage(activeSlot, queueId).catch(() => {})
