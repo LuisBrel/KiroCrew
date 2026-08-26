@@ -3,9 +3,9 @@
 // submitting. Reading the live `tab` prop at submit time sent the agent a quote
 // that does not appear in the file it was told to fix.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import React from 'react'
+import React, { useState } from 'react'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import DocView from '../apps/spec-builder/components/DocView'
+import DocView, { type Selection } from '../apps/spec-builder/components/DocView'
 import type { SpecDetail } from '../apps/spec-builder/api'
 
 const detail = {
@@ -40,12 +40,26 @@ function selectInsidePane(node: HTMLElement, text: string) {
   act(() => { fireEvent.mouseUp(node) })
 }
 
+function Harness({ tab, addComment }: { tab: string; addComment: (c: { file: string; quote: string; note: string }) => void }) {
+  const [sel, setSel] = useState<Selection | null>(null)
+  const [note, setNote] = useState<Selection | null>(null)
+  const [draft, setDraft] = useState('')
+  return (
+    <DocView
+      detail={detail}
+      tab={tab}
+      addComment={addComment}
+      composer={{ sel, setSel, note, setNote, draft, setDraft }}
+    />
+  )
+}
+
 describe('DocView selection-to-comment attribution', () => {  beforeEach(() => { vi.restoreAllMocks() })
 
   it('attributes the comment to the document the passage came from', async () => {
     const addComment = vi.fn()
     const { rerender } = render(
-      <DocView detail={detail} tab="requirements" addComment={addComment} />
+      <Harness tab="requirements" addComment={addComment} />
     )
 
     const passage = screen.getByText(/requirements thing/i)
@@ -55,7 +69,7 @@ describe('DocView selection-to-comment attribution', () => {  beforeEach(() => {
     act(() => { fireEvent.click(pill) })
 
     // User switches document while the composer is open.
-    rerender(<DocView detail={detail} tab="design" addComment={addComment} />)
+    rerender(<Harness tab="design" addComment={addComment} />)
 
     const input = screen.getByLabelText(/Your feedback on the selected passage/i)
     act(() => { fireEvent.change(input, { target: { value: 'tighten this' } }) })
