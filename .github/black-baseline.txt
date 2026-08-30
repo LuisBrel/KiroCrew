@@ -395,7 +395,6 @@ test/metrics/test_schema.py
 test/metrics/test_startup_channel_attrs.py
 test/metrics/test_telemetry_titles.py
 test/metrics/test_watchdog_metrics.py
-test/test_acp_backend_kas.py
 test/test_acp_dynamic_config.py
 test/test_acp_error_surface.py
 test/test_acp_liveness.py
