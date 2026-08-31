@@ -20,6 +20,7 @@ import subprocess
 import sys
 from typing import Any
 
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
@@ -111,5 +112,12 @@ def install_deps() -> dict[str, Any]:
         return {"ok": False, "installed": [], "error": f"install failed: {exc}"}
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
-        return {"ok": False, "installed": [], "error": f"pip failed: {tail[0][:200]}"}
+        # Redact BEFORE the bound: pip echoes an authenticated index URL on an auth
+        # failure, and the slice can cut the credential mid-match into a fragment no
+        # downstream redaction pass recognises.
+        return {
+            "ok": False,
+            "installed": [],
+            "error": f"pip failed: {redact_and_truncate(tail[0], 200)}",
+        }
     return {"ok": True, "installed": ["ruff"], "detail": "ruff installed"}

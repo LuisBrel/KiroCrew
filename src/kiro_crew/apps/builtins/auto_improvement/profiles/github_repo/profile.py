@@ -82,6 +82,7 @@ from typing import Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
+from kiro_crew.security import redact_and_truncate
 
 from ...spine import agent_discovery
 from ...spine import scope as scope_util
@@ -971,7 +972,10 @@ class PytestBuildGate:
         tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""]
         return GateResult(
             passed=False,
-            detail=f"suite red (exit {proc.returncode}): {tail[0][:160]}",
+            # Redact BEFORE the bound: a candidate's test run can echo a credential,
+            # and the slice can cut it mid-match into a fragment no downstream
+            # redaction pass recognises.
+            detail=f"suite red (exit {proc.returncode}): {redact_and_truncate(tail[0], 160)}",
             failing_tests=failing,
         )
 

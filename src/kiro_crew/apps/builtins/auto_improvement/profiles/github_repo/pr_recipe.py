@@ -43,6 +43,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from ...spine.git_safety import GIT_SAFE_CONFIG, require_pinned
@@ -417,7 +418,7 @@ class GitHubPRRecipe:
                 "push failed for %s (git exit %s): %s",
                 branch,
                 proc.returncode,
-                (proc.stderr or "").strip()[:200],
+                redact_and_truncate((proc.stderr or "").strip(), 200),
             )
             return False, "push failed"
         return True, branch
@@ -504,7 +505,9 @@ class GitHubPRRecipe:
             return f"QUEUED:{fingerprint}"
         if proc.returncode != 0:
             logger.warning(
-                "gh pr create failed for %s: %s", fingerprint, (proc.stderr or "").strip()[:200]
+                "gh pr create failed for %s: %s",
+                fingerprint,
+                redact_and_truncate((proc.stderr or "").strip(), 200),
             )
             return f"QUEUED:{fingerprint}"
         return extract_pr_url(proc.stdout or "") or f"QUEUED:{fingerprint}"
