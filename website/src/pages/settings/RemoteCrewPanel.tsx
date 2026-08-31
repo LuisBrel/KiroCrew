@@ -1,5 +1,5 @@
 /**
- * RemoteCrewPanel — Settings → Remote Crew. One page, two tabs:
+ * RemoteCrewPanel — the Settings → Remote Instances page. One page, two tabs:
  *
  *   1. "Your crews" (default) — the machines you can switch to from the top
  *      header: any in-progress cloud launch (a durable gateway job), the

@@ -82,7 +82,7 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * by switching to that crew's pane, and the local session list does not show
  * live remote sessions — so the session is hard to return to afterwards.
  *
- * Its toggle lives in Settings > Remote crews, not Developer > Feature Previews:
+ * Its toggle lives in Settings > Remote Instances, not Developer > Feature Previews:
  * the flag is only meaningful to someone who already has a crew connected, and
  * that is the page where crews are managed.
  *
