@@ -653,6 +653,55 @@ def is_document_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in DOC_EXTENSIONS
 
 
+# Literal-color detector backing the theme-contrast warning. Lives here (the
+# store module) so every artifact-authoring surface computes the SAME verdict:
+# the gateway handlers stamp it on save/update responses, and the MCP tool
+# phrases its own hint from it. Hex colors are 3/4/6/8 digits -- 5 and 7 are
+# excluded on purpose so hex-ish CSS id selectors ("#added1") don't fire. The
+# leading [:=(\s"'] anchors the literal to a value position (color:#111,
+# fill="#111") rather than a fragment anchor or an id selector at line start.
+# IGNORECASE is what lets RGB(...) / HSL(...) match -- CSS functions are
+# case-insensitive. Fragment/URL hrefs (href="#abc") are excluded by
+# stripping href attributes BEFORE scanning (see _HREF_ATTR_RE) rather than
+# by a lookbehind: Python lookbehinds must be fixed-width, so a lookbehind
+# cannot tolerate `href = "#abc"` spacing -- the strip is whitespace-tolerant
+# and covers xlink:href and any case for free.
+# Accepted noise, documented rather than parsed away: a whitespace-preceded
+# hex-ish id selector ("... } #decade {") can still fire, but whitespace must
+# stay in the prefix class or true positives like "border: 1px solid #ccc"
+# are lost -- and every consumer surfaces this as a soft warning, never a
+# rejection.
+_HARDCODED_COLOR_RE = re.compile(
+    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"
+    r"|\brgba?\("
+    r"|\bhsla?\(",
+    re.IGNORECASE,
+)
+
+# href / xlink:href attribute (quoted value), whitespace-tolerant around the
+# ``=``. An href value is a URL or fragment, never a rendered color, so it is
+# removed before the color scan to keep the warning's false-positive rate low.
+_HREF_ATTR_RE = re.compile(r"href\s*=\s*(\"[^\"]*\"|'[^']*')", re.IGNORECASE)
+
+
+def has_unthemed_hardcoded_colors(kind: str, content: str) -> bool:
+    """True when iframe-rendered content hardcodes its palette.
+
+    Only widget/html kinds render inside the dashboard's themed iframe, so
+    only they can clash with the injected theme defaults. Content carrying a
+    single ``var(--`` reference is treated as theme-aware -- including the
+    recommended fallback form ``color:var(--text,#111)`` -- and never flags.
+    A full foreground/background *pairing* check needs a CSS parser; this
+    zero-var heuristic catches the observed failure class (partially styled
+    content clashing with the injected theme) with one regex.
+    """
+    if kind not in ("widget", "html"):
+        return False
+    if not content or "var(--" in content:
+        return False
+    return bool(_HARDCODED_COLOR_RE.search(_HREF_ATTR_RE.sub("href=x", content)))
+
+
 def _infer_kind(content: str, source_path: str = "", explicit: str | None = None) -> str:
     """Infer an artifact ``kind`` when the caller didn't pin one.
 

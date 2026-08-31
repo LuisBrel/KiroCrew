@@ -2363,6 +2363,18 @@ def _artifact(args: argparse.Namespace) -> None:
                 f"kirocrew artifact update {taken}",
                 file=sys.stderr,
             )
+        # Relayed from the gateway (same pattern as slug_collided_with): the
+        # handler computes the theme-contrast verdict at the convergence
+        # point, so this CLI path -- the one the motivating incident traveled
+        # -- hears it without duplicating the detector. Advisory only.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "update":
@@ -2394,6 +2406,17 @@ def _artifact(args: argparse.Namespace) -> None:
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
+        # Relayed from the gateway (see the save action above) -- the PATCH
+        # path is exactly how the motivating incident's script pushed its
+        # hardcoded-palette page. Advisory only; the update succeeded.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "delete":

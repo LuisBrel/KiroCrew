@@ -53,6 +53,7 @@ from kiro_crew.artifacts import (
     ArtifactValidationError,
     get_default_folder_store,
     get_default_store,
+    has_unthemed_hardcoded_colors,
     is_document_path,
     slugify,
     webapp_metadata_from_dict,
@@ -1526,6 +1527,17 @@ async def api_artifacts_create(request: web.Request) -> web.Response:
         if art.slug != requested:
             collided_with = requested
     payload["slug_collided_with"] = collided_with
+    # Theme-contrast verdict for the clients, same relay pattern as
+    # ``slug_collided_with``: computed once here at the convergence point so
+    # EVERY authoring surface (MCP tool, CLI, dashboard) sees the same
+    # verdict -- the motivating incident traveled the CLI, which never runs
+    # the MCP-layer hint. Scans ``art.content`` (what was actually persisted),
+    # not the request body: a file-promoted save persists the server-read
+    # bytes, and the client's copy can be stale or redacted. Advisory only;
+    # the save has already succeeded.
+    payload["theme_contrast_warning"] = has_unthemed_hardcoded_colors(
+        art.kind, art.content or ""
+    )
     return _json_response(payload, status=201)
 
 
@@ -1853,7 +1865,18 @@ async def api_artifact_update(request: web.Request) -> web.Response:
                 await publish_sync.push_version_by_slug(art.slug)
             except Exception as exc:  # noqa: BLE001 - best-effort egress
                 logger.info("auto-sync push after snapshot failed for %s: %s", art.slug, exc)
-    return _json_response(_serialize(art, include_content=True))
+    payload = _serialize(art, include_content=True)
+    # Same relay as the save path's ``theme_contrast_warning``: a
+    # content-carrying update gets the verdict computed here at the
+    # convergence point, so the CLI's PATCH (the motivating incident's
+    # path) hears it too. Unlike save, PATCH never file-promotes, so the
+    # body IS the persisted content -- and scanning the body (not
+    # ``art.content``) keeps metadata-only updates (rename/retag) from
+    # warning about pre-existing content they didn't touch.
+    payload["theme_contrast_warning"] = has_unthemed_hardcoded_colors(
+        art.kind, body.get("content") or ""
+    )
+    return _json_response(payload)
 
 
 async def api_artifact_settle_blank(request: web.Request) -> web.Response:

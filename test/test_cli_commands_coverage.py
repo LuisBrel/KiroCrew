@@ -2002,6 +2002,52 @@ class TestArtifactCli:
         assert "Saved: slug=chosen-by-hand version=1" in captured.out
         assert captured.err == ""
 
+    def test_save_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The gateway computes the verdict (same relay pattern as
+        # slug_collided_with); the CLI must surface it — this direct-POST
+        # path is the one the motivating incident traveled, which the
+        # MCP-layer hint alone never covered.
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 1, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Perf",
+                    content='<div style="color:#111">x</div>',
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=perf version=1" in captured.out
+        assert "theme variables" in captured.err
+
+    def test_update_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 2, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="update",
+                    slug="perf",
+                    content='<body style="background:#fffbe6">x</body>',
+                    content_file=None,
+                    name=None,
+                    description=None,
+                    tags=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Updated: slug=perf version=2" in captured.out
+        assert "theme variables" in captured.err
+
     def test_save_reads_content_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
