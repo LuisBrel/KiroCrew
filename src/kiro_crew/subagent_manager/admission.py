@@ -729,6 +729,21 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # spawn approval from a mid-run tool prompt and report the accurate
             # cause.
             info._awaiting_approval = True
+            # Name the wait as well as marking it. The flag above is machine
+            # state read by the reaper and (now) by the wire; this is the line an
+            # operator gets. #6484's reporter had no lead at all because
+            # ``kirocrew logs`` held no record keyed to the affected run id —
+            # while a wait with no deadline of its own held the run at turn 0.
+            # ``parent_session_key`` is in the record on purpose: an unowned
+            # spawn (the CLI posts none) raises its prompt with ``slot=""``, so
+            # it is surfaced only on the global approvals feed and appears in no
+            # chat tab, which is the case with the least other evidence.
+            logger.info(
+                "Subagent %s awaiting spawn approval (request_id=%s, parent=%s)",
+                info.id,
+                request_id,
+                info.parent_session_key or "<unowned>",
+            )
             try:
                 approved: bool = await self._manager._on_spawn_approval(
                     request_id, f"spawn_run({task_preview})", info.parent_session_key
