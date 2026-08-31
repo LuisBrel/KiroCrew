@@ -52,6 +52,7 @@ from kiro_crew.apps.manager import (
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.security import is_sensitive_path, path_contains_sensitive
+from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
@@ -294,8 +295,18 @@ def _set_dev_cache(names: set[str]) -> None:
     _dev_apps_cache = set(names)
 
 
-def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
+def set_dev_mode(
+    name: str, enabled: bool, *, confirm_out_of_install_root: bool = False
+) -> dict[str, Any]:
     """Toggle dev mode for an installed app. Returns a result dict.
+
+    ``confirm_out_of_install_root`` is the operator's explicit acknowledgement
+    for a grant whose ui root resolves OUTSIDE the app's install directory
+    (see the confirmation gate below). Only host-boundary callers (the CLI)
+    may pass it — the HTTP toggle route must not, because a request-body flag
+    from the dashboard origin is app-controllable, not operator attestation.
+    It never overrides the sensitive-path refusal, and an in-install root
+    does not need it.
 
     Blocking filesystem IO — callers on the event loop MUST offload this to a
     thread (``await asyncio.to_thread(set_dev_mode, ...)``).
@@ -323,6 +334,7 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
         if meta is None:
             return {"error": f"app {name!r} is not installed"}
         granted_root: str | None = None
+        out_of_install_confirmed = False
         if enabled:
             # VALIDATE BEFORE ANY WRITE: a refusal must leave prior state
             # exactly as it was — an already-enabled app whose `ui` was
@@ -363,6 +375,55 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
                             "dev-mode grant is refused"
                         )
                     }
+                # OUT-OF-INSTALL grants additionally require the operator's
+                # EXPLICIT confirmation, and only a caller on the gateway
+                # host can supply it. The toggle route carries no
+                # app-vs-operator identity — an app's UI bundle runs as a
+                # same-origin module with the dashboard's own credentials,
+                # so any request-body flag is data the app controls, never
+                # an attestation — which is why the HTTP endpoint NEVER
+                # passes this parameter and answers every out-of-install
+                # enable with the refusal below. The CLI flag
+                # (--confirm-out-of-install-root) is the one way to supply
+                # it, and it is operator-only on BOTH sides of the process
+                # boundary: running the CLI requires a process on the host
+                # (app page-code cannot cross that), and an AGENT shell on
+                # the host is refused by the builtin deny rule
+                # ``self-protection-dev-mode-out-of-root-confirm`` — the
+                # flag's literal text is denied in agent commands, so an
+                # auto-approved Bash tool cannot self-supply the
+                # attestation. Both outcomes of the decision are
+                # SEL-audited (see the emissions below). The load-bearing
+                # serving guarantees remain the resolved-root equality
+                # binding and the sensitivity screen above; this gate
+                # closes the self-grant path to them and makes the escape
+                # explicit at the call site.
+                # Validate-before-write: like the sensitivity refusal above,
+                # this must leave prior state untouched. Both the refusal and
+                # the confirmed grant are SEL-audited: the permission decision
+                # on an out-of-install root is exactly the kind of authority
+                # change the event log exists to record.
+                if not confirm_out_of_install_root:
+                    sel().log_api_access(
+                        caller=f"app:{name}",
+                        operation="dev_mode_out_of_install_grant",
+                        outcome="denied",
+                        source="apps",
+                        resources=granted_root,
+                        error="out-of-install ui root requires operator confirmation",
+                    )
+                    return {
+                        "error": (
+                            f"app {name!r} has a ui root resolving outside "
+                            f"its install directory ({granted_root}) — "
+                            "granting dev mode on it requires explicit "
+                            "operator confirmation: run `kirocrew app dev "
+                            f"{name} --confirm-out-of-install-root` on the "
+                            "gateway host"
+                        ),
+                        "code": "dev_mode_out_of_install_confirmation_required",
+                    }
+                out_of_install_confirmed = True
         else:
             # Revoke the AUTHORIZATION first: every write below narrows state,
             # so a crash after any prefix of them leaves the SAFER remainder
@@ -391,6 +452,17 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
             grants = _read_dev_grants()
             grants[name] = granted_root
             _write_dev_grants(grants)
+            if out_of_install_confirmed:
+                # Audit AFTER the grant record lands, so the event asserts an
+                # authority change that actually happened (a decision-point
+                # event could record a grant a later write failure undid).
+                sel().log_api_access(
+                    caller=f"app:{name}",
+                    operation="dev_mode_out_of_install_grant",
+                    outcome="granted",
+                    source="apps",
+                    resources=granted_root,
+                )
         # Update the in-process cache immediately so a same-process POST toggle
         # takes effect on the very next UI request (no wait for a watcher tick).
         _set_dev_cache(names)
@@ -466,8 +538,9 @@ def dev_mode_granted_root(name: str) -> str | None:
     exact tree the operator approved, never whatever ``ui`` points at now.
     (The toggle endpoint itself carries no app-vs-operator identity — a
     same-origin caller reaches it too — which is why the binding, the
-    sensitive-path screen at grant time, and this equality check carry the
-    guarantee rather than the file's authorship alone.)
+    sensitive-path screen and the explicit out-of-install confirmation at
+    grant time, and this equality check carry the guarantee rather than the
+    file's authorship alone.)
 
     Blocking IO — do NOT call on the event loop; callers run it off-loop, and
     it sits on an exceptional path (an out-of-install ui root), never on

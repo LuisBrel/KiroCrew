@@ -996,3 +996,194 @@ def test_enable_refuses_a_root_CONTAINING_sensitive_leaves(tmp_path, monkeypatch
     assert "error" in result and "sensitive location" in result["error"]
     assert dev_mode._read_dev_grants() == {}
     assert is_dev_mode("dev-mode-app") is False
+
+
+# ---------------------------------------------------------------------------
+# Out-of-install grants require explicit operator confirmation
+# ---------------------------------------------------------------------------
+
+
+def _repoint_ui_outside(tmp_path, dirname="external-src"):
+    """Replace the installed ui/ with a link to a benign out-of-install tree."""
+    import shutil
+
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    app_ui = dev_mode.apps_dir() / "dev-mode-app" / "ui"
+    shutil.rmtree(app_ui)
+    outside = tmp_path / dirname
+    outside.mkdir()
+    (outside / "index.mjs").write_text("export default () => null\n")
+    make_dir_link(app_ui, outside)
+    return outside
+
+
+def test_enable_out_of_install_root_requires_confirmation(tmp_path, monkeypatch):
+    """The remaining self-grant surface, closed.
+
+    An out-of-install (non-sensitive) root used to be granted unaided. Now the
+    toggle fails closed without the explicit host-boundary confirmation — the
+    refusal names the CLI command — and, like every validate-before-write
+    refusal, leaves no state behind. With the confirmation it binds the grant
+    to the escaped root as before.
+    """
+    import os
+
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    outside = _repoint_ui_outside(tmp_path)
+
+    result = set_dev_mode("dev-mode-app", True)
+
+    assert "error" in result and "operator confirmation" in result["error"]
+    assert "--confirm-out-of-install-root" in result["error"]
+    assert result["code"] == "dev_mode_out_of_install_confirmation_required"
+    assert dev_mode._read_dev_grants() == {}
+    assert _read_dev_sentinel() == set()
+    assert is_dev_mode("dev-mode-app") is False
+
+    confirmed = set_dev_mode("dev-mode-app", True, confirm_out_of_install_root=True)
+
+    assert confirmed == {"name": "dev-mode-app", "dev": True}
+    assert dev_mode._read_dev_grants() == {
+        "dev-mode-app": os.path.realpath(outside)
+    }
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") == os.path.realpath(outside)
+
+
+def test_out_of_install_confirmation_decisions_are_SEL_audited(tmp_path, monkeypatch):
+    """Both outcomes of the out-of-install permission decision hit the SEL.
+
+    The grant relaxes the unauthenticated UI route's root containment, so the
+    decision is an authority change the security event log must record: the
+    unconfirmed refusal emits a denial, and a confirmed enable emits a granted
+    event only AFTER the grant record is written (the event asserts a change
+    that actually happened). An in-install enable emits nothing — no authority
+    beyond the normal dev-mode shape changed.
+    """
+    from types import SimpleNamespace
+
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+
+    sel_events: list = []
+    monkeypatch.setattr(
+        dev_mode,
+        "sel",
+        lambda: SimpleNamespace(log_api_access=lambda **kw: sel_events.append(kw)),
+    )
+
+    # In-install enable: no permission decision, no event.
+    assert set_dev_mode("dev-mode-app", True) == {"name": "dev-mode-app", "dev": True}
+    assert sel_events == []
+    set_dev_mode("dev-mode-app", False)
+    sel_events.clear()
+
+    outside = _repoint_ui_outside(tmp_path)
+
+    refused = set_dev_mode("dev-mode-app", True)
+    assert refused["code"] == "dev_mode_out_of_install_confirmation_required"
+    assert len(sel_events) == 1
+    denial = sel_events[0]
+    assert denial["operation"] == "dev_mode_out_of_install_grant"
+    assert denial["outcome"] == "denied"
+    assert denial["caller"] == "app:dev-mode-app"
+    import os
+
+    assert denial["resources"] == os.path.realpath(outside)
+
+    sel_events.clear()
+    confirmed = set_dev_mode("dev-mode-app", True, confirm_out_of_install_root=True)
+    assert confirmed == {"name": "dev-mode-app", "dev": True}
+    assert len(sel_events) == 1
+    grant = sel_events[0]
+    assert grant["operation"] == "dev_mode_out_of_install_grant"
+    assert grant["outcome"] == "granted"
+    assert grant["resources"] == os.path.realpath(outside)
+    # The event fired only after the grant record actually landed.
+    assert dev_mode._read_dev_grants() == {"dev-mode-app": os.path.realpath(outside)}
+
+
+def test_confirmation_cannot_override_the_sensitivity_screen(tmp_path, monkeypatch):
+    """The two gates are ordered: sensitivity is a hard refusal, confirmation
+    only answers the benign-escape case. An operator who confirms a sensitive
+    root is still refused — no dev workflow legitimately serves credential
+    stores over the unauthenticated UI route."""
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    _repoint_ui_outside(tmp_path, dirname="credential-store")
+    monkeypatch.setattr(dev_mode, "is_sensitive_path", lambda p: True)
+
+    result = set_dev_mode("dev-mode-app", True, confirm_out_of_install_root=True)
+
+    assert "error" in result and "sensitive location" in result["error"]
+    assert "confirmationRequired" not in result
+    assert dev_mode._read_dev_grants() == {}
+
+
+def test_an_unconfirmed_refusal_preserves_prior_dev_state(tmp_path, monkeypatch):
+    """Validate-before-write holds for the confirmation refusal too: an app
+    already in dev mode on its in-install root keeps its metadata, sentinel
+    entry, and OLD grant when an unconfirmed re-toggle over a repointed root
+    is refused."""
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    set_dev_mode("dev-mode-app", True)
+    prior_grants = dev_mode._read_dev_grants()
+    assert set(prior_grants) == {"dev-mode-app"}
+
+    _repoint_ui_outside(tmp_path)
+
+    result = set_dev_mode("dev-mode-app", True)
+
+    assert result.get("code") == "dev_mode_out_of_install_confirmation_required"
+    assert is_dev_mode("dev-mode-app") is True, "metadata dev flag preserved"
+    assert _read_dev_sentinel() == {"dev-mode-app"}, "watching preserved"
+    assert dev_mode._read_dev_grants() == prior_grants, "old grant untouched"
+
+
+@pytest.mark.asyncio
+async def test_dev_endpoint_never_confirms_out_of_install_roots(tmp_path, monkeypatch):
+    """The HTTP route is not a confirmation surface — pinned as a contract.
+
+    App UI bundles run as same-origin modules with the dashboard's own
+    credentials, so a request-body flag is app-controllable data, never
+    operator attestation. Enabling dev mode on an out-of-install root over
+    HTTP must answer 400 whether or not the caller supplies a
+    ``confirmOutOfInstallRoot`` flag — an app POSTing to its own toggle can
+    never mint the grant. (Confirmation is CLI-only: the host process
+    boundary is what proves the operator.)
+    """
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    _repoint_ui_outside(tmp_path)
+
+    async with TestClient(TestServer(_make_web_app())) as client:
+        resp = await client.post("/api/apps/dev-mode-app/dev", json={"enabled": True})
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["code"] == "dev_mode_out_of_install_confirmation_required"
+        assert "--confirm-out-of-install-root" in body["error"]
+
+        # The self-grant vector: a same-origin caller supplying the flag
+        # itself. It must be inert — still 400, still no grant.
+        resp = await client.post(
+            "/api/apps/dev-mode-app/dev",
+            json={"enabled": True, "confirmOutOfInstallRoot": True},
+        )
+        assert resp.status == 400
+        assert (await resp.json())[
+            "code"
+        ] == "dev_mode_out_of_install_confirmation_required"
+        assert dev_mode._read_dev_grants() == {}
+        assert dev_mode.dev_mode_granted_root("dev-mode-app") is None

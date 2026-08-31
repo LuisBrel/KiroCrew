@@ -157,7 +157,7 @@ choice blob makes the usage line unreadable.
 | `kirocrew spawn run/list` | Manage background subagents |
 | `kirocrew app install/list/enable/disable/uninstall` | Manage App Kit apps. Uninstall preserves `apps/<name>/data/` by default. |
 | `kirocrew app uninstall NAME --purge-data` | Explicitly uninstall an app and permanently delete its app data. |
-| `kirocrew app dev <name> [--off]` | Toggle an installed app into/out of dev mode (no-store UI serving + live reload on file change). See [App Dev Mode](#app-dev-mode). |
+| `kirocrew app dev <name> [--off] [--confirm-out-of-install-root]` | Toggle an installed app into/out of dev mode (no-store UI serving + live reload on file change). See [App Dev Mode](#app-dev-mode). |
 | `kirocrew learn add/list/remove` | Manage learned corrections |
 | `kirocrew run TASK.md` | Run an autonomous task from a spec file |
 | `kirocrew token` | Print a dashboard access URL with auth token |
@@ -1218,24 +1218,34 @@ and prints uptime, sessions, messages, tool calls, subagents, crons, lessons.
 
 ## App Dev Mode
 
-`kirocrew app dev <name> [--off]` toggles an installed App Kit app into (or,
-with `--off`, out of) **dev mode**, which speeds the app-UI edit loop by serving
-UI files uncached and live-reloading the dashboard on file change. The command
-writes the flag out-of-process; the running gateway's watcher picks it up within
-one poll interval, so no gateway restart is needed. Full App Kit developer docs
-live in `docs/app-kit/api-reference.md`; the durable contract surfaces this
-feature introduces are:
+`kirocrew app dev <name> [--off] [--confirm-out-of-install-root]` toggles an
+installed App Kit app into (or, with `--off`, out of) **dev mode**, which speeds
+the app-UI edit loop by serving UI files uncached and live-reloading the
+dashboard on file change. The command writes the flag out-of-process; the
+running gateway's watcher picks it up within one poll interval, so no gateway
+restart is needed. Full App Kit developer docs live in
+`docs/app-kit/api-reference.md`; the durable contract surfaces this feature
+introduces are:
 
 - **Persisted schema — `installed.json` `dev: bool`** (default `false`): a
   per-app flag in each app's `~/.kiro/crew/apps/<name>/installed.json`. Tolerant
-  on read (absent ⇒ `false`), reversible, no migration. This field is the sole
-  authoritative source of truth for an app's dev-mode state. Builtin apps cannot
-  enter dev mode.
+  on read (absent ⇒ `false`), reversible, no migration. This field is the
+  authoritative source of truth for **watching and no-store serving**; enabling
+  also records a gateway-owned **operator grant** binding the ui root's resolved
+  path, which is what authorizes serving a ui root outside the install directory
+  (see api-reference.md). Builtin apps cannot enter dev mode.
 - **Endpoint — `POST /api/apps/{name}/dev`**, body `{"enabled": <bool>}`,
-  returns `{"name": <name>, "dev": <bool>}`. Behind standard gateway auth; emits
-  an `app_dev_mode` SEL audit event. `400` for a non-boolean body, a builtin
-  app, or an unsafe app name; `404` when the app is not installed. Equivalent to
-  the CLI toggle for in-dashboard control.
+  returns `{"name": <name>, "dev": <bool>}`. Behind standard gateway auth;
+  emits an `app_dev_mode` SEL audit event. `400` for a non-boolean body, a
+  builtin app, an unsafe app name, or a refused grant (a sensitive ui root is
+  never grantable; an out-of-install root always answers `400` over HTTP —
+  only the CLI flag, run on the gateway host, supplies the confirmation,
+  because a request-body flag from the dashboard origin is app-controllable);
+  `404` when the app is not installed. The flag is additionally agent-denied:
+  the builtin rule `self-protection-dev-mode-out-of-root-confirm` refuses any
+  agent shell command carrying it, so only the operator's own terminal can
+  supply the attestation — and both the confirmed grant and the unconfirmed
+  refusal emit a `dev_mode_out_of_install_grant` SEL event.
 - **WebSocket event — `app_reload`**, payload `{"app": <name>, "ts": <float>}`,
   broadcast when a dev-mode app's `ui/` tree changes; the dashboard reloads that
   app so edits appear immediately.

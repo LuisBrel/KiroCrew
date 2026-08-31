@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context
 
 try:
@@ -610,13 +611,7 @@ def bound_agent_workspace_target(descriptor: int, workspace: str | os.PathLike[s
     """
     if not _bound_agent_workspace_matches(descriptor, workspace):
         return None
-    # Local import: hooks imports sandbox at call time, so a module-level
-    # dependency would be circular. `_fd_real_path` is private but already
-    # borrowed this way by apps/builtins/spec_builder/backend/routes.py; issue
-    # #6907 tracks promoting it to a shared home.
-    from kiro_crew.hooks import _fd_real_path
-
-    resolved = _fd_real_path(descriptor)
+    resolved = fd_real_path(descriptor)
     if resolved is None:
         raise OSError(
             errno.ENOSYS,
