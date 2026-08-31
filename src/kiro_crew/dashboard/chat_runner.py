@@ -5816,6 +5816,11 @@ async def _run_chat(
                 exclude_last_n=1,
                 folder_path=folder_path,
                 model_window=model_window,
+                # Member DM threads get the four-layer member identity block.
+                # `slot.agent` is the member the human picked (the crew name);
+                # the `agent=` above is the TEMPLATE it resolved to, which is
+                # why the member identity travels separately.
+                member=slot.agent if slot.mode == "member" and slot.agent else "",
                 user_text_range=user_text_span(
                     _user_prepend_offset,
                     user_typed_len,

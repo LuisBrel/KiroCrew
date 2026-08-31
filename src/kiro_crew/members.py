@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +55,34 @@ _ACTIVITY_LOG_MAX_BYTES = 1024 * 1024
 
 #: Crew-slug -> DM-thread binding inside a member's directory.
 DM_FILE_NAME = "dm.json"
+
+#: Per-member PERMANENT RULES (the user-owned layer of the member system
+#: prompt: approval boundaries, forbidden actions, evidence requirements).
+#: Lives under the keystone-gated ``trust/`` subtree for the same reason the
+#: DM binding does: these rules are precisely what the member must not be able
+#: to rewrite for itself, so they cannot sit on a path the agent's file tools
+#: can write. Only the gateway (via the dashboard rules endpoint — a human
+#: action) writes here.
+RULES_DIR_NAME = "member-rules"
+
+#: Hard cap on a member's permanent-rules text. Enforced on WRITE (the write
+#: is a human dashboard action, so a too-long payload is refused loudly)
+#: rather than truncated on read — silently dropping the tail of a rules
+#: document would drop rules.
+MEMBER_RULES_MAX_CHARS = 4000
+
+#: Per-member self-maintained briefing (the member-owned layer of the member
+#: system prompt: current priorities, pointers to its own scripts and notes).
+#: Lives in the member's OWN directory — deliberately agent-writable, since
+#: the whole point is that the member curates what its future self wakes up
+#: knowing. Precedence is fixed by injection order, not trust: rules outrank
+#: the briefing because they are injected above it and named as user-owned.
+BRIEFING_FILE_NAME = "briefing.md"
+
+#: Cap on how much of the briefing is INJECTED per turn (working memory, not
+#: an archive). Enforced on read with a visible truncation marker so the
+#: member learns its briefing overflowed instead of silently losing the tail.
+MEMBER_BRIEFING_MAX_CHARS = 4000
 # Bindings live under the keystone-gated ``trust/`` subtree, NOT inside the
 # member's own directory. The binding IS the thread's identity authority (the
 # resume/send/thread-open guards all defer to it precisely because transcript
@@ -286,6 +315,204 @@ def write_dm_binding(slug: str, *, member: str, slot_key: str) -> dict:
     # must be at least as durable as the transcript it attributes.
     atomic_write(path, json.dumps(binding, ensure_ascii=False), fsync=True)
     return binding
+
+
+def member_rules_path(slug: str) -> Path:
+    """Absolute path to one member's permanent-rules file, containment-checked.
+
+    Mirrors :func:`dm_binding_path`: keystone-gated ``trust/`` subtree, one
+    flat ``<slug>.json`` per member, symlink containment re-checked behind
+    ``validate_slug``. JSON rather than bare text because the payload records
+    the EXACT member name (slugification is lossy, and a safety-rules file
+    shared between two colliding crew names must be attributable — the same
+    reason ``dm.json`` records the name). Does NOT create the directory;
+    :func:`write_member_rules` does on demand.
+    """
+    validate_slug(slug)
+    root = (data_home() / "trust" / RULES_DIR_NAME).resolve()
+    target = (root / f"{slug}.json").resolve()
+    if target.parent != root and root not in target.parents:
+        raise MemberSlugError(f"member slug {slug!r} escapes {root}")
+    return target
+
+
+class MemberRulesUnreadable(RuntimeError):
+    """A rules file EXISTS but cannot be read or parsed.
+
+    Deliberately distinct from "absent": the rules layer is the user's safety
+    boundary, so an unreadable file must NOT silently read as "never set" —
+    injecting identity + protocol + briefing with the user's rules quietly
+    missing would be indistinguishable from a member the user never bounded.
+    Callers degrade the WHOLE member section (or answer 500), never just the
+    rules layer.
+    """
+
+
+def read_member_rules(slug: str, member: str) -> str:
+    """Return *member*'s permanent rules text, or ``""`` when never set.
+
+    Name-scoped, like every read of a lossy-slug file: the payload's recorded
+    ``member`` must equal the requested name, so a colliding crew name reads
+    the shared file as "no rules for me" instead of inheriting another
+    member's safety boundary.
+
+    Missing file reads as ``""`` (the normal state). An EXISTING file that
+    cannot be read or parsed raises :class:`MemberRulesUnreadable` — see its
+    docstring for why that must not degrade to ``""``.
+
+    Blocking file IO: call via ``asyncio.to_thread`` from async code.
+    """
+    path = member_rules_path(slug)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeError) as exc:
+        raise MemberRulesUnreadable(f"member rules for {slug!r} unreadable") from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise MemberRulesUnreadable(f"member rules for {slug!r} malformed") from exc
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("member"), str)
+        or not isinstance(data.get("rules"), str)
+    ):
+        raise MemberRulesUnreadable(f"member rules for {slug!r} malformed")
+    if data["member"] != member:
+        # A colliding slug's file holds another exact name's rules; for THIS
+        # member that is "never set", not an error.
+        return ""
+    return data["rules"].strip()
+
+
+def write_member_rules(slug: str, *, member: str, text: str) -> None:
+    """Persist a member's permanent rules atomically (human write path only).
+
+    Records the EXACT member name in the payload so the name-scoped read can
+    attribute the file across lossy-slug collisions. Raises rather than
+    degrading: the caller is the dashboard rules endpoint — a human action —
+    and the human must know their rules did not land. ``ValueError`` on an
+    over-cap payload (refused loudly, never truncated: silently dropping the
+    tail of a rules document would drop rules), and ``OSError`` propagates
+    like :func:`write_dm_binding`.
+
+    An empty/whitespace *text* deletes the rules file: "no rules" is the
+    documented absent state, so clearing the editor clears the state instead
+    of leaving a zero-byte file that reads back differently from "never set".
+
+    fsync, like the DM binding: rules are the user's safety boundary for this
+    member, so they must not silently vanish to a crash after the dashboard
+    confirmed the save.
+    """
+    path = member_rules_path(slug)
+    if len(text) > MEMBER_RULES_MAX_CHARS:
+        raise ValueError(
+            f"member rules for {slug!r} exceed {MEMBER_RULES_MAX_CHARS} chars ({len(text)})"
+        )
+    if not text.strip():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Same defence-in-depth mode tightening as the DM binding: the trust
+    # subtree is owner-only everywhere else, and a chmod failure must not
+    # cost the save (the sensitive-path floor is the real fence).
+    for _dir in (path.parent, path.parent.parent):
+        try:
+            platform_compat.restrict_dir_to_owner(_dir)
+        except OSError:
+            logger.debug("could not tighten mode on %s", _dir, exc_info=True)
+    payload = {"member": member, "slug": slug, "rules": text}
+    atomic_write(path, json.dumps(payload, ensure_ascii=False), fsync=True)
+
+
+def member_briefing_path(slug: str) -> Path:
+    """Absolute path to one member's self-maintained briefing file.
+
+    Inside :func:`member_dir` — deliberately agent-writable (see
+    ``BRIEFING_FILE_NAME``). Does NOT create the directory; the member's own
+    file tools do when it first writes its briefing.
+    """
+    return member_dir(slug) / BRIEFING_FILE_NAME
+
+
+def read_member_briefing(slug: str) -> str:
+    """Return a member's briefing text capped for injection, or ``""``.
+
+    Total by contract: every failure reads as "no briefing yet", which is the
+    normal state of a fresh member. Content past
+    :data:`MEMBER_BRIEFING_MAX_CHARS` is cut at the cap with a visible marker,
+    so the member SEES that its briefing overflowed (and can prune it) rather
+    than silently losing the tail.
+
+    The file is AGENT-WRITTEN, so two properties are enforced at the open,
+    not after it:
+
+    * **No symlink following, no non-regular files, no blocking open.** The
+      gateway reads this file with its own privileges while building context,
+      so a briefing replaced by a symlink would pull any gateway-readable
+      file — including the keystone-gated ``trust/`` payloads the agent's
+      tools cannot reach — into the prompt, and a briefing replaced by a FIFO
+      would make a plain ``open`` block forever, hanging the member's turn and
+      exhausting the embed workers. ``O_NOFOLLOW`` refuses a symlink leaf and
+      ``O_NONBLOCK`` makes a FIFO open return immediately instead of waiting
+      for a writer (both at open time — no check-then-open race); ``fstat``
+      then rejects anything that is not a regular file. Where ``O_NOFOLLOW``
+      does not exist (Windows) the read FAILS CLOSED to "no briefing": a
+      check-then-open probe is exactly the TOCTOU an agent-writable path
+      invites (swap a symlink in after the check), and the repo's posture on
+      hosts lacking an OS-level control is to refuse, not to run the racy
+      approximation.
+    * **Bounded read.** At most ``(cap + 2) * 4`` bytes are read (4 = max
+      UTF-8 bytes per char), so an arbitrarily large briefing costs a bounded
+      allocation, never gateway memory.
+
+    Blocking file IO: call via ``asyncio.to_thread`` from async code.
+    """
+    try:
+        path = member_briefing_path(slug)
+    except (MemberSlugError, OSError, RuntimeError):
+        return ""
+    byte_cap = (MEMBER_BRIEFING_MAX_CHARS + 2) * 4
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow:
+        # Fail closed (see the docstring): without O_NOFOLLOW there is no
+        # race-free way to refuse a symlink leaf on an agent-writable path.
+        return ""
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow | nonblock)
+    except OSError:
+        # Missing file, a symlink leaf refused by O_NOFOLLOW (ELOOP), or any
+        # unreadable state — all read as "no briefing yet".
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            # A FIFO, device or socket is never a briefing; reading one can
+            # block or misbehave, so it reads as "no briefing yet".
+            return ""
+        data = os.read(fd, byte_cap + 1)
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+    truncated_bytes = len(data) > byte_cap
+    if truncated_bytes:
+        # The cut can split a multi-byte character; the tail is being
+        # truncated anyway, so drop the partial character rather than failing
+        # the whole read over it.
+        text = data[:byte_cap].decode("utf-8", errors="ignore").strip()
+    else:
+        try:
+            text = data.decode("utf-8").strip()
+        except UnicodeError:
+            return ""
+    if truncated_bytes or len(text) > MEMBER_BRIEFING_MAX_CHARS:
+        return text[:MEMBER_BRIEFING_MAX_CHARS] + "\n[... briefing truncated at cap — prune it]"
+    return text
 
 
 def record_activity(
