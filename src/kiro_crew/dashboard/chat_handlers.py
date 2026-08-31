@@ -2411,6 +2411,13 @@ async def _reset_slot_session(
     completed an LLM round-trip, and such a turn is visible to any caller's
     has_active_turn() fast path — so a decline here implies a turn that started
     microseconds ago, which cannot have posted a card yet.
+
+    A successful reset also drops the slot's MCP session report, for the same
+    reason the pending card goes: it describes the session being torn down.
+    Every caller here changes what the next session will mount (agent, model,
+    workspace) or restarts it outright, so keeping the old report would leave
+    the UI presenting a dead session's server list as the live one's — the
+    stale-evidence failure that report exists to remove.
     """
     _unblock_pending_waits(state, slot)
     try:
@@ -2439,6 +2446,12 @@ async def _reset_slot_session(
         # decline would throw the authoritative answer away and re-create exactly
         # that.
         slot.record_model_withheld(None)
+        # The MCP session report rides the same gate for the same reason: it
+        # describes the session that was just torn down. Clearing is a courtesy
+        # delta push -- correctness rests on the identity projector in
+        # serialize_slots -- so it only fires when something was recorded.
+        if slot.clear_mcp_report():
+            state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
     return reloaded
 
 
