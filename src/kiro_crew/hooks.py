@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1898,60 +1898,94 @@ def is_unc_shape(raw: str) -> bool:
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
-_unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+_unc_kiro_roots_cache: tuple[tuple[object, ...], tuple[Path, ...]] | None = None
 
 
-def _unc_agents_root() -> Path | None:
-    """The kiro agents dir as a UNC-gate trusted root, memoized per configuration.
+def _unc_kiro_roots() -> tuple[Path, ...]:
+    """The kiro-home directories that are UNC-gate trusted roots, memoized.
 
-    ``kiro_agents_dir()`` resolves ``KIRO_HOME`` (``Path.resolve()`` --
-    filesystem I/O, and on a UNC-shaped override an SMB touch), so consulting
-    it per gate check would put blocking I/O -- and exactly the network access
-    this gate promises not to make -- on every validation, including async
-    callers (review finding on #6728). Memoized on the RAW ``KIRO_HOME`` env
-    value plus the accessor and override-hook identities, so the resolution
-    runs once per configuration and a monkeypatched or hot-swapped accessor
-    invalidates naturally. Mirrors how ``data_home()`` keeps its own hot path
-    cheap.
+    Two of them: the agents dir (#6721) and the kiro-cli transcript dir
+    (#6733). Both are admitted on the same two properties, and neither is
+    admitted on "the gateway writes here" alone:
 
-    A computation failure memoizes ``None`` (root absent, gate stays total):
-    deterministic-per-configuration beats self-healing here, because the
+    1. The root is derived from the ENVIRONMENT -- ``Path.home()`` or an
+       explicit ``KIRO_HOME`` -- never from message text or a request
+       parameter. The host in a UNC spelling of it is therefore the operator's
+       own profile server, which is the whole distinction this gate draws: an
+       attacker cannot steer a fixed prefix at ``\\\\evil\\share``.
+    2. The gateway already reaches that host by design, so admitting the root
+       adds no new SMB destination -- on a roaming profile both sit on the same
+       share as the data home.
+
+    The transcript dir is WRITTEN by kiro-cli rather than by this gateway,
+    which is why #6733 held it back from #6728 for a decision. It does not
+    change either property: the gateway READS that directory by design on every
+    platform (``session_map``, ``acp/*``, ``providers/acp``,
+    ``dashboard/handlers/usage``), and what a foreign writer controls is a
+    file's NAME and CONTENT under an already-fixed prefix -- content is the
+    reader's problem (``is_sensitive_path``, then JSON parsing), and a name
+    cannot introduce a host. Admission is the transcript directory EXACTLY, not
+    the kiro home: ``<kiro home>/settings/mcp.json`` decides which MCP servers
+    exist and has no reader that needs the gate opened, so it stays refused.
+
+    Memoized because both accessors route through ``kiro_home()``, which
+    resolves a ``KIRO_HOME`` override with ``Path.resolve()`` -- filesystem
+    I/O, and on a UNC-shaped override an SMB touch. Consulting them per gate
+    check would put blocking I/O -- and exactly the network access this gate
+    promises not to make -- on every validation, including async callers
+    (review finding on #6728). The key is the raw ``KIRO_HOME`` value plus the
+    accessor and override-hook identities, so the resolution runs once per
+    configuration and a monkeypatched or hot-swapped accessor invalidates
+    naturally. Mirrors how ``data_home()`` keeps its own hot path cheap.
+
+    A per-accessor failure drops only THAT root and is memoized as absent
+    (deterministic-per-configuration beats self-healing here, because the
     failure mode being avoided is a per-call resolve that can block on an SMB
-    timeout, and the degraded state -- UNC agent specs refused -- is exactly
-    the pre-#6721 status quo. Recovery is an env change or process restart.
-    Benign write race under threads: last-writer-wins on an idempotent value.
+    timeout; the degraded state -- UNC specs or transcripts refused -- is the
+    pre-#6721 status quo, and recovery is an env change or a restart). Each
+    accessor is tolerated independently so one broken resolution cannot cost
+    the other its root. Benign write race under threads: last-writer-wins on
+    an idempotent value.
     """
-    global _unc_agents_root_cache
+    global _unc_kiro_roots_cache
+    # Read the accessors ONCE: they go into the cache key and are then called,
+    # so a hot swap between the two steps cannot memoize a root under the wrong
+    # key. The PROJECT-level agents dir is deliberately absent -- an arbitrary
+    # project directory is neither environment-derived nor a host the gateway
+    # already reaches, so admitting it would widen the trust boundary.
+    accessors: tuple[Callable[[], Path], ...] = (
+        _config_paths.kiro_agents_dir,
+        _config_paths.kiro_sessions_dir,
+    )
     key: tuple[object, ...] = (
         os.environ.get("KIRO_HOME"),
-        _config_paths.kiro_agents_dir,
         getattr(_config_paths, "_agents_dir_override", None),
-    )
-    cached = _unc_agents_root_cache
+    ) + accessors
+    cached = _unc_kiro_roots_cache
     if cached is not None and cached[0] == key:
         return cached[1]
-    try:
-        # Same admission basis as data_home(): the gateway itself writes the
-        # managed agent specs here. The PROJECT-level agents dir is
-        # deliberately NOT admitted -- an arbitrary project directory is not
-        # gateway-written, so admitting it would widen the trust boundary.
-        root: Path | None = _config_paths.kiro_agents_dir()
-    except (ValueError, OSError, RuntimeError):
-        # A broken home resolution must not take the gate down with it: the
-        # two always-computable roots still apply and the function stays
-        # total (True/False, never a propagated error).
-        root = None
-    _unc_agents_root_cache = (key, root)
-    return root
+    resolved: list[Path] = []
+    for accessor in accessors:
+        try:
+            resolved.append(accessor())
+        except (ValueError, OSError, RuntimeError):
+            # A broken home resolution must not take the gate down with it: the
+            # two always-computable roots still apply, the sibling kiro root is
+            # unaffected, and the function stays total (a tuple, never a
+            # propagated error).
+            continue
+    roots = tuple(resolved)
+    _unc_kiro_roots_cache = (key, roots)
+    return roots
 
 
 # Prime the memo at import time (review finding, #6728 round 3): without this
 # the FIRST gate check after process start -- or after a ``KIRO_HOME`` change --
-# still pays the resolving accessor on whatever thread asked, which on an async
+# still pays the resolving accessors on whatever thread asked, which on an async
 # validation path is the event loop. Import of this module happens at process
 # start, off the loop, so the one resolution per configuration lands there.
 # Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
-_unc_agents_root()
+_unc_kiro_roots()
 
 
 def unc_probe_allowed(raw: str) -> bool:
@@ -1961,26 +1995,26 @@ def unc_probe_allowed(raw: str) -> bool:
     (``\\\\evil\\share\\x.png`` or ``//evil/share/x.png`` echoed in any message
     or query) makes Windows open an SMB connection to that host -- an outbound
     credential probe the attacker controls. Filesystem access is therefore
-    restricted to UNC paths under directories this gateway itself writes to:
-    the data home (on a roaming profile the home directory is itself a UNC
-    share, the one legitimate source of UNC attachment paths), the temp
-    directory (channel-side image staging), and the kiro agents directory
-    (``apps.bridges._register_agents`` and ``agent.rebuild_agent_config``
-    write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
-    on a roaming profile it sits on the same UNC share as the data home, and
-    without it every user-level agent spec read was silently refused, #6721).
-    The comparison is purely lexical (``normpath``/``normcase``) and the
-    agents root is memoized per configuration (see ``_unc_agents_root``), so
-    this check never touches the network itself.
+    restricted to UNC paths under a fixed set of environment-derived roots the
+    gateway already reaches by design: the data home (on a roaming profile the
+    home directory is itself a UNC share, the one legitimate source of UNC
+    attachment paths), the temp directory (channel-side image staging), and the
+    two kiro-home roots -- the agents dir, without which every user-level agent
+    spec read was silently refused (#6721), and the kiro-cli transcript dir,
+    without which the usage page silently counted zero sessions (#6733). See
+    ``_unc_kiro_roots`` for what admits those two and why the rest of the kiro
+    home is not admitted. The comparison is purely lexical
+    (``normpath``/``normcase``) and the kiro roots are memoized per
+    configuration, so this check never touches the network itself.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
-    agents_root = _unc_agents_root()
-    if agents_root is not None:
-        roots += (agents_root,)
+    roots: tuple[Path, ...] = (
+        _config_paths.data_home(),
+        Path(tempfile.gettempdir()),
+    ) + _unc_kiro_roots()
     for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):

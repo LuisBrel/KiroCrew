@@ -30,6 +30,7 @@ from kiro_crew.metrics.turns import (
     emit_turn_usage,
     turn_outcome,
 )
+from kiro_crew.pinned_fs import is_reparse_point
 
 logger = logging.getLogger(__name__)
 
@@ -1797,6 +1798,8 @@ def _parse_sessions() -> dict:
     total_msgs = 0
     total_tools = 0
     all_time_sessions = 0
+    refused_transcripts = 0
+    linked_transcripts = 0
     now_dt = datetime.now()
     today_str = now_dt.strftime("%Y-%m-%d")
 
@@ -1811,9 +1814,29 @@ def _parse_sessions() -> dict:
     for f in entries:
         if f.suffix != ".jsonl":
             continue
+        # Refuse a symlink or Windows junction BEFORE validate_file_path, whose
+        # ``realpath`` would follow it (GPT review on #7285). The trusted-root
+        # gate is deliberately lexical and reads the RAW path, so it cannot see
+        # where a link points: a link planted here by anything that can write
+        # this directory would pass the gate and then have its TARGET resolved,
+        # which on a UNC target is the outbound SMB probe the gate exists to
+        # prevent. ``is_reparse_point`` only ``lstat``s the link itself -- that
+        # inode lives on the already-trusted share this loop is enumerating --
+        # so the check never touches the target host. kiro-cli writes
+        # transcripts as regular files, so nothing legitimate is lost.
+        if is_reparse_point(f):
+            linked_transcripts += 1
+            continue
         # Validate path through hooks.py (resolves symlinks, checks sensitive)
         resolved_str = validate_file_path(str(f))
         if resolved_str is None:
+            # Counted, not swallowed (#6733): a refusal here is indistinguishable
+            # from an idle account in the rendered numbers, and on a
+            # roaming-profile (UNC) home EVERY transcript used to land in this
+            # branch -- so the page reported a confident zero with nothing
+            # anywhere to say why. Aggregated after the loop rather than logged
+            # per file, because that failure mode refuses all of them.
+            refused_transcripts += 1
             continue
         resolved = Path(resolved_str)
         try:
@@ -1855,6 +1878,27 @@ def _parse_sessions() -> dict:
         daily_tools[day] += tools
         total_msgs += msgs
         total_tools += tools
+
+    if refused_transcripts:
+        # Server-side only: %s of a Path is a filesystem path, which the
+        # returned payload deliberately never carries (see the iterdir handler
+        # above). Two separate records because the causes need different
+        # responses: a gate refusal is a configuration/platform problem, while a
+        # link planted in this directory is a potential tampering signal.
+        logger.warning(
+            "usage: %d transcript(s) refused by path validation in %s; "
+            "the reported session counts exclude them",
+            refused_transcripts,
+            sessions_dir,
+        )
+    if linked_transcripts:
+        logger.warning(
+            "usage: %d transcript(s) in %s are links, not regular files, and "
+            "were refused without resolving their target; the reported session "
+            "counts exclude them",
+            linked_transcripts,
+            sessions_dir,
+        )
 
     # Build daily history sorted by date
     all_days = sorted(set(daily.keys()))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import kiro_crew.dashboard.handlers.usage as usage_mod
+import kiro_crew.hooks as hooks_mod
 from kiro_crew.dashboard.handlers.usage import (
     _cached_parse_sessions,
     _parse_sessions,
@@ -30,6 +32,34 @@ from kiro_crew.dashboard.handlers.usage import (
 )
 
 # ── _parse_sessions ─────────────────────────────────────────────────────
+
+
+class _NtOsShim:
+    """Proxy for the ``os`` module that reports ``name == "nt"``.
+
+    Installed onto :mod:`kiro_crew.hooks` only, so ``validate_file_path``'s
+    Windows-only UNC branch runs on the POSIX CI box while every other module
+    keeps the real ``os`` (a global ``os.name`` patch makes ``Path.home()``
+    raise on POSIX). ``path.realpath`` is a LEXICAL no-op so the simulated UNC
+    spelling survives to the caller instead of being collapsed by the real
+    resolver -- which is also what keeps the test from handing a synthetic UNC
+    host to a resolver on a real Windows box.
+    """
+
+    name = "nt"
+
+    class _LexicalPath:
+        @staticmethod
+        def realpath(p):
+            return p
+
+        def __getattr__(self, attr):
+            return getattr(os.path, attr)
+
+    path = _LexicalPath()
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
 
 
 def _write_session(path, lines, mtime=None):
@@ -76,6 +106,116 @@ class TestParseSessions:
         ):
             r = _parse_sessions()
             assert r["total_sessions"] == 0
+
+    def test_refused_transcripts_are_reported_not_swallowed(self, tmp_path, caplog):
+        """#6733: a refused transcript is skipped, and the skip must leave a
+        trace. Before this, a home whose every transcript the path validator
+        refused rendered as a legitimate "zero sessions" with nothing logged.
+
+        Asserted on the LOG, not the payload: the count is deliberately not an
+        API field while no renderer reads it (First Principles review on #7285).
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        _write_session(d / "s1.jsonl", [{"kind": "Prompt"}])
+        _write_session(d / "s2.jsonl", [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=None
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 0
+        # One aggregated record, not one per file: a UNC home refuses every
+        # transcript, and per-file logging would emit thousands.
+        refusals = [
+            rec for rec in caplog.records if "refused by path validation" in rec.getMessage()
+        ]
+        assert len(refusals) == 1
+        assert "2" in refusals[0].getMessage()
+
+    def test_no_refusal_log_when_every_transcript_validates(self, tmp_path, caplog):
+        """The counterpart: the healthy path stays quiet."""
+        d = tmp_path / "cli"
+        d.mkdir()
+        f = d / "s1.jsonl"
+        _write_session(f, [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=str(f)
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 1
+        assert not [rec for rec in caplog.records if "refused" in rec.getMessage()]
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="needs POSIX symlink creation without the Windows developer-mode "
+        "privilege; the production check is platform-neutral via is_reparse_point",
+    )
+    def test_symlinked_transcript_is_refused_before_resolution(self, tmp_path, caplog):
+        """GPT review on #7285: admitting the transcript dir to the UNC gate must
+        not let a LINK planted in that directory have its target resolved.
+
+        The gate is lexical on the RAW path, so a link under a trusted root
+        passes it and ``validate_file_path`` would then ``realpath`` the target
+        -- on a UNC target that resolution IS the outbound SMB probe the gate
+        exists to prevent. The load-bearing assertion is therefore that
+        ``validate_file_path`` is never CALLED for the link, not merely that the
+        link goes uncounted: refusing it after resolution would already have made
+        the network call.
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        _write_session(d / "good.jsonl", [{"kind": "Prompt"}])
+        outside = tmp_path / "elsewhere.jsonl"
+        _write_session(outside, [{"kind": "Prompt"}])
+        (d / "linked.jsonl").symlink_to(outside)
+
+        seen: list[str] = []
+        real_validate = usage_mod.validate_file_path
+
+        def spy(raw):
+            seen.append(raw)
+            return real_validate(raw)
+
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", spy
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+
+        assert not any("linked.jsonl" in raw for raw in seen)
+        assert any("good.jsonl" in raw for raw in seen)
+        assert r["total_sessions"] == 1  # only the regular transcript counted
+        links = [rec for rec in caplog.records if "are links" in rec.getMessage()]
+        assert len(links) == 1
+        assert "1" in links[0].getMessage()
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "resolving the synthetic UNC path would itself be the outbound SMB "
+        "probe the gate exists to prevent",
+    )
+    def test_unc_home_transcripts_are_counted(self, monkeypatch, tmp_path):
+        """End-to-end #6733 symptom on a roaming-profile (UNC) home.
+
+        The transcript directory is spelled with two leading separators -- which
+        makes it UNC-SHAPED to the gate while still naming the same real local
+        directory on Linux, so ``iterdir``/``stat``/``open`` all run for real --
+        and hooks' view of ``os`` is shimmed to report ``"nt"`` so
+        ``validate_file_path`` consults the Windows-only UNC branch. Before the
+        fix every transcript was refused and the page reported zero sessions.
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        _write_session(d / "s1.jsonl", [{"kind": "Prompt"}, {"kind": "AssistantMessage"}])
+        unc_sessions = Path("/" + str(d))  # //tmp/... -- UNC-shaped, same real dir
+
+        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", unc_sessions)
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_sessions_dir", lambda: unc_sessions)
+        monkeypatch.setattr(hooks_mod, "os", _NtOsShim())
+
+        r = _parse_sessions()
+        assert r["total_sessions"] == 1
+        assert r["all_time_sessions"] == 1
 
     def test_stat_oserror(self, tmp_path):
         d = tmp_path / "cli"

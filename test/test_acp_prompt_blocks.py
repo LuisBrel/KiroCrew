@@ -490,6 +490,147 @@ class TestUncProbeGate:
         monkeypatch.setattr(hooks, "os", self._NtOs())
         assert _read_agent_spec(_WindowsResolvedPath()) == {"name": "foo", "model": "m1"}
 
+    # --- kiro sessions dir as a trusted UNC root (#6733) --------------------
+    #
+    # Same lexical gate, same forward-slash convention as the agents block
+    # above. The admission is deliberately the TRANSCRIPT DIRECTORY, not the
+    # kiro home: the reader that needed it (``dashboard.handlers.usage``)
+    # enumerates exactly that directory, so a wider root would buy nothing and
+    # would put ``<kiro home>/settings`` behind the same allow.
+
+    def _patch_session_roots(self, monkeypatch, tmp_path, sessions_dir):
+        """Local data home + agents dir, so only the sessions root can admit."""
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.kiro_agents_dir", lambda: tmp_path / ".kiro" / "agents"
+        )
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_sessions_dir", lambda: sessions_dir)
+
+    def test_unc_kiro_sessions_dir_is_allowed(self, monkeypatch, tmp_path):
+        """Headline #6733: on a roaming-profile (UNC) home, a kiro-cli
+        transcript under the sessions dir passes the gate. The data home and
+        the agents dir are patched LOCAL so the admission can only come from
+        the new sessions root."""
+        self._patch_session_roots(
+            monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/sessions/cli")
+        )
+        assert (
+            hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/cli/abc.jsonl") is True
+        )
+        if os.name == "nt":
+            assert (
+                hooks.unc_probe_allowed(
+                    r"\\fileserver\profiles\alice\.kiro\sessions\cli\abc.jsonl"
+                )
+                is True
+            )
+
+    def test_sibling_share_refused_for_sessions_root(self, monkeypatch, tmp_path):
+        """Same HOST, different share: the new root is prefix-anchored, not
+        host-anchored."""
+        self._patch_session_roots(
+            monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/sessions/cli")
+        )
+        assert hooks.unc_probe_allowed("//fileserver/other/sessions/cli/abc.jsonl") is False
+
+    def test_neighbour_directory_of_sessions_root_refused(self, monkeypatch, tmp_path):
+        """``cli-evil`` is not under ``cli``: the comparison must require a
+        separator boundary, not a bare ``startswith``."""
+        self._patch_session_roots(
+            monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/sessions/cli")
+        )
+        assert (
+            hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/cli-evil/abc.jsonl")
+            is False
+        )
+
+    def test_rest_of_the_unc_kiro_home_is_not_admitted(self, monkeypatch, tmp_path):
+        """The trust decision this issue asked for, pinned: admitting the
+        transcript directory must NOT admit the kiro home. ``settings/mcp.json``
+        is the registry that decides which MCP servers exist, and it stays
+        refused."""
+        self._patch_session_roots(
+            monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/sessions/cli")
+        )
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/settings/mcp.json") is False
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/other/x.jsonl") is False
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME) is False
+
+    def test_local_sessions_root_is_not_admitted(self, monkeypatch, tmp_path):
+        """On an ordinary local home the added root admits nothing -- the
+        ``is_unc_shape(rootn)`` skip, asserted for the new root too."""
+        local_sessions = tmp_path / ".kiro" / "sessions" / "cli"
+        self._patch_session_roots(monkeypatch, tmp_path, local_sessions)
+        assert hooks.unc_probe_allowed("//evil/share/x.jsonl") is False
+        assert hooks.unc_probe_allowed(r"\\evil\share\x.jsonl") is False
+        assert hooks.unc_probe_allowed(str(local_sessions)) is False
+        assert hooks.unc_probe_allowed(str(local_sessions / "abc.jsonl")) is False
+
+    def test_broken_sessions_root_fails_safe(self, monkeypatch, tmp_path):
+        """``kiro_sessions_dir()`` raising must not take the gate down, and must
+        not cost the sibling kiro-home root either: each accessor is tolerated
+        independently."""
+
+        def boom():
+            raise RuntimeError("no usable home")
+
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.kiro_agents_dir",
+            lambda: Path(self._UNC_KIRO_HOME + "/agents"),
+        )
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_sessions_dir", boom)
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
+        assert (
+            hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/cli/abc.jsonl") is False
+        )
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+
+    def test_sessions_root_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """``kiro_sessions_dir()`` resolves ``KIRO_HOME`` through
+        ``kiro_home()`` (``Path.resolve()`` -- filesystem I/O, and an SMB touch
+        on a UNC override), so the gate must not consult it per check. Same
+        memoization contract #6728 established for the agents root."""
+        calls: list[int] = []
+
+        def counting_sessions_dir():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/sessions/cli")
+
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.kiro_agents_dir", lambda: tmp_path / ".kiro" / "agents"
+        )
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.kiro_sessions_dir", counting_sessions_dir
+        )
+        assert (
+            hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/cli/a.jsonl") is True
+        )
+        assert (
+            hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/sessions/cli/b.jsonl") is True
+        )
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "the downstream resolution of the synthetic UNC host would itself be "
+        "the outbound SMB probe the gate exists to prevent",
+    )
+    def test_validate_file_path_accepts_unc_sessions_transcript(self, monkeypatch, tmp_path):
+        """The surrounding gate, which is the call ``usage.py`` makes."""
+        self._patch_session_roots(
+            monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/sessions/cli")
+        )
+        monkeypatch.setattr(hooks, "os", self._NtOs())
+        assert (
+            hooks.validate_file_path(self._UNC_KIRO_HOME + "/sessions/cli/abc.jsonl")
+            is not None
+        )
+        assert hooks.validate_file_path("//evil/share/x.jsonl") is None
+
     def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
         """End-to-end: build_prompt_blocks must not touch the filesystem for a
         refused UNC candidate."""
