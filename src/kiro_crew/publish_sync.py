@@ -11,7 +11,10 @@ Responsibilities that live here (provider-agnostic):
 - The version-bump → push chokepoint and the 1:1 KiroCrew↔destination version
   invariant. Reverts mirror as a new version (never a pointer-rollback).
 - Best-effort sync: a ``push_version`` failure NEVER fails the KiroCrew update;
-  it's recorded in ``publication.last_error`` and surfaced to the UI.
+  a genuine failure is recorded in ``publication.last_error`` and surfaced to
+  the UI. A SUCCESSFUL publish whose link is not usable yet (e.g. CloudFront
+  still rolling out) records that status on ``publication.notice`` instead —
+  never ``last_error``, which every consumer reads as failure.
 - Optimistic concurrency: the provider's concurrency token is stored in
   ``publication.last_pushed_sha256`` and passed back on the next push; a
   mismatch is surfaced as a conflict, never force-pushed.
@@ -25,6 +28,7 @@ the user is intentionally sharing it — but it is never written to a log.
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import logging
 import os
@@ -381,6 +385,8 @@ def _publication_summary(pub: ArtifactPublication) -> dict[str, object]:
         "published_at": pub.published_at,
         "published_by": pub.published_by,
         "last_error": pub.last_error,
+        "notice": pub.notice,
+        "notice_code": pub.notice_code,
     }
 
 
@@ -478,6 +484,8 @@ async def publish(
         published_at=_now_iso(),
         published_by=res.owner,
         last_error="",
+        notice=res.notice,
+        notice_code=res.notice_code,
     )
     if pub.collab_mode == "live":
         # Establish the drift baseline from the read-back remote body (a live CRDT provider
@@ -595,6 +603,8 @@ async def push_version(art: Artifact, *, force: bool = False) -> None:
             wrapper_revision=WRAPPER_REVISION if fresh.kind == "widget" else pub.wrapper_revision,
             version_map=version_map,
             last_error="",
+            notice="",
+            notice_code="",
             **extra_pub,
         )
     )
@@ -612,6 +622,39 @@ async def push_version_by_slug(slug: str, *, force: bool = False) -> None:
     art = await asyncio.to_thread(get_default_store().get, slug)
     if art.publication is not None and art.publication.auto_sync:
         await push_version(art, force=force)
+
+
+def _sharing_fields(
+    art: Artifact, provider: PublishProvider, visibility: str, shared_with: list[str]
+) -> dict[str, object]:
+    """The publication patch for a visibility change, including a late-derived link.
+
+    A destination whose link is DERIVED rather than returned can only produce a usable
+    one once the artifact is publicly served, so publishing privately stores no url --
+    correct at the time, since a link into the served prefix would 404 while the object
+    sits in the unserved one. Nothing else ever revisits the field, so without this a
+    later flip to public leaves the artifact public with NO link at all, and no way to
+    obtain one short of re-publishing it.
+
+    Additive only: the url is filled when it is missing, never replaced and never
+    cleared. A destination that returned its own url at publish time keeps exactly that
+    url, so this cannot corrupt a link it did not create.
+    """
+    fields: dict[str, object] = {
+        "visibility": visibility,
+        "shared_with": shared_with,
+        "last_error": "",
+        # A successful visibility change settles the rollout question, so a
+        # stale "still rolling out" notice must not persist.
+        "notice": "",
+        "notice_code": "",
+    }
+    pub = art.publication
+    if pub is not None and not pub.view_url and (visibility or "").strip().lower() == "public":
+        derived = provider.view_url_for(pub.artifact_id)
+        if derived:
+            fields["view_url"] = derived
+    return fields
 
 
 async def update_sharing(
@@ -634,7 +677,7 @@ async def update_sharing(
     )
     updated = await asyncio.to_thread(
         lambda: store.update_publication(
-            slug, visibility=visibility, shared_with=shared_with, last_error=""
+            slug, **_sharing_fields(art, provider, visibility, shared_with)
         )
     )
     assert updated.publication is not None  # just set above
@@ -647,22 +690,44 @@ async def unshare(slug: str) -> dict[str, object]:
 
 
 async def unpublish(slug: str) -> None:
-    """Delete from the destination and clear the local publication block.
+    """Delete from the destination, then clear the local publication block.
 
-    Best-effort on the destination delete (logs on failure) but always clears
-    the local publication. Raises ``NotPublishedError`` only when the artifact
-    isn't published.
+    The destination delete is deliberately NOT best-effort. The publication block is
+    the only handle to content that may still be served, so clearing it after a failed
+    removal strands that content: nothing local records where it is, and no retry can
+    reach it. A failure therefore keeps the block and raises, leaving the withdrawal
+    retryable. Deleting the ARTIFACT is the other way out of a kept publication, and it
+    does attempt the destination withdrawal first (see ``delete_for_artifact``). That
+    path is the escape hatch for a destination that is GONE FOR GOOD -- unregistered,
+    or ``available()`` False (credentials revoked, account closed): the withdrawal can
+    never reach it, so the delete proceeds and only a log line is left. But when the
+    destination is reachable and merely REJECTS the withdrawal, that path aborts too
+    (it does not silently strand the copy), because a retry there can still succeed.
+    Raises ``NotPublishedError`` only when the artifact isn't published.
     """
     store = get_default_store()
     art = await asyncio.to_thread(store.get, slug)
     if art.publication is None:
         raise NotPublishedError(f"artifact {slug} is not published")
     provider = _resolve_provider(art.publication.provider)
-    if provider.available():
-        try:
-            await provider.unpublish(external_id=art.publication.artifact_id)
-        except Exception as exc:  # pragma: no cover — best-effort
-            logger.warning("unpublish: destination delete failed for %s: %s", slug, exc)
+    if not provider.reachable_for(external_id=art.publication.artifact_id):
+        raise PublishUnavailableError(
+            "This artifact's destination is not reachable, so it is still marked "
+            "published: the copy out there may still be served, and discarding the "
+            "record here would leave nothing able to withdraw it. If the account it "
+            "was published to still exists, restore access and try again; if it is "
+            "gone, delete the artifact to drop the record along with it."
+        )
+    try:
+        await provider.unpublish(external_id=art.publication.artifact_id)
+    except Exception as exc:
+        # The exception text is for the log, not the user: it carries provider and SDK
+        # internals, and this string is rendered verbatim in the dashboard.
+        logger.warning("unpublish: destination delete failed for %s: %s", slug, exc)
+        raise PublishError(
+            "The destination did not confirm the removal, so this artifact is still "
+            "marked published and the withdrawal can be retried."
+        ) from exc
     await asyncio.to_thread(store.clear_publication, slug)
     logger.info("artifact unpublished: slug=%s", slug)
 
@@ -761,21 +826,154 @@ async def refresh_publication(slug: str) -> Artifact:
     return await asyncio.to_thread(lambda: store.update_publication(slug, **fields))
 
 
-async def delete_for_artifact(art: Artifact) -> None:
-    """Best-effort destination delete before a local artifact delete.
+async def reprobe_notice(slug: str) -> Artifact:
+    """Re-check the destination's serving state and bring a stale publish
+    ``notice`` up to date. Best-effort — never raises; returns the (possibly
+    updated) artifact.
 
-    Unlike ``unpublish`` this does NOT touch the local store (the artifact is
-    about to be deleted entirely) and never raises.
+    Fixes the happy-path staleness gap: ``notice`` / ``notice_code`` are reset
+    on push / pull / overwrite / visibility-change, but an ordinary publish that
+    later finishes rolling out has no path that revisits them, so the amber
+    "still rolling out" banner would persist forever after the link works. This
+    asks the provider what the CURRENT notice is (:meth:`PublishProvider.serving_notice`)
+    and reconciles the stored record to that truth. It does NOT clear on a timer
+    or on read without checking:
+
+    - Provider re-checks and returns an EMPTY pair -> the condition has cleared,
+      so ``notice`` / ``notice_code`` are cleared.
+    - Provider returns a non-empty pair -> still (or now differently) unhealthy;
+      the stored notice is refreshed to match rather than cleared.
+    - Provider returns ``None`` (cannot re-check) or is unavailable -> the stored
+      notice is left exactly as it was; we never clear a notice we could not
+      verify.
+
+    A publication that carries no notice is a no-op (nothing to reconcile), so
+    the re-probe never issues a needless store write for the common case.
+    """
+    store = get_default_store()
+    art = await asyncio.to_thread(store.get, slug)
+    pub = art.publication
+    if pub is None:
+        return art
+    # Nothing to reconcile if there is no stored notice. Skip the provider probe
+    # AND the store write so a re-probe of an already-healthy publication costs
+    # nothing.
+    if not pub.notice and not pub.notice_code:
+        return art
+    provider = _resolve_provider(pub.provider)
+    if not provider.available():
+        return art
+    try:
+        probed = await provider.serving_notice(external_id=pub.artifact_id)
+    except Exception as exc:  # pragma: no cover — best-effort
+        logger.warning("reprobe_notice: serving_notice failed for %s: %s", slug, exc)
+        return art
+    if probed is None:
+        # Provider cannot re-check — leave the stored notice untouched.
+        return art
+    notice_text, notice_code = probed
+    # Redact provider-controlled text before persisting (parity with the other
+    # provider-string sinks in this module) — it can embed remote URLs.
+    notice_text = _redact_untrusted(str(notice_text or ""), "provider")
+    notice_code = str(notice_code or "")
+    if notice_text == pub.notice and notice_code == pub.notice_code:
+        # Already in sync (e.g. still rolling out and unchanged) — no write.
+        return art
+    logger.info(
+        "reprobe_notice: reconciled notice for %s (code %r -> %r)",
+        slug,
+        pub.notice_code,
+        notice_code,
+    )
+    return await asyncio.to_thread(
+        lambda: store.update_publication(slug, notice=notice_text, notice_code=notice_code)
+    )
+
+
+class DeleteWithdrawal(enum.Enum):
+    """Outcome of ``delete_for_artifact`` -- the four states the caller must
+    tell apart to decide whether the local delete may proceed.
+
+    A retry of the destination withdrawal is meaningful ONLY for ``FAILED`` (the
+    destination was reachable and rejected the call, so trying again later can
+    succeed). For every other outcome the record carries no retryable handle
+    worth keeping, so the caller should proceed with the local delete:
+
+    - ``NOTHING_PUBLISHED`` -- the artifact was never published; there is nothing
+      to withdraw.
+    - ``UNREACHABLE`` -- the destination is gone for good as far as this process
+      can tell (provider unregistered in this edition, or ``available()`` False:
+      credentials revoked, account closed, offline). No call was attempted, and
+      no retry from here can reach it. This is the escape-hatch case ``unpublish``
+      points users at.
+    - ``WITHDRAWN`` -- the destination confirmed the removal.
+    - ``FAILED`` -- the destination was reachable but the withdrawal call raised.
+      A later retry can plausibly succeed, so the caller MUST keep the record.
+    """
+
+    NOTHING_PUBLISHED = "nothing_published"
+    UNREACHABLE = "unreachable"
+    WITHDRAWN = "withdrawn"
+    FAILED = "failed"
+
+
+async def delete_for_artifact(art: Artifact) -> DeleteWithdrawal:
+    """Attempt the destination withdrawal for an artifact being deleted locally,
+    and REPORT which of :class:`DeleteWithdrawal` happened.
+
+    Unlike ``unpublish`` this does NOT touch the local store (the artifact is the
+    caller's to delete) and NEVER raises -- provider resolution, the availability
+    probe, and the withdrawal call are all inside the guard, so a caller that
+    cannot act on an exception gets a value instead. But it no longer *swallows*
+    the distinction: the caller uses the returned outcome to decide whether the
+    local delete may proceed.
+
+    An unreachable or unregistered destination is reported as ``UNREACHABLE``,
+    not ``FAILED``: nothing was attempted and no retry from here could reach it,
+    so it is the gone-for-good escape-hatch case rather than a retryable error.
+    Only a reachable destination that rejects the call yields ``FAILED``.
     """
     if art.publication is None:
-        return
-    provider = _resolve_provider(art.publication.provider)
-    if not provider.available():
-        return
+        return DeleteWithdrawal.NOTHING_PUBLISHED
+    try:
+        provider = _resolve_provider(art.publication.provider)
+    except PublishUnavailableError as exc:
+        # No provider registered under this name in this edition: there is no
+        # destination this process can reach, so a retry is not meaningful.
+        logger.warning(
+            "delete_for_artifact: no reachable destination for %s (provider=%s): %s",
+            art.slug,
+            art.publication.provider,
+            exc,
+        )
+        return DeleteWithdrawal.UNREACHABLE
+    if not provider.reachable_for(external_id=art.publication.artifact_id):
+        # Destination gone for good as far as we can tell -- the escape-hatch
+        # case. Proceed with the local delete; the remote copy may remain.
+        # Scoped to THIS publication's account, not the registry default: with
+        # another account still registered, the wide probe called a removed one
+        # reachable and sent this into the retryable branch below, which cannot
+        # succeed and leaves the artifact undeletable.
+        logger.warning(
+            "delete_for_artifact: destination not reachable, local delete will proceed "
+            "and the remote copy may remain for %s (provider=%s)",
+            art.slug,
+            art.publication.provider,
+        )
+        return DeleteWithdrawal.UNREACHABLE
     try:
         await provider.unpublish(external_id=art.publication.artifact_id)
-    except Exception as exc:  # pragma: no cover — best-effort
-        logger.warning("delete_for_artifact failed for %s: %s", art.slug, exc)
+    except Exception as exc:
+        # Reachable but the withdrawal was rejected -- a retry can succeed, so the
+        # caller must keep the publication record rather than strand the copy.
+        logger.warning(
+            "delete_for_artifact: destination copy may remain for %s (provider=%s): %s",
+            art.slug,
+            art.publication.provider,
+            exc,
+        )
+        return DeleteWithdrawal.FAILED
+    return DeleteWithdrawal.WITHDRAWN
 
 
 # ── Bidirectional sync: pull + clone ─────────────────────────────────────────
@@ -1098,6 +1296,8 @@ async def pull_upstream(
                 last_pushed_sha256=str(pulled.get("sha256") or prev_sha),
                 version_map=version_map,
                 last_error="",
+                notice="",
+                notice_code="",
                 **extra_pull,
             )
         )
@@ -1214,6 +1414,8 @@ async def clone_from_remote(artifact_id: str, *, provider_name: str = DEFAULT_PR
             published_at=_now_iso(),
             published_by=owner,
             last_error="",
+            notice="",
+            notice_code="",
         )
         logger.info("clone_from_remote: %s as slug=%s", artifact_id, art.slug)
         if pub.collab_mode == "live":
@@ -1322,7 +1524,7 @@ async def overwrite_upstream(slug: str) -> dict[str, object]:
         if not provider.available():
             return {"overwritten": False, "reason": "provider unavailable", "tracked": True}
         await asyncio.to_thread(
-            lambda: store.update_publication(slug, auto_sync=True, last_error="")
+            lambda: store.update_publication(slug, auto_sync=True, last_error="", notice="", notice_code="")
         )
         await push_version(await asyncio.to_thread(store.get, slug), force=True)
         refreshed = await asyncio.to_thread(store.get, slug)
@@ -1353,6 +1555,8 @@ async def overwrite_upstream(slug: str) -> dict[str, object]:
             ),
             auto_sync=True,
             last_error="",
+            notice="",
+            notice_code="",
         )
     )
     await push_version(await asyncio.to_thread(store.get, slug), force=True)

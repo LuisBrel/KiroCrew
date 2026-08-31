@@ -243,6 +243,25 @@ class PublishResult:
     version_number: int  # destination version number (usually 1)
     concurrency_token: str  # opaque token to pass to the next push (sha256)
     owner: str = ""  # destination-side owner alias ("shared by")
+    # Non-empty when the publish SUCCEEDED but the link is not usable yet -- the content
+    # is stored at the destination and this result's handle is valid, so the publication
+    # must be recorded, but something the user needs to know stands between them and a
+    # working link (e.g. a CDN rollout that has not finished). Raising instead would be
+    # lossy: the caller stores the publication only on success, so an abort after the
+    # content is already uploaded strands it with no withdrawal handle. Recorded as the
+    # publication's ``notice`` -- NOT ``last_error``, because ``last_error`` is read as
+    # failure by every consumer, so a success reported there renders the publish red and
+    # withholds the URL.
+    notice: str = ""
+    # Machine-readable discriminator for ``notice``, so the frontend can pick per-case
+    # copy instead of printing one fixed "still rolling out" string for every notice.
+    # Exactly one of the allowed values -- ``"rolling_out"`` (a fresh CDN deploy that will
+    # resolve shortly), ``"distribution_disabled"`` (the delivery network is off, whose
+    # remedy is to re-enable it in the provider console, NOT to wait), ``"unknown"`` (a
+    # notice with no recognised discriminator) -- or ``""`` when there is no notice. It
+    # always moves with ``notice``: a result carrying ``notice`` text carries a code, and
+    # an empty ``notice`` carries an empty code.
+    notice_code: str = ""
 
 
 @dataclass
@@ -289,6 +308,26 @@ class PublishProvider(ABC):
         :meth:`available`. Providers with an automated install override this to
         self-install silently so a first publish completes with no manual setup.
         Returns ``True`` when ready.
+        """
+        return self.available()
+
+    def reachable_for(self, *, external_id: str) -> bool:
+        """Whether the account THIS publication is bound to can still be reached.
+
+        :meth:`available` answers a destination-WIDE question -- is this kind of
+        destination configured at all -- which is the right question when deciding
+        whether to offer it for a new publish. Paths acting on an EXISTING
+        publication need the narrower one, because a publication is bound to one
+        specific account: a registry that still holds *an* account can be missing
+        the one this artifact was published to, and asking the wide question there
+        reports a destination as reachable when this artifact's own is gone. The
+        withdrawal paths then attempt a call that cannot succeed and report its
+        failure as retryable, so an artifact bound to a removed account can neither
+        be withdrawn nor deleted -- it just keeps advising a retry that will never
+        work.
+
+        Default: the destination-wide answer, which is correct for any provider
+        that binds nothing per publication.
         """
         return self.available()
 
@@ -347,6 +386,35 @@ class PublishProvider(ABC):
         default returns ``None`` (no reconcile) so providers that can't read
         state back don't have to implement it. Best-effort: implementations
         must not raise.
+        """
+        return None
+
+    async def serving_notice(self, *, external_id: str) -> tuple[str, str] | None:
+        """Re-derive the CURRENT serving notice for an already-published id, as
+        ``(notice_text, notice_code)`` -- or ``None`` when the provider cannot
+        re-check.
+
+        This is the read-back half of the publish-time notice: a publish records
+        a ``notice`` (e.g. a CDN still rolling out) that later resolves on its
+        own, but nothing on the happy path ever revisits it, so the stale banner
+        would otherwise persist forever. The dashboard calls this to bring the
+        record up to date; ``publish_sync.reprobe_notice`` clears the stored
+        ``notice`` / ``notice_code`` only when this returns an EMPTY pair
+        ``("", "")`` -- i.e. the provider re-checked and the condition has
+        actually cleared. Never on a timer, never without checking.
+
+        The two non-clearing outcomes are kept distinct so the re-probe never
+        clears a notice it could not verify:
+
+        - ``None`` -- the provider cannot re-check serving state (the default,
+          and what an unavailable / unregistered provider yields). The re-probe
+          leaves any stored notice exactly as it was.
+        - ``(text, code)`` with a non-empty ``code`` -- the condition is still
+          live (possibly a DIFFERENT one, e.g. rolling-out has finished but the
+          distribution is now disabled); the re-probe refreshes the stored
+          notice to match rather than clearing it.
+
+        Best-effort: implementations must not raise.
         """
         return None
 

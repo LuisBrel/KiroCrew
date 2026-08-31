@@ -69,6 +69,10 @@ class DummyPublishProvider(PublishProvider):
         self.update_sharing_response: dict = {"artifactId": "uuid-123"}
         self.delete_response: dict = {"deleted": True}
         self.get_response: dict = {}
+        #: What ``serving_notice`` reports on a re-probe. ``None`` means "cannot
+        #: re-check" (the interface default); a ``(text, code)`` tuple is the
+        #: current live notice (an empty pair meaning the condition has cleared).
+        self.serving_notice_response: tuple[str, str] | None = None
 
     # ── availability ──────────────────────────────────────────────────────
 
@@ -113,6 +117,8 @@ class DummyPublishProvider(PublishProvider):
             version_number=int(res.get("versionNumber") or 1),
             concurrency_token=str(res.get("sha256") or ""),
             owner=str(res.get("ownerAlias") or ""),
+            notice=str(res.get("notice") or ""),
+            notice_code=str(res.get("notice_code") or ""),
         )
 
     async def push_version(self, *, external_id, file_path, expected_token) -> PushResult:
@@ -212,6 +218,10 @@ class DummyPublishProvider(PublishProvider):
             "sha256": str(meta.get("sha256") or ""),
         }
 
+    async def serving_notice(self, *, external_id) -> tuple[str, str] | None:
+        self.calls.append(("serving_notice", {"artifact_id": external_id}))
+        return self.serving_notice_response
+
     # ── test helper ───────────────────────────────────────────────────────
 
     def called(self, tool: str) -> list[dict]:
@@ -268,6 +278,260 @@ async def test_publish_sets_publication(store, fake_client):
     upload_args = fake_client.called("upload")[0]
     assert upload_args["title"] == "Doc"
     assert upload_args["visibility"] == "PRIVATE"
+
+
+@pytest.mark.asyncio
+async def test_publish_records_a_provider_notice_without_losing_the_publication(
+    store, fake_client
+):
+    """A destination that stored the content but cannot serve it YET (a CDN mid-rollout)
+    must not have to choose between telling the user and keeping the handle. Raising
+    would skip `set_publication` entirely, stranding content that is already uploaded
+    with nothing to withdraw it by, so the notice rides back on the result. It is a
+    SUCCESS status, so it is recorded on `publication.notice` -- never `last_error`,
+    which every consumer reads as failure (renders the publish red and withholds the
+    URL)."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out; the same link will work shortly",
+    }
+    art = store.create(name="Doc", content="hello", kind="text")
+    summary = await publish_sync.publish(art.slug, visibility="PUBLIC")
+
+    pub = store.get(art.slug).publication
+    assert pub is not None, "a notice must never cost the withdrawal handle"
+    assert pub.artifact_id == "uuid-123"
+    # The notice rides the dedicated non-error field, and last_error stays empty
+    # so the publish is NOT rendered as a failure.
+    assert "still rolling out" in pub.notice
+    assert pub.last_error == ""
+    assert summary["artifact_id"] == "uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_publish_notice_appears_on_both_payload_keys(store, fake_client):
+    """The API payload must carry the success notice on `notice` and leave
+    `last_error` empty, so a frontend gating red on `last_error` shows the URL
+    and can surface the rollout line separately."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "CloudFront still rolling out",
+    }
+    art = store.create(name="Doc", content="hello", kind="text")
+    summary = await publish_sync.publish(art.slug, visibility="PUBLIC")
+
+    assert summary["notice"] == "CloudFront still rolling out"
+    assert summary["last_error"] == ""
+
+
+@pytest.mark.asyncio
+async def test_later_successful_push_clears_a_stale_notice(store, fake_client):
+    """A later successful push settles the rollout question, so a stale
+    'still rolling out' notice from the first publish must not persist."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PUBLIC")
+    assert store.get("d").publication.notice == "still rolling out"
+
+    # A new Kiro Crew version pushed successfully clears the stale notice.
+    store.update("d", content="v2 content", snapshot=True)
+    await publish_sync.push_version(store.get("d"))
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.last_error == ""
+
+
+@pytest.mark.asyncio
+async def test_later_successful_visibility_change_clears_a_stale_notice(store, fake_client):
+    """A visibility change reconciles the publication and settles the rollout
+    question, so it too clears a stale notice."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PRIVATE")
+    assert store.get("d").publication.notice == "still rolling out"
+
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.last_error == ""
+
+
+# ── notice_code discriminator (B1) ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_publish_carries_notice_code_on_payload_and_record(store, fake_client):
+    """The publish result's ``notice_code`` must land on the stored publication
+    AND the summary payload, alongside the human ``notice`` text."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "The drive's delivery network is DISABLED.",
+        "notice_code": "distribution_disabled",
+    }
+    art = store.create(name="Doc", content="hello", kind="text")
+    summary = await publish_sync.publish(art.slug, visibility="PUBLIC")
+
+    assert summary["notice_code"] == "distribution_disabled"
+    assert summary["notice"] == "The drive's delivery network is DISABLED."
+    pub = store.get(art.slug).publication
+    assert pub is not None
+    assert pub.notice_code == "distribution_disabled"
+
+
+@pytest.mark.asyncio
+async def test_notice_code_round_trips_through_meta_json(store, fake_client):
+    """``notice_code`` must persist to meta.json and deserialize back (additive,
+    defaulted — a reload never loses it)."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+        "notice_code": "rolling_out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PUBLIC")
+
+    # Fresh store instance -> forces a real meta.json read, not a cache hit.
+    reloaded = ArtifactStore(root=store.root).get("d")
+    assert reloaded.publication is not None
+    assert reloaded.publication.notice_code == "rolling_out"
+    assert reloaded.publication.notice == "still rolling out"
+
+
+@pytest.mark.asyncio
+async def test_notice_code_cleared_with_notice_on_push(store, fake_client):
+    """``notice_code`` moves with ``notice``: a later successful push that clears
+    the stale notice must clear the code too."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+        "notice_code": "rolling_out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PUBLIC")
+    assert store.get("d").publication.notice_code == "rolling_out"
+
+    store.update("d", content="v2 content", snapshot=True)
+    await publish_sync.push_version(store.get("d"))
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.notice_code == ""
+
+
+@pytest.mark.asyncio
+async def test_notice_code_cleared_with_notice_on_visibility_change(store, fake_client):
+    """A visibility change clears both halves of the notice together."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+        "notice_code": "rolling_out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PRIVATE")
+    assert store.get("d").publication.notice_code == "rolling_out"
+
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.notice_code == ""
+
+
+# ── reprobe_notice (B2) ─────────────────────────────────────────────────────
+
+
+async def _publish_with_rolling_out_notice(store, fake_client, slug="d"):
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+        "notice_code": "rolling_out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug=slug)
+    await publish_sync.publish(slug, visibility="PUBLIC")
+    assert store.get(slug).publication.notice_code == "rolling_out"
+
+
+@pytest.mark.asyncio
+async def test_reprobe_clears_notice_when_destination_now_healthy(store, fake_client):
+    """A re-probe against a destination that has finished rolling out (provider
+    reports an EMPTY pair) clears both ``notice`` and ``notice_code``."""
+    await _publish_with_rolling_out_notice(store, fake_client)
+
+    fake_client.serving_notice_response = ("", "")
+    await publish_sync.reprobe_notice("d")
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.notice_code == ""
+    # It actually probed the provider (not cleared on read without checking).
+    assert fake_client.called("serving_notice")
+
+
+@pytest.mark.asyncio
+async def test_reprobe_leaves_notice_when_still_unhealthy(store, fake_client):
+    """A re-probe against a destination that is still unhealthy leaves the
+    notice in place (refreshed to the provider's current answer)."""
+    await _publish_with_rolling_out_notice(store, fake_client)
+
+    fake_client.serving_notice_response = (
+        "The drive's delivery network is DISABLED.",
+        "distribution_disabled",
+    )
+    await publish_sync.reprobe_notice("d")
+
+    pub = store.get("d").publication
+    assert pub.notice_code == "distribution_disabled"
+    assert pub.notice == "The drive's delivery network is DISABLED."
+
+
+@pytest.mark.asyncio
+async def test_reprobe_leaves_notice_when_provider_cannot_recheck(store, fake_client):
+    """When the provider cannot re-check (``serving_notice`` returns ``None``),
+    the stored notice must be left exactly as it was — never cleared unverified."""
+    await _publish_with_rolling_out_notice(store, fake_client)
+
+    fake_client.serving_notice_response = None
+    await publish_sync.reprobe_notice("d")
+
+    pub = store.get("d").publication
+    assert pub.notice == "still rolling out"
+    assert pub.notice_code == "rolling_out"
+
+
+@pytest.mark.asyncio
+async def test_reprobe_is_noop_when_no_notice(store, fake_client):
+    """A publication with no notice never probes the provider or writes."""
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PUBLIC")
+    assert store.get("d").publication.notice == ""
+
+    await publish_sync.reprobe_notice("d")
+
+    assert not fake_client.called("serving_notice")
+
+
+@pytest.mark.asyncio
+async def test_reprobe_leaves_notice_when_provider_unavailable(store, fake_client):
+    """An unavailable provider is treated as "cannot re-check": the notice is
+    left in place rather than cleared."""
+    await _publish_with_rolling_out_notice(store, fake_client)
+
+    fake_client.ready = False
+    fake_client.serving_notice_response = ("", "")  # would clear IF it were consulted
+    await publish_sync.reprobe_notice("d")
+
+    pub = store.get("d").publication
+    assert pub.notice == "still rolling out"
+    assert pub.notice_code == "rolling_out"
+    assert not fake_client.called("serving_notice")
 
 
 @pytest.mark.asyncio
@@ -419,6 +683,59 @@ async def test_unpublish_clears_publication(store, fake_client):
 
 
 @pytest.mark.asyncio
+async def test_unpublish_keeps_the_publication_when_the_destination_fails(store, fake_client):
+    """The publication block is the only handle to content that may still be served, so
+    a failed removal must keep it rather than strand that content with no retry path."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    fake_client.delete_response = {"error": "Throttling: rate exceeded"}
+    with pytest.raises(publish_sync.PublishError):
+        await publish_sync.unpublish("d")
+    assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_unpublish_keeps_the_publication_when_the_destination_is_unreachable(store, fake_client, monkeypatch):
+    """Same invariant through the other mouth: an unavailable destination skips the
+    delete entirely, so clearing the record there loses the handle just as silently."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    monkeypatch.setattr(type(fake_client), "available", lambda self: False)
+    with pytest.raises(publish_sync.PublishUnavailableError):
+        await publish_sync.unpublish("d")
+    assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_going_public_fills_a_link_the_private_publish_could_not_derive(store, fake_client, monkeypatch):
+    """A destination whose link is derived can only produce one once the object is
+    served, so a private publish stores none. Nothing else revisits the field, so
+    without this the artifact ends up public with no link and no way to get one."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    store.update_publication("d", view_url="", visibility="PRIVATE")
+    monkeypatch.setattr(
+        type(fake_client), "view_url_for", lambda self, external_id: f"https://drive/{external_id}"
+    )
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+    assert store.get("d").publication.view_url == "https://drive/uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_going_public_never_replaces_a_link_the_destination_returned(store, fake_client, monkeypatch):
+    """Additive only: a destination that returned its own url at publish time keeps it,
+    so this can add a link but never corrupt one it did not create."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    store.update_publication("d", view_url="https://remote/original", visibility="PRIVATE")
+    monkeypatch.setattr(
+        type(fake_client), "view_url_for", lambda self, external_id: "https://drive/derived"
+    )
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+    assert store.get("d").publication.view_url == "https://remote/original"
+
+
+@pytest.mark.asyncio
 async def test_unpublish_unpublished_raises(store):
     store.create(name="Doc", content="x", kind="text", slug="d")
     with pytest.raises(publish_sync.NotPublishedError):
@@ -446,14 +763,77 @@ async def test_republish_preserves_push_error(store, fake_client):
 
 
 @pytest.mark.asyncio
-async def test_delete_for_artifact_best_effort(store, fake_client):
+async def test_delete_for_artifact_withdraws_and_reports_withdrawn(store, fake_client):
     store.create(name="Doc", content="x", kind="text", slug="d")
     await publish_sync.publish("d")
     art = store.get("d")
-    await publish_sync.delete_for_artifact(art)
+    result = await publish_sync.delete_for_artifact(art)
+    assert result is publish_sync.DeleteWithdrawal.WITHDRAWN
     assert fake_client.called("delete")[0]["artifact_id"] == "uuid-123"
     # store untouched (the caller deletes locally afterwards)
     assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_reports_nothing_published_when_unpublished(store):
+    """An artifact with no publication has nothing to withdraw -- the caller
+    deletes it unchanged."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    art = store.get("d")
+    assert art.publication is None
+    result = await publish_sync.delete_for_artifact(art)
+    assert result is publish_sync.DeleteWithdrawal.NOTHING_PUBLISHED
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_reports_unreachable_on_an_unknown_provider(store):
+    """A publication naming a destination this edition does not register cannot be
+    reached, so no retry from here is meaningful: the outcome is UNREACHABLE (the
+    escape-hatch case), NOT FAILED, and nothing raises -- provider resolution is the
+    case the guard used to miss (it raised before the try block was entered)."""
+    store.create(name="Doc", content="x", kind="text", slug="gone")
+    art = store.get("gone")
+    art.publication = ArtifactPublication(
+        provider="a-destination-this-edition-does-not-have",
+        artifact_id="uuid-999",
+        view_url="",
+        visibility="PUBLIC",
+    )
+    result = await publish_sync.delete_for_artifact(art)  # must not raise
+    assert result is publish_sync.DeleteWithdrawal.UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_reports_unreachable_when_destination_is_down(
+    store, fake_client, monkeypatch
+):
+    """A registered destination whose ``available()`` is False is gone-for-good as far
+    as this process can tell (offline / credentials revoked / account closed): no call
+    is attempted and no retry from here can reach it, so the outcome is UNREACHABLE and
+    the caller proceeds with the local delete."""
+    store.create(name="Doc", content="x", kind="text", slug="d3")
+    await publish_sync.publish("d3")
+    art = store.get("d3")
+    monkeypatch.setattr(type(fake_client), "available", lambda self: False)
+    result = await publish_sync.delete_for_artifact(art)
+    assert result is publish_sync.DeleteWithdrawal.UNREACHABLE
+    # No withdrawal was attempted against the unreachable destination.
+    assert not fake_client.called("delete")
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_reports_failed_when_reachable_destination_rejects(
+    store, fake_client
+):
+    """A reachable destination that REJECTS the withdrawal yields FAILED -- a retry can
+    plausibly succeed, so the caller must keep the publication (the only retry handle).
+    It still never raises: the outcome is a value, not an exception."""
+    store.create(name="Doc", content="x", kind="text", slug="d2")
+    await publish_sync.publish("d2")
+    art = store.get("d2")
+    fake_client.delete_response = {"error": "the destination refused the delete"}
+    result = await publish_sync.delete_for_artifact(art)  # must not raise
+    assert result is publish_sync.DeleteWithdrawal.FAILED
 
 
 # ── persistence ────────────────────────────────────────────────────────────────
@@ -1366,3 +1746,57 @@ async def test_push_snapshots_live_dirty_before_push_no_map_drift(store, fake_cl
     # was pushed (the pre-fix drift signature was version_map["1"] -> remote).
     assert "1" in pub.version_map and pub.version_map["1"] == 1
     assert result["local_version"] == 2
+
+
+# ── the withdrawal paths ask about THIS publication's account ───────────────────
+#
+# `available()` is a destination-WIDE question ("is this kind of destination
+# configured at all"), which is what makes it right for deciding whether to offer a
+# new publish. A publication is bound to ONE account, so with two registered and the
+# bound one removed the wide answer stays True while every call for this artifact
+# raises -- and the raise was then read as a retryable rejection. The result was an
+# artifact that could be neither withdrawn nor deleted, only told to retry forever.
+# These pin the call sites to the narrow question by making the two answers DISAGREE:
+# `available()` True, `reachable_for()` False.
+
+
+@pytest.mark.asyncio
+async def test_delete_asks_whether_this_publications_account_is_reachable(
+    store, fake_client, monkeypatch
+):
+    store.create(name="Doc", content="x", kind="text", slug="d-bound")
+    await publish_sync.publish("d-bound")
+    art = store.get("d-bound")
+    # The destination is configured (another account remains) but THIS artifact's is gone.
+    monkeypatch.setattr(type(fake_client), "reachable_for", lambda self, *, external_id: False)
+    assert fake_client.available() is True
+    result = await publish_sync.delete_for_artifact(art)
+    # UNREACHABLE, not FAILED: a removed account is permanent, so "retry" is a lie.
+    assert result is publish_sync.DeleteWithdrawal.UNREACHABLE
+    assert not fake_client.called("delete")
+
+
+@pytest.mark.asyncio
+async def test_unpublish_asks_whether_this_publications_account_is_reachable(
+    store, fake_client, monkeypatch
+):
+    store.create(name="Doc", content="x", kind="text", slug="u-bound")
+    await publish_sync.publish("u-bound")
+    monkeypatch.setattr(type(fake_client), "reachable_for", lambda self, *, external_id: False)
+    assert fake_client.available() is True
+    with pytest.raises(publish_sync.PublishUnavailableError) as exc:
+        await publish_sync.unpublish("u-bound")
+    # The copy is kept and the message must not promise a retry will fix it; it
+    # names deleting the artifact as the exit for the gone-account case.
+    assert "delete the artifact" in str(exc.value)
+    assert not fake_client.called("delete")
+    assert store.get("u-bound").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_reachable_for_defaults_to_the_destination_wide_answer(fake_client):
+    """Providers that bind nothing per publication must not have to implement it."""
+    fake_client.ready = False
+    assert fake_client.reachable_for(external_id="anything") is False
+    fake_client.ready = True
+    assert fake_client.reachable_for(external_id="anything") is True
