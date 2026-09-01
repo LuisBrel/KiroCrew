@@ -2298,6 +2298,7 @@
             "kind_reply": "답변함",
             "kind_review": "리뷰",
             "kind_skip": "범위 외 판단",
+            "kind_sweep": "확인함",
             "kind_yield": "양보함",
             "no_next_recorded": "기록된 다음 단계 없음",
             "no_open_work_items": "진행 중인 작업 없음",

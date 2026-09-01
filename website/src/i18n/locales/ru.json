@@ -2404,6 +2404,7 @@
             "kind_reply": "Отвечено",
             "kind_review": "Ревью",
             "kind_skip": "Отклонено",
+            "kind_sweep": "Проверено",
             "kind_yield": "Отпущено",
             "no_next_recorded": "следующий шаг не записан",
             "no_open_work_items": "Ничего в работе",

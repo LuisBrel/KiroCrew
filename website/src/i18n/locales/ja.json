@@ -2304,6 +2304,7 @@
             "kind_reply": "返信済み",
             "kind_review": "レビュー",
             "kind_skip": "対象外",
+            "kind_sweep": "確認済み",
             "kind_yield": "取り下げ",
             "no_next_recorded": "次の手順は記録されていません",
             "no_open_work_items": "進行中の作業はありません",

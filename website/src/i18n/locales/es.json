@@ -2354,6 +2354,7 @@
             "kind_reply": "Respondida",
             "kind_review": "Revisión",
             "kind_skip": "Descartada",
+            "kind_sweep": "Revisado",
             "kind_yield": "Liberada",
             "no_next_recorded": "sin siguiente paso registrado",
             "no_open_work_items": "Nada en curso",

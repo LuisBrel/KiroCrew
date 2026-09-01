@@ -2348,6 +2348,7 @@
             "kind_reply": "Geantwortet",
             "kind_review": "Review",
             "kind_skip": "Übergangen",
+            "kind_sweep": "Geprüft",
             "kind_yield": "Freigegeben",
             "no_next_recorded": "kein nächster Schritt vermerkt",
             "no_open_work_items": "Nichts in Arbeit",

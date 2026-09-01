@@ -2304,6 +2304,7 @@
             "kind_reply": "উত্তর দিয়েছে",
             "kind_review": "রিভিউ",
             "kind_skip": "পরিধির বাইরে",
+            "kind_sweep": "পরীক্ষিত",
             "kind_yield": "ছেড়ে দিয়েছে",
             "no_next_recorded": "পরবর্তী ধাপ কিছু লেখা নেই",
             "no_open_work_items": "কিছুই চলছে না",

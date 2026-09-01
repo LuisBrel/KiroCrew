@@ -2398,6 +2398,7 @@
             "kind_reply": "Répondu",
             "kind_review": "Revue",
             "kind_skip": "Écarté",
+            "kind_sweep": "Parcouru",
             "kind_yield": "Libéré",
             "no_next_recorded": "aucune étape suivante enregistrée",
             "no_open_work_items": "Rien en cours",
