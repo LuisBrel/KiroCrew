@@ -17,6 +17,7 @@ import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+import { PREVIEW_INSTANCE_SESSIONS } from '../utils/previewFlags'
 import type { RootState } from '../store'
 
 vi.mock('framer-motion', async () => {
@@ -51,20 +52,31 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   saveChatConfig: vi.fn(),
 }))
 
-const { TAG_JIRA, COL_FILTERED, COL_ALL, tags, columns, updateTagColumn } = vi.hoisted(() => {
+const {
+  TAG_JIRA, COL_FILTERED, COL_ALL, REMOTE_KEY, tags, columns,
+  updateTagColumn, listInstancesMock, instanceChatSlotsMock,
+} = vi.hoisted(() => {
   const TAG_JIRA = '11111111-1111-1111-1111-111111111111'
   const COL_FILTERED = 'col-filtered'
   const COL_ALL = 'col-all'
+  const REMOTE_KEY = 'remote-untagged-1'
   return {
     TAG_JIRA,
     COL_FILTERED,
     COL_ALL,
+    REMOTE_KEY,
     tags: [{ id: TAG_JIRA, name: 'Jira', color: '#e11', order: 0, status: false }],
     columns: [
       { id: COL_FILTERED, name: 'Jira lane', tag_ids: [TAG_JIRA], mode: 'any' as const, order: 0 },
       { id: COL_ALL, name: 'Everything', tag_ids: [] as string[], mode: 'any' as const, order: 1 },
     ],
     updateTagColumn: vi.fn(),
+    listInstancesMock: vi.fn().mockResolvedValue({
+      instances: [{ id: 'inst-a', name: 'astro', status: { state: 'connected' } }],
+    }),
+    instanceChatSlotsMock: vi.fn().mockResolvedValue([
+      { key: REMOTE_KEY, title: 'Remote untagged', running: false, last_turn_ts: '2026-09-01T12:00:00Z' },
+    ]),
   }
 })
 // chatTags/tagColumns must serve the SAME data seeded into the query cache:
@@ -77,6 +89,8 @@ vi.mock('../api/client', () => ({
       if (prop === 'updateTagColumn') return updateTagColumn
       if (prop === 'chatTags') return () => Promise.resolve(tags)
       if (prop === 'tagColumns') return () => Promise.resolve(columns)
+      if (prop === 'listInstances') return listInstancesMock
+      if (prop === 'instanceChatSlots') return instanceChatSlotsMock
       return vi.fn().mockResolvedValue([])
     },
   }),
@@ -142,6 +156,15 @@ function slotKeysIn(container: HTMLElement, columnId: string): string[] {
 }
 
 describe('board column tag filter', () => {
+  it('keeps remote rows out of board columns and names the hidden count', async () => {
+    localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
+    const { container } = renderSidebar()
+
+    await waitFor(() => expect(instanceChatSlotsMock).toHaveBeenCalled())
+    await waitFor(() => expect(container.textContent).toContain('1 remote session is not shown in board view'))
+    expect(slotKeysIn(container, COL_ALL)).not.toContain(REMOTE_KEY)
+  })
+
   it('renders only sessions carrying the selected tag in a filtered column', () => {
     const { container } = renderSidebar()
     // The filtered lane holds exactly the tagged session — not the full list.
