@@ -30,6 +30,9 @@ export default function FindingRow({
   const s = sevOf(f.severity)
   const Icon = s.icon
   return (
+    // Hover-only wrapper: `onEnter`/`onLeave` cross-highlight this row's pin on
+    // the canvas, and nothing else. The row's action (open the finding) lives on
+    // the <Clickable> inside, which is the tab stop and key handler.
     <div
       ref={rowRef}
       // Styling and hover-highlight only: the row's activation lives on the
