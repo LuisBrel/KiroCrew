@@ -144,6 +144,19 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         # returns. Publish the live routing context first so that drainer keeps
         # the batch identity and held-sibling settlement debt.
         self._manager._outbox_live_contexts[info.id] = context
+
+        async def wait_for_retry() -> None:
+            try:
+                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+            except asyncio.CancelledError:
+                if not self._manager._shutting_down:
+                    raise
+                logger.warning(
+                    "Synthetic batch terminal retry delay cancelled for %s during shutdown; "
+                    "retrying",
+                    info.id,
+                )
+
         while True:
             try:
                 recorded = await self._manager._coordinator.record_terminal(request)
@@ -168,14 +181,14 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     info.id,
                     exc_info=True,
                 )
-                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+                await wait_for_retry()
                 continue
             if recorded.value is None:
                 logger.warning(
                     "Synthetic batch terminal commit returned no value for %s; retrying",
                     info.id,
                 )
-                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+                await wait_for_retry()
                 continue
             info._coordinator_admitted = True
             info._coordinator_version = recorded.value.run.version

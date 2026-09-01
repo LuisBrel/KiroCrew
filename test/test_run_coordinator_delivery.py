@@ -294,6 +294,64 @@ async def test_shutdown_retries_cancelled_synthetic_terminal_commit(monkeypatch)
     assert list(coordinator._outbox) == ["event-shutdown"]
 
 
+@pytest.mark.parametrize("first_attempt", ["error", "missing-value"])
+@pytest.mark.asyncio
+async def test_shutdown_retries_synthetic_terminal_after_retry_sleep_cancellation(
+    monkeypatch,
+    first_attempt: str,
+) -> None:
+    monkeypatch.setattr("kiro_crew.subagent._REPORT_DRAIN_TIMEOUT", 0.0)
+    coordinator = MemoryRunCoordinator(id_factory=lambda: "event-retry-cancel")
+    original_record = coordinator.record_terminal
+    retry_started = asyncio.Event()
+    calls = 0
+
+    async def fail_then_record(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if first_attempt == "error":
+                raise RuntimeError("coordinator unavailable")
+            return CoordinatorResult(
+                CoordinatorDecision.APPLIED,
+                CoordinatorReason.COMPLETED,
+                None,
+            )
+        return await original_record(request)
+
+    async def wait_for_retry(_delay: float) -> None:
+        retry_started.set()
+        await asyncio.Event().wait()
+
+    coordinator.record_terminal = fail_then_record  # type: ignore[method-assign]
+    monkeypatch.setattr("kiro_crew.subagent.asyncio.sleep", wait_for_retry)
+    manager = SubagentManager(
+        sessions=MagicMock(),
+        ctx_builder=MagicMock(),
+        on_done=AsyncMock(),
+        coordinator=coordinator,
+    )
+    info = SubagentInfo(
+        id="synthetic-retry-cancel",
+        task="record a rejected batch member",
+        parent_session_key="dashboard:parent",
+        done=True,
+        error="spawn rejected",
+        batch_id="batch-1",
+        batch_total=2,
+    )
+
+    manager._announce_rejection(info)
+    await retry_started.wait()
+    await manager.cancel_all()
+
+    run = await coordinator.get_run(info.id)
+    assert calls == 2
+    assert run is not None
+    assert run.observed_state.value == "terminal"
+    assert list(coordinator._outbox) == ["event-retry-cancel"]
+
+
 @pytest.mark.asyncio
 async def test_synthetic_terminal_retries_non_delivered_attempt(monkeypatch) -> None:
     monkeypatch.setattr("kiro_crew.subagent._TERMINAL_RETRY_SECONDS", 0.0)
@@ -539,6 +597,32 @@ async def test_startup_orphan_scans_leave_the_event_loop_thread(monkeypatch) -> 
 
     assert len(scan_threads) == 2
     assert all(thread_id != event_loop_thread for thread_id in scan_threads)
+
+
+@pytest.mark.asyncio
+async def test_startup_orphan_reaping_leaves_the_event_loop_thread(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    reap_threads: list[int] = []
+    orphan = {"id": "run-1", "pid": 4242}
+
+    def reap_orphan(_state: dict[str, object]) -> bool:
+        reap_threads.append(threading.get_ident())
+        return False
+
+    manager = SubagentManager(
+        sessions=MagicMock(),
+        ctx_builder=MagicMock(),
+        coordinator=MemoryRunCoordinator(),
+    )
+    monkeypatch.setattr("kiro_crew.subagent.list_orphans", lambda: [orphan])
+    monkeypatch.setattr(manager, "_is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(manager, "_reap_orphan_process", reap_orphan)
+    monkeypatch.setattr(manager, "_notify_orphan", AsyncMock(return_value=False))
+
+    await manager._reconcile_orphans()
+
+    assert len(reap_threads) == 2
+    assert all(thread_id != event_loop_thread for thread_id in reap_threads)
 
 
 @pytest.mark.asyncio
