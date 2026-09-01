@@ -74,6 +74,10 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install)
         "idle_secs": 300,
         "max_cycles": 5,
         "max_runtime_secs": 0,
+        # Whether the loop may be observation-gated. Always present and True
+        # unless the caller opted out, so whichever surface applies this
+        # directive reads the same decision the ack reported.
+        "gate": True,
     }
 
 
@@ -161,9 +165,7 @@ def test_monitor_update_runtime_budget_passes_through(default_install):
     """A revised wall-clock budget lands in the patch; untouched fields are
     omitted, not defaulted over."""
     result = _call_tool_inner("monitor_update", {"max_runtime_secs": 3600})
-    assert session_directive.decode(result, "monitor_update")["patch"] == {
-        "max_runtime_secs": 3600
-    }
+    assert session_directive.decode(result, "monitor_update")["patch"] == {"max_runtime_secs": 3600}
 
 
 def test_monitor_update_empty_patch_returns_plain_message_no_directive(default_install):
@@ -229,8 +231,16 @@ def test_autonudge_stop_short_circuits_for_non_nudgeable_session(monkeypatch):
 
 class _FakeLoop:
     def __init__(
-        self, loop_id, *, cycle_count=0, max_cycles=0, active=True, created_ts=0.0,
-        max_runtime_secs=0, stopped_reason="", slot_key="",
+        self,
+        loop_id,
+        *,
+        cycle_count=0,
+        max_cycles=0,
+        active=True,
+        created_ts=0.0,
+        max_runtime_secs=0,
+        stopped_reason="",
+        slot_key="",
     ):
         self.id = loop_id
         self.cycle_count = cycle_count
@@ -311,6 +321,66 @@ _SESSION = "dashboard:chat-3-1700000000"
 _RESEARCH_SESSION = "dashboard:research-a1b2c3d4"
 
 
+def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
+    """A gated loop must not be acknowledged with an every-interval promise.
+
+    This applier defaults ``gate`` to True, so the unconditional "re-injects every
+    {idle_secs}s" was wrong for its own default: a quiet tick on a gated loop spends no
+    turn at all. The MCP tool's ack already disclosed this; the dashboard directive
+    applier did not, and the pull request's own description claims the arming surface
+    says so.
+
+    The cadence is read off the ARMED loop rather than the request, because this surface
+    knows what the tool has to infer -- whether a monitor was actually attached.
+    """
+    from kiro_crew.monitoring.models import MonitorState
+
+    armed = _FakeLoop("loop-gated")
+    armed.monitor = MonitorState(
+        kind="gh-pr",
+        target="acme/widgets#42",
+        objective="watch until green",
+        created_ts=0.0,
+    )
+    armed.gate = True
+    svc = _FakeSvc()
+    _install_svc(monkeypatch, svc)
+    _record_add(monkeypatch, loop=armed)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_start",
+            {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
+        )
+    )
+    assert "only when it changes" in result, "the ack must state the gated cadence"
+    assert "acme/widgets#42" in result, "and name the subject it is watching"
+    assert "message re-injects every 300s" not in result, "not the plain promise"
+
+
+def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
+    """An ungated loop DOES re-inject every interval, so its ack must still say so."""
+    plain = _FakeLoop("loop-plain")
+    plain.monitor = None
+    plain.gate = False
+    svc = _FakeSvc()
+    _install_svc(monkeypatch, svc)
+    _record_add(monkeypatch, loop=plain)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_start",
+            {"message": "keep checking", "idle_secs": 300, "gate": False},
+        )
+    )
+    assert "re-injects every 300s" in result
+    assert "only when it changes" not in result
+
+
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
     """monitor_start arms the loop through the authz core keyed on the session's
     binding key — never anything the caller supplied."""
@@ -382,8 +452,9 @@ def test_applier_monitor_update_refuses_spent_runtime_budget(monkeypatch):
     import time as _time
 
     armed_two_hours_ago = _time.time() - 7200
-    loop = _FakeLoop("loop-8", cycle_count=3, max_cycles=24, active=True,
-                     created_ts=armed_two_hours_ago)
+    loop = _FakeLoop(
+        "loop-8", cycle_count=3, max_cycles=24, active=True, created_ts=armed_two_hours_ago
+    )
     svc = _FakeSvc(loop)
     _install_svc(monkeypatch, svc)
     update_calls = _record_update(monkeypatch, loop=loop)
@@ -422,7 +493,11 @@ def test_applier_monitor_update_refuses_to_resume_a_paused_loop(monkeypatch):
     update_calls = _record_update(monkeypatch)
     result = asyncio.run(
         apply_session_directive(
-            _fake_state(), _fake_slot(), _SESSION, "monitor_update", {"patch": {"message": "revised"}}
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"message": "revised"}},
         )
     )
     assert "PAUSED" in result
@@ -455,8 +530,12 @@ def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(mo
     import time as _time
 
     loop = _FakeLoop(
-        "loop-budget", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-budget",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="runtime_budget",
     )
     svc = _FakeSvc(loop)
@@ -485,8 +564,12 @@ def test_applier_manual_pause_is_never_revived_by_a_budget_raise(monkeypatch):
     import time as _time
 
     loop = _FakeLoop(
-        "loop-paused-budget", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-paused-budget",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="manual",
     )
     svc = _FakeSvc(loop)
@@ -513,7 +596,10 @@ def test_applier_approval_stalled_denial_names_the_authorization(monkeypatch):
     ask a human who already answered by letting the grant lapse.
     """
     loop = _FakeLoop(
-        "loop-stalled", cycle_count=3, max_cycles=24, active=False,
+        "loop-stalled",
+        cycle_count=3,
+        max_cycles=24,
+        active=False,
         stopped_reason=APPROVAL_STALL_REASON,
     )
     svc = _FakeSvc(loop)
@@ -540,8 +626,12 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
     import time as _time
 
     loop = _FakeLoop(
-        "loop-budget2", cycle_count=5, max_cycles=24, active=False,
-        created_ts=_time.time() - 7200, max_runtime_secs=3600,
+        "loop-budget2",
+        cycle_count=5,
+        max_cycles=24,
+        active=False,
+        created_ts=_time.time() - 7200,
+        max_runtime_secs=3600,
         stopped_reason="runtime_budget",
     )
     svc = _FakeSvc(loop)
@@ -549,7 +639,10 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
     update_calls = _record_update(monkeypatch)
     result = asyncio.run(
         apply_session_directive(
-            _fake_state(), _fake_slot(), _SESSION, "monitor_update",
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
             {"patch": {"message": "revised"}},
         )
     )
@@ -587,9 +680,7 @@ def test_applier_autonudge_stop_records_tombstone_for_loop_resolved_by_binding(m
         )
     )
     assert svc.get_by_slot_keys == [binding_key_for(_RESEARCH_SESSION)]
-    assert svc.updated == [
-        ("loop-1", {"active": False, "stopped_reason": AUTONUDGE_STOP_REASON})
-    ]
+    assert svc.updated == [("loop-1", {"active": False, "stopped_reason": AUTONUDGE_STOP_REASON})]
     assert svc.removed == []
     assert "stopped" in result.lower()
     assert "done" in result

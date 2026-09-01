@@ -214,6 +214,10 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
     idle_secs = int(args.get("idle_secs") or 300)
     max_cycles = int(args.get("max_cycles") or 0)
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
+    # Absent means gated, matching the tool's default: a directive written before
+    # the flag existed must not read as an opt-out.
+    raw_gate = args.get("gate")
+    gate = True if raw_gate is None else bool(raw_gate)
     loop, error, _status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -225,6 +229,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        gate=gate,
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
@@ -233,9 +238,22 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
     cap = f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap"
     if max_runtime_secs:
         cap += f", wall-clock budget {max_runtime_secs}s"
+    # Read the cadence off the ARMED loop, not off the request. This surface knows
+    # something the MCP tool's own ack has to infer: whether a monitor was actually
+    # attached. Reporting "re-injects every {idle_secs}s" for a gated loop is untrue --
+    # a quiet tick spends no turn at all -- and this applier defaults ``gate`` to True
+    # a few lines above, so the unconditional promise was wrong for its own default.
+    armed_monitor = getattr(loop, "monitor", None)
+    if armed_monitor is not None and getattr(loop, "gate", False):
+        cadence = (
+            f"observing {armed_monitor.target} every {idle_secs}s and re-injecting the "
+            "message only when it changes, so quiet cycles cost no turn"
+        )
+    else:
+        cadence = f"the message re-injects every {idle_secs}s"
     return (
-        f"Monitor loop {getattr(loop, 'id', '?')} started on this session: the "
-        f"message re-injects every {idle_secs}s (user messages defer a due fire "
+        f"Monitor loop {getattr(loop, 'id', '?')} started on this session: {cadence} "
+        f"(user messages defer a due fire "
         f"to their turn's end without restarting the countdown){cap}. "
         "End your turn now — the loop wakes you. Call autonudge_stop when the "
         "exit condition is met."
@@ -351,9 +369,8 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
         # The authorizer already audited its own refusal; agree with it.
         raise _DirectiveDenied(f"Failed to update monitor loop: {error}")
     fields = ", ".join(sorted(k for k in patch if k != "active"))
-    return (
-        f"Monitor loop {loop.id} updated on this session ({fields})."
-        + (" The stopped loop has been re-armed." if revived else "")
+    return f"Monitor loop {loop.id} updated on this session ({fields})." + (
+        " The stopped loop has been re-armed." if revived else ""
     )
 
 
