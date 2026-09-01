@@ -49,6 +49,7 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
+    _safe_avatar,
     _safe_color,
     inject_kiro_cli_api_key,
     normalize_agent_model,
@@ -2736,6 +2737,19 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "session_color must be #rrggbb or empty", "code": "invalid_color_hex"},
             status=400,
         )
+    # Same convention as session_color: a non-empty raw value that the coercer
+    # collapses to "no override" is a caller mistake worth a 400, not a silent
+    # fallback to the name-derived face.
+    _raw_avatar = body.get("avatar")
+    avatar = _safe_avatar(_raw_avatar)
+    if _raw_avatar not in (None, {}) and not avatar:
+        return web.json_response(
+            {
+                "error": "avatar must be {'kind': 'ghost', 'traits': {...}} or empty",
+                "code": "invalid_avatar",
+            },
+            status=400,
+        )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
@@ -2752,6 +2766,7 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
             session_color=session_color,
+            avatar=avatar,
         )
         cfg.save()
     _sel().log_api_access(
@@ -2829,6 +2844,22 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 )
             agent.session_color = _norm
             changed.append("session_color")
+        if "avatar" in body:
+            _raw_av = body["avatar"]
+            _av = _safe_avatar(_raw_av)
+            # Same 400 convention as session_color: junk that coerces to "no
+            # override" is refused rather than silently clearing the face.
+            # None/{} are the explicit "reset to name-derived" spellings.
+            if _raw_av not in (None, {}) and not _av:
+                return web.json_response(
+                    {
+                        "error": "avatar must be {'kind': 'ghost', 'traits': {...}} or empty",
+                        "code": "invalid_avatar",
+                    },
+                    status=400,
+                )
+            agent.avatar = _av
+            changed.append("avatar")
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")

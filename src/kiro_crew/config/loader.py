@@ -663,6 +663,50 @@ def _safe_color(value: object) -> str:
     return ""
 
 
+#: String-valued ghost trait axes accepted in a per-crew avatar override.
+_AVATAR_GHOST_STR_TRAITS = ("eyes", "brows", "mouth", "accessory", "prop")
+#: Boolean-valued ghost trait axes.
+_AVATAR_GHOST_BOOL_TRAITS = ("blush", "flip")
+#: Cap on a single trait value, so hand-written junk cannot bloat config.json.
+_AVATAR_TRAIT_MAX_LEN = 32
+
+
+def _safe_avatar(value: object) -> dict:
+    """Return a validated per-crew avatar override, or ``{}`` on junk.
+
+    Accepted shape: ``{"kind": "ghost", "traits": {...}}``, where traits pins
+    the ghost face trait-by-trait instead of deriving it from the crew name.
+    Empty means "no override" — the frontend keeps rendering the name-seeded
+    face. config.json is hand-editable (and agent-writable), so junk collapses
+    to ``{}`` rather than crashing the load.
+
+    Trait *values* are deliberately not checked against the frontend's trait
+    vocabulary: the renderer resolves an unknown option to "absent"
+    (``EYES[k] ?? ''``), and keeping the vocabulary in one place (the style
+    module) means a new hat needs no backend release. ``tile`` is the one
+    exception — it is interpolated into SVG markup, so it is pinned to a hex
+    color by the same validator session_color uses.
+    """
+    if not isinstance(value, dict):
+        return {}
+    if value.get("kind") != "ghost":
+        return {}
+    raw = value.get("traits")
+    if not isinstance(raw, dict):
+        return {}
+    traits: dict[str, object] = {}
+    for key in _AVATAR_GHOST_STR_TRAITS:
+        v = raw.get(key, "")
+        traits[key] = v[:_AVATAR_TRAIT_MAX_LEN] if isinstance(v, str) else ""
+    for key in _AVATAR_GHOST_BOOL_TRAITS:
+        # `is True`, not bool(): config.json is hand-editable and
+        # bool("false") is True, so a string-typed value would render the
+        # opposite of what its author wrote. Only a real boolean counts.
+        traits[key] = raw.get(key, False) is True
+    traits["tile"] = _safe_color(raw.get("tile", ""))
+    return {"kind": "ghost", "traits": traits}
+
+
 def _session_work_dir(session_key: str | None) -> Path:
     """Return a per-session subdirectory under workspace_root()."""
     root = workspace_root()
@@ -3794,6 +3838,15 @@ class KiroCrewAgentConfig:
             "bot. Preserved on load and save so an existing config is not "
             "rewritten out from under the operator.",
             deprecated=True,
+        ),
+    )
+    avatar: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Avatar",
+            "Per-crew avatar override. Empty means the face is derived from "
+            "the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit "
+            "ghost traits chosen in the avatar builder.",
         ),
     )
 
@@ -8014,6 +8067,7 @@ class KiroCrewConfig:
                         ),
                         telegram_account=entry.get("telegram_account", ""),
                         session_color=_safe_color(entry.get("session_color", "")),
+                        avatar=_safe_avatar(entry.get("avatar")),
                     )
 
         # Migrate workspaces from flat or structured format

@@ -18,7 +18,8 @@ import SegmentedControl from '../components/SegmentedControl'
 import InfoTip from '../components/InfoTip'
 import { FOCUSABLE } from '../hooks/useDialogFocusTrap'
 import SimpleSelect from '../components/SimpleSelect'
-import CrewAvatar from '../components/CrewAvatar'
+import CrewAvatar, { ghostTraitsFrom, type CrewAvatarOverride } from '../components/CrewAvatar'
+import CrewAvatarBuilder from '../components/CrewAvatarBuilder'
 import CrewWakeSection from '../components/CrewWakeSection'
 import CrewWebhookSection from '../components/CrewWebhookSection'
 import CrewEditorRail from '../components/crew/CrewEditorRail'
@@ -59,6 +60,8 @@ interface AgentUpdatePayload {
   model: string
   /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
   session_color: string
+  /** Pinned ghost face from the avatar builder. `{}` = the name-derived face. */
+  avatar: CrewAvatarOverride | Record<string, never>
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -521,7 +524,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
-        <CrewAvatar seed={agent.name} size={38} />
+        <CrewAvatar seed={agent.name} avatar={agent.avatar} size={38} />
         {/* Fixed height for the whole header block. Badges are slightly taller
             than plain text, so cards carrying a `default` badge would otherwise
             push their binding grid lower than a card without one, and the row
@@ -615,7 +618,7 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
     >
       <TableCell>
         <div className="flex items-center gap-2.5 min-w-0">
-          <CrewAvatar seed={agent.name} size={28} />
+          <CrewAvatar seed={agent.name} avatar={agent.avatar} size={28} />
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <Clickable
@@ -712,6 +715,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [triggers, setTriggers] = useState('')
   const [sessionColor, setSessionColor] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
+  /** Draft avatar override. null = the name-derived face (no override). */
+  const [editAvatar, setEditAvatar] = useState<CrewAvatarOverride | null>(null)
+  const [avatarBuilderOpen, setAvatarBuilderOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
    *  is the last section, so on a short window the confirm buttons land under
@@ -759,6 +765,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setTriggers(a.triggers || '')
     setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
+    // Normalized through the same coercion the renderer applies, so the dirty
+    // check compares like with like (a junk stored value reads as "no
+    // override" everywhere).
+    const storedTraits = ghostTraitsFrom(a.avatar)
+    setEditAvatar(storedTraits ? { kind: 'ghost', traits: storedTraits } : null)
+    setAvatarBuilderOpen(false)
     setSheet({ mode: 'edit', name: a.name })
   }, [defaultAgent])
 
@@ -844,6 +856,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         // clearing a pin is a real write rather than a skipped field.
         model: editModel,
         session_color: sessionColor,
+        // {} is the wire spelling for "reset to the name-derived face".
+        avatar: editAvatar ?? {},
       },
     })
   }
@@ -1003,8 +1017,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
     if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
+    // Traits are a flat record with a stable key order (both sides come out of
+    // ghostTraitsFrom), so JSON equality is a faithful comparison.
+    const savedTraits = ghostTraitsFrom(editingAgent.avatar)
+    if (JSON.stringify(editAvatar?.traits ?? null) !== JSON.stringify(savedTraits)) out.add('routing')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, sessionColor])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, sessionColor, editAvatar])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1206,7 +1224,23 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
              and suppressing it would break that. */
         >
           <DialogHeader>
-            {!creating && <CrewAvatar seed={editing} size={28} />}
+            {/* The avatar is itself the entry point to the builder: the
+                first-run review's top finding was that a face setting filed
+                under "Triggers" has no scent — but everyone tries clicking
+                the face. The Triggers-pane row remains as the discoverable
+                text route. */}
+            {!creating && (
+              <button
+                type="button"
+                onClick={() => setAvatarBuilderOpen(true)}
+                className="rounded-md transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={i18nT('components.avatarBuilder.title')}
+                title={i18nT('components.avatarBuilder.title')}
+                data-testid="header-avatar-button"
+              >
+                <CrewAvatar seed={editing} avatar={editAvatar ?? undefined} size={28} />
+              </button>
+            )}
             <DialogTitle className="font-mono">
               {creating ? i18nT('pages.kiroCrewAgentsPage.create_agent') : editing}
             </DialogTitle>
@@ -1270,7 +1304,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 >
                   {pane === 'overview' && (
                     <CrewOverviewPane
-                      hub={<CrewAvatar seed={editing} size={34} />}
+                      hub={<CrewAvatar seed={editing} avatar={editAvatar ?? undefined} size={34} />}
                       templateLabel={provider.labels.agentTemplateField}
                       template={kiroAgent}
                       workspace={workspace}
@@ -1345,6 +1379,22 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                     <>
                       <TriggersField value={triggers} onChange={setTriggers} />
                       <SessionColorField value={sessionColor} onChange={setSessionColor} />
+                      <Field
+                        label={i18nT('components.avatarBuilder.field_label')}
+                        hint={i18nT('components.avatarBuilder.field_hint')}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <CrewAvatar seed={editing || ''} avatar={editAvatar ?? undefined} size={36} />
+                          <Btn onClick={() => setAvatarBuilderOpen(true)} data-testid="open-avatar-builder">
+                            {i18nT('components.avatarBuilder.customize')}
+                          </Btn>
+                          {editAvatar && (
+                            <span className="text-[11px] text-muted">
+                              {i18nT('components.avatarBuilder.customized_note')}
+                            </span>
+                          )}
+                        </div>
+                      </Field>
                     </>
                   )}
 
@@ -1413,6 +1463,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             onCreated={handleWsCreated}
             onClose={() => setWsModalOpen(false)}
           />
+          {/* Same stacked-layer contract as WorkspaceModal: mounted inside the
+              editor's DialogContent, `open`-driven. Save only lands in the
+              editor's draft state — the crew record is written by Save changes. */}
+          {!creating && editing && (
+            <CrewAvatarBuilder
+              open={avatarBuilderOpen}
+              name={editing}
+              value={editAvatar}
+              onCancel={() => setAvatarBuilderOpen(false)}
+              onSave={next => { setEditAvatar(next); setAvatarBuilderOpen(false) }}
+            />
+          )}
         </DialogContent>
       </Dialog>
     </>

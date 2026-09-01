@@ -410,6 +410,7 @@ export default function MembersPage() {
                 <span className="relative shrink-0">
                   <CrewAvatar
                     seed={m.name}
+                    avatar={m.avatar}
                     size={36}
                     working={isRunning(m) ? 'subtle' : undefined}
                   />
@@ -490,6 +491,7 @@ export default function MembersPage() {
               </button>
               <CrewAvatar
                 seed={active.name}
+                avatar={active.avatar}
                 size={30}
                 working={isRunning(active) ? 'full' : undefined}
               />
@@ -571,7 +573,7 @@ export default function MembersPage() {
               mock: avatar, name, and a live status line (working now, or the
               last time anything happened on the thread). */}
           <div className="flex items-center gap-3 mb-3">
-            <CrewAvatar seed={active.name} size={40} />
+            <CrewAvatar seed={active.name} avatar={active.avatar} size={40} />
             <div className="min-w-0 flex-1">
               <div className="text-sm font-semibold truncate">{active.name}</div>
               <div className="text-[11px] truncate" data-testid="member-drawer-status">
