@@ -85,6 +85,31 @@ function stubDrivePresent() {
   vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
 }
 
+/** A `BackupStatus` whose `kind` row is running, as the server would report it. */
+function backupWithActive(kind: 'snapshot' | 'sessions'): BackupStatus {
+  return {
+    ...emptyBackup,
+    jobs: {
+      [kind]: {
+        active: {
+          run_id: 'r-live',
+          kind,
+          status: 'running',
+          created_at: '2026-08-24T00:00:00Z',
+          updated_at: '2026-08-24T00:00:00Z',
+          finished_at: '',
+          error: '',
+        },
+        lastFailed: null,
+      },
+    },
+  }
+}
+
+function stubActiveJob(kind: 'snapshot' | 'sessions') {
+  vi.mocked(awsControlApi.backup).mockResolvedValue(backupWithActive(kind))
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   // The grid/list toggle persists per section to localStorage, which outlives a
@@ -196,7 +221,8 @@ describe('DrivePage sections', () => {
 
   it('disables the backup row and spins while a run is in flight', async () => {
     stubDrivePresent()
-    // A run that never resolves keeps the row in its busy state.
+    // A run that never resolves keeps the row busy from the moment of the click,
+    // before the server has a run to report.
     vi.mocked(awsControlApi.backupRun).mockReturnValue(new Promise(() => {}) as ReturnType<typeof awsControlApi.backupRun>)
 
     await renderDrive('backup')
@@ -204,6 +230,171 @@ describe('DrivePage sections', () => {
     const runBtn = await screen.findByTestId('backup-run-snapshot')
     fireEvent.click(runBtn)
     await waitFor(() => expect((screen.getByTestId('backup-run-snapshot') as HTMLButtonElement).disabled).toBe(true))
+  })
+
+  it('shows a backup as running on a FRESH mount, with no click in this session', async () => {
+    // The point of the migration. Nothing in this render started the run -- the
+    // host reports it. Before the durable job the indicator lived in the
+    // component, so a navigation away destroyed the only record that a backup
+    // was in flight and coming back showed an idle row mid-upload. Under the
+    // rail that unmount is what switching panes actually does.
+    stubDrivePresent()
+    stubActiveJob('snapshot')
+
+    await renderDrive('backup')
+
+    await waitFor(() =>
+      expect((screen.getByTestId('backup-run-snapshot') as HTMLButtonElement).disabled).toBe(true),
+    )
+    expect(screen.getByTestId('backup-run-snapshot').textContent).toContain(
+      i18nT('apps.awsControl.console.backup_running'),
+    )
+    // Adoption is not a side effect of having asked for one: no start was posted.
+    expect(awsControlApi.backupRun).not.toHaveBeenCalled()
+  })
+
+  it('adopts only the kind that is running, leaving the sibling row usable', async () => {
+    // The rows are independent: the host indexes a run by (kind, account), so a
+    // sessions backup in flight must not disable Back up now on snapshot.
+    stubDrivePresent()
+    stubActiveJob('sessions')
+
+    await renderDrive('backup')
+
+    await waitFor(() =>
+      expect((screen.getByTestId('backup-run-sessions') as HTMLButtonElement).disabled).toBe(true),
+    )
+    expect((screen.getByTestId('backup-run-snapshot') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('says a run failed instead of just stopping the spinner', async () => {
+    // The app's own ledger records only SUCCESSES, so without the durable
+    // record's status a failed backup renders exactly like one that was never
+    // started -- the row silently going quiet is itself a false statement.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      jobs: {
+        snapshot: {
+          active: null,
+          lastFailed: {
+            run_id: 'a'.repeat(32),
+            kind: 'snapshot',
+            status: 'failed',
+            created_at: '2026-09-01T00:00:00Z',
+            updated_at: '2026-09-01T00:00:02Z',
+            finished_at: '2026-09-01T00:00:02Z',
+            error: 'S3 consent no longer holds',
+          },
+        },
+      },
+    })
+
+    await renderDrive('backup')
+
+    const err = await screen.findByTestId('backup-error-snapshot')
+    expect(err.textContent ?? '').toContain('S3 consent no longer holds')
+    // A failure is history, not work in flight: the row must be usable again.
+    expect((screen.getByTestId('backup-run-snapshot') as HTMLButtonElement).disabled).toBe(false)
+    // And the sibling row says nothing about it.
+    expect(screen.queryByTestId('backup-error-sessions')).toBeNull()
+  })
+
+  it('offers the archive control on a first paint with no remote data', async () => {
+    // The state the bug lived in. The remote half is opt-in behind `?remote=1`,
+    // which only this control can request -- so gating the control on
+    // `data.remote` made it wait for the fetch it enables, and the archive and
+    // Restore were unreachable for the whole session. A first paint has
+    // `remote: null`, so this is the paint that matters.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({ ...emptyBackup, remote: null })
+
+    await renderDrive('backup')
+
+    const toggle = await screen.findByTestId('backup-remote-toggle')
+    expect(toggle).toBeTruthy()
+    // And it must actually open, since opening is what requests the data.
+    fireEvent.click(toggle)
+    expect(await screen.findByTestId('backup-archive')).toBeTruthy()
+  })
+
+  it('does not busy the row when the payload reports no run for this account', async () => {
+    // The server answers per account now, so "another account is backing up"
+    // arrives as an EMPTY jobs block here rather than as someone else's run. This
+    // pins the client half: an absent entry must read as idle, not as unknown.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({ ...emptyBackup, jobs: {} })
+
+    await renderDrive('backup')
+
+    const btn = await screen.findByTestId('backup-run-snapshot')
+    expect((btn as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByTestId('backup-error-snapshot')).toBeNull()
+  })
+
+  it('invites a retry only for a refusal a retry can actually clear', async () => {
+    // 502 `aws_call_failed` is a live AWS call that failed transiently -- the one
+    // refusal on this path where pressing the button again is honest advice.
+    vi.mocked(awsControlApi.backupRun).mockRejectedValue(new Error('aws_call_failed'))
+
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-run-snapshot'))
+
+    const err = await screen.findByTestId('backup-error-snapshot')
+    expect(err.textContent ?? '').toContain('Try again')
+  })
+
+  it('does not invite a retry for a refusal the owner must act on', async () => {
+    // An UNRECOGNISED code: still not retryable, so the generic line promises
+    // nothing rather than inviting a retry. Defaulting to "try again" and
+    // excepting one code was the wrong way round.
+    vi.mocked(awsControlApi.backupRun).mockRejectedValue(new Error('some_new_code'))
+
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-run-snapshot'))
+
+    const err = await screen.findByTestId('backup-error-snapshot')
+    expect(err.textContent ?? '').toContain('Could not start')
+    expect(err.textContent ?? '').not.toContain('Try again')
+  })
+
+  it('names the cause and the next step for a refusal with a known code', async () => {
+    // The route sends these codes so the UI can localise them. Collapsing them
+    // into one generic line makes the owner guess which of several repairs to
+    // attempt, so each reachable code names its own cause.
+    vi.mocked(awsControlApi.backupRun).mockRejectedValue(new Error('aws_consent_required'))
+
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-run-snapshot'))
+
+    const err = await screen.findByTestId('backup-error-snapshot')
+    expect(err.textContent ?? '').toContain('S3 access')
+    expect(err.textContent ?? '').not.toContain('Try again')
+  })
+
+  it('sends the owner to create a drive when there is not one yet', async () => {
+    // Reachable as a RACE past the pane gate: the pane only mounts when the drive
+    // exists, so this is the drive being deleted between that render and the
+    // click. Rare is not impossible, which is why it earns a string where
+    // `invalid_account` does not.
+    vi.mocked(awsControlApi.backupRun).mockRejectedValue(new Error('drive_missing'))
+
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-run-snapshot'))
+
+    expect((await screen.findByTestId('backup-error-snapshot')).textContent ?? '').toContain('no drive yet')
+  })
+
+  it('does not tell the owner to retry when the runtime is absent', async () => {
+    // 503 `jobs_unavailable` means the job runtime was never registered -- a
+    // missing manifest grant or a failed startup, not a transient blip. The
+    // string deliberately avoids "right now", which implied waiting would help.
+    vi.mocked(awsControlApi.backupRun).mockRejectedValue(new Error('jobs_unavailable'))
+
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-run-snapshot'))
+
+    const err = await screen.findByTestId('backup-error-snapshot')
+    expect(err.textContent ?? '').toContain('not available for this app')
+    expect(err.textContent ?? '').not.toContain('Try again')
+    expect(err.textContent ?? '').not.toContain('right now')
   })
 
   /* ── Drive: folder navigation and load-more ─────────────────────────────── */
@@ -1587,7 +1778,7 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
       remote: { snapshot: [], sessions: [] },
     })
     vi.mocked(awsControlApi.backupRun).mockResolvedValue({
-      ran: true, kind: 'snapshot', run: { key: 'snap-2', bytes: 2048, at: '2026-08-25T00:00:00Z' },
+      started: true, kind: 'snapshot', runId: 'a'.repeat(32),
     })
     vi.mocked(awsControlApi.backupNightly).mockResolvedValue({ nightly: true } as never)
 
@@ -1644,9 +1835,16 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
 
     await renderDrive('backup')
 
-    // A null remote with a reason renders the muted error note and NO disclosure.
+    // The note still renders. The disclosure NO LONGER hides, and that change is
+    // deliberate: since the remote half became opt-in behind `?remote=1`, a
+    // `remoteError` can only exist because this control already requested it, so
+    // "errored AND control hidden" is unreachable in the running app. Asserting
+    // the old invariant is what produced the regression -- the control that
+    // enables the fetch rendered only once the fetch had succeeded, leaving the
+    // archive and Restore unreachable. Keeping it visible also lets the owner
+    // collapse and retry instead of being stuck with the note.
     expect(await screen.findByTestId('backup-remote-error')).toBeTruthy()
-    expect(screen.queryByTestId('backup-remote-toggle')).toBeNull()
+    expect(screen.queryByTestId('backup-remote-toggle')).not.toBeNull()
   })
 
   /* ── Access: forget a share ──────────────────────────────────────────────── */

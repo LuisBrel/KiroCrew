@@ -1760,11 +1760,13 @@ class TestRound22Hardening:
             ),
         ):
             backup.clear_stop()
-            backup._authorize_upload(ACCOUNT, "p", "us-west-2")  # no raise
+            backup._authorize_upload(
+                ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER
+            )  # no raise
             backup.signal_stop()
             try:
                 with pytest.raises(RuntimeError, match="shutting down"):
-                    backup._authorize_upload(ACCOUNT, "p", "us-west-2")
+                    backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
             finally:
                 backup.clear_stop()
 
@@ -2032,7 +2034,7 @@ class TestRound26Hardening:
         with p1, p2, p3, p4:
             backup.clear_stop()
             with pytest.raises(RuntimeError, match="does not name this account"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2")
+                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
 
     def test_grant_naming_no_account_refuses_the_upload(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup
@@ -2041,7 +2043,7 @@ class TestRound26Hardening:
         with p1, p2, p3, p4:
             backup.clear_stop()
             with pytest.raises(RuntimeError, match="does not name this account"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2")
+                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
 
     def test_matching_grant_account_allows_the_upload(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup
@@ -2049,7 +2051,9 @@ class TestRound26Hardening:
         p1, p2, p3, p4 = self._authorizing_env(ACCOUNT)
         with p1, p2, p3, p4:
             backup.clear_stop()
-            backup._authorize_upload(ACCOUNT, "p", "us-west-2")  # no raise
+            backup._authorize_upload(
+                ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER
+            )  # no raise
 
     def test_grant_withdrawn_mid_build_refuses_the_upload(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup
@@ -2065,7 +2069,7 @@ class TestRound26Hardening:
         ):
             backup.clear_stop()
             with pytest.raises(RuntimeError, match="withdrawn"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2")
+                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
 
 
 class TestProfileDiscovery:

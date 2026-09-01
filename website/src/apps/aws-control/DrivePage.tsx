@@ -53,7 +53,7 @@ import { fmtBytes, fmtNumber, fmtRelative } from '../../i18n/format'
 import { awsControlApi } from './api'
 import type {
   DriveSection, DriveStatus, ArtifactKind, LibraryArtifact,
-  BackupKind, Share, DriveUsage,
+  BackupKind, BackupRun, BackupJobState, Share, DriveUsage,
 } from './types'
 import { CopyBtn, PaneHeader } from './shared'
 
@@ -61,6 +61,23 @@ import { CopyBtn, PaneHeader } from './shared'
  * key by interpolation (dynamicKeys gate): extractors and unused-key tooling
  * can then see every key, and a missing one fails the parity gate rather than
  * rendering raw. Mirrors UPDATE_ERROR_KEYS in pages/settings/AboutPanel.tsx. */
+
+/* Refusals that name a cause the owner can act on, mapped rather than collapsed
+ * into one line. The route answers these with codes precisely so the UI can
+ * localise them; discarding the code and rendering a single generic string makes
+ * the owner guess which of several different repairs to attempt.
+ *
+ * `invalid_account` is deliberately absent, and the asymmetry with `drive_missing`
+ * is the point rather than an exception to it: the account comes from the page, so
+ * the start button structurally cannot produce a malformed one -- an IMPOSSIBLE
+ * state. `drive_missing` past the pane gate is a RACE (the drive deleted between
+ * the pane rendering and the click), and rare is not impossible. It falls to the
+ * generic line with any code we do not recognise. */
+const START_ERROR_KEYS: Record<string, string> = {
+  aws_consent_required: 'apps.awsControl.console.backup_start_consent',
+  drive_missing: 'apps.awsControl.console.backup_start_no_drive',
+  jobs_unavailable: 'apps.awsControl.console.backup_start_unavailable',
+}
 const KIND_LABEL_KEY: Record<ArtifactKind, string> = {
   widget: 'apps.awsControl.console.kind_widget',
   markdown: 'apps.awsControl.console.kind_markdown',
@@ -1895,18 +1912,118 @@ function ShareDialog({ account, section, fileKey, onClose }: { account: string; 
 
 const BACKUP_KINDS: BackupKind[] = ['snapshot', 'sessions']
 
+/**
+ * One backup kind's row.
+ *
+ * Its own component, rather than a `.map` body inside `BackupSection`, so each
+ * row's mutation state stays its own -- a click on one kind must not disable the
+ * other.
+ *
+ * `busy` comes from the SERVER, not from `runMut.isPending`. That is the whole
+ * change: the previous indicator lived in this component, so unmounting it
+ * destroyed the only record that a backup was in flight, and coming back showed
+ * an idle row while the upload continued. Under the rail that unmount is no
+ * longer hypothetical -- switching panes genuinely unmounts this subtree.
+ */
+function BackupRow({
+  account,
+  kind,
+  run,
+  job,
+  onStarted,
+}: {
+  account: string
+  kind: BackupKind
+  run: BackupRun | undefined
+  job: BackupJobState | undefined
+  onStarted: () => void
+}) {
+  const runMut = useMutation({
+    mutationFn: () => awsControlApi.backupRun(account, kind),
+    // The claim is durable the moment the POST returns, but the next poll may be
+    // seconds away. Re-read now so the row turns over immediately instead of
+    // looking like the click did nothing.
+    onSuccess: onStarted,
+  })
+  // The server owns the answer, scoped to THIS account. `isPending` still matters
+  // for the window between the click and the claim landing: the server does not
+  // know about the run yet, and a row that ignored it would accept a second click
+  // that starts nothing (the SDK would dedupe it).
+  const busy = job?.active != null || runMut.isPending
+  // A run that ended `failed` must not render identically to one that succeeded.
+  // The app's ledger records only successes, so without this the row would simply
+  // stop spinning -- which is itself a false statement about what happened.
+  const failed = !busy ? (job?.lastFailed ?? null) : null
+  // Which refusals a retry can actually clear, enumerated from the route rather
+  // than special-cased one at a time. `aws_call_failed` is a 502 from a live AWS
+  // call and is the only genuinely transient one; a transport-level `http_5xx`
+  // is the same shape. Everything else the start path answers needs the owner to
+  // do something ELSE, so it gets the cause named (START_ERROR_KEYS) or, for a
+  // code we do not recognise, a line that promises nothing. Defaulting to "try
+  // again" and excepting one code was the wrong way round.
+  const code = (runMut.error as Error | null)?.message ?? ''
+  const retryable = code === 'aws_call_failed' || /^http_5\d\d$/.test(code)
+  const startError = runMut.isError
+    ? i18nT(
+        START_ERROR_KEYS[code] ??
+          (retryable
+            ? 'apps.awsControl.console.backup_start_retry'
+            : 'apps.awsControl.console.backup_start_failed'),
+      )
+    : ''
+
+  return (
+    <div className="flex items-center gap-3 px-3 py-2.5" data-testid={`backup-row-${kind}`}>
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] font-medium text-text">{i18nT(BACKUP_KIND_LABEL_KEY[kind])}</div>
+        <div className="text-[12px] text-muted">
+          {run
+            ? i18nT('apps.awsControl.console.backup_last_run', { when: fmtRelative(run.at), size: fmtBytes(run.bytes) })
+            : i18nT('apps.awsControl.console.backup_never')}
+        </div>
+        {(failed || startError) && (
+          <div className="text-[12px] text-danger" data-testid={`backup-error-${kind}`}>
+            {startError || i18nT('apps.awsControl.console.backup_failed', { reason: failed?.error || '' })}
+          </div>
+        )}
+        {kind === 'sessions' && (
+          // The archive takes BOTH halves of a session, and the CLI
+          // half lives in a directory shared with any kiro-cli chat
+          // started outside Kiro Crew. Say so where the button is:
+          // the owner is choosing what leaves their machine.
+          <div className="text-[12px] text-muted" data-testid="backup-sessions-scope">
+            {i18nT('apps.awsControl.console.backup_sessions_scope')}
+          </div>
+        )}
+      </div>
+      <Btn onClick={() => runMut.mutate()} disabled={busy} data-testid={`backup-run-${kind}`}>
+        <RefreshCw size={13} className={busy ? 'animate-spin' : ''} />
+        {busy ? i18nT('apps.awsControl.console.backup_running') : i18nT('apps.awsControl.console.backup_run_now')}
+      </Btn>
+    </div>
+  )
+}
+
 export function BackupSection({ account }: { account: string }) {
   const qc = useQueryClient()
   const [showRemote, setShowRemote] = useState(false)
   const backupQ = useQuery({
-    queryKey: ['aws-control', 'backup', account],
-    queryFn: () => awsControlApi.backup(account),
+    // `showRemote` is part of the key on purpose: the remote listing costs paid
+    // AWS calls, so it is fetched only while the stored-archive list is open, and
+    // opening it is a deliberate refetch rather than a hidden cost on every poll.
+    queryKey: ['aws-control', 'backup', account, showRemote],
+    queryFn: () => awsControlApi.backup(account, { remote: showRemote }),
+    // Poll only while a run is actually in flight: an idle section needs no
+    // timer, and a start goes through `invalidate`, which is deterministic
+    // rather than a wait for the next tick. A remount must ADOPT the server's
+    // answer rather than render a cached idle state -- that cached-stale render
+    // is the original bug wearing a different hat.
+    refetchInterval: (query) =>
+      BACKUP_KINDS.some((k) => query.state.data?.jobs?.[k]?.active != null) ? 3000 : false,
+    staleTime: 0,
+    refetchOnMount: 'always',
   })
   const invalidate = () => qc.invalidateQueries({ queryKey: ['aws-control', 'backup', account] })
-  const runMut = useMutation({
-    mutationFn: (kind: BackupKind) => awsControlApi.backupRun(account, kind),
-    onSuccess: invalidate,
-  })
   const nightlyMut = useMutation({
     mutationFn: (enabled: boolean) => awsControlApi.backupNightly(account, enabled),
     onSuccess: invalidate,
@@ -1923,35 +2040,20 @@ export function BackupSection({ account }: { account: string }) {
       {backupQ.isLoading && <ContentSkeleton rows={2} />}
       {data && (
         <div className="rounded-md border border-border bg-card divide-y divide-border">
-          {BACKUP_KINDS.map((kind) => {
-            const run = data.runs[kind]
-            const running = runMut.isPending && runMut.variables === kind
-            return (
-              <div key={kind} className="flex items-center gap-3 px-3 py-2.5" data-testid={`backup-row-${kind}`}>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[13px] font-medium text-text">{i18nT(BACKUP_KIND_LABEL_KEY[kind])}</div>
-                  <div className="text-[12px] text-muted">
-                    {run
-                      ? i18nT('apps.awsControl.console.backup_last_run', { when: fmtRelative(run.at), size: fmtBytes(run.bytes) })
-                      : i18nT('apps.awsControl.console.backup_never')}
-                  </div>
-                  {kind === 'sessions' && (
-                    // The archive takes BOTH halves of a session, and the CLI
-                    // half lives in a directory shared with any kiro-cli chat
-                    // started outside Kiro Crew. Say so where the button is:
-                    // the owner is choosing what leaves their machine.
-                    <div className="text-[12px] text-muted" data-testid="backup-sessions-scope">
-                      {i18nT('apps.awsControl.console.backup_sessions_scope')}
-                    </div>
-                  )}
-                </div>
-                <Btn onClick={() => runMut.mutate(kind)} disabled={running} data-testid={`backup-run-${kind}`}>
-                  <RefreshCw size={13} className={running ? 'animate-spin' : ''} />
-                  {running ? i18nT('apps.awsControl.console.backup_running') : i18nT('apps.awsControl.console.backup_run_now')}
-                </Btn>
-              </div>
-            )
-          })}
+          {BACKUP_KINDS.map((kind) => (
+            <BackupRow
+              key={kind}
+              account={account}
+              kind={kind}
+              run={data.runs[kind]}
+              // Account-scoped: this payload answers "is a backup running for THIS
+              // account", which the app-scoped `_jobs/active` surface cannot.
+              job={data.jobs?.[kind]}
+              // Re-read immediately after a start, rather than waiting out the
+              // poll gap and looking like the click did nothing.
+              onStarted={invalidate}
+            />
+          ))}
           <div className="flex items-center justify-between px-3 py-2.5" data-testid="backup-nightly">
             <div className="min-w-0">
               <div className="text-[13px] font-medium text-text">{i18nT('apps.awsControl.console.backup_nightly')}</div>
@@ -1966,7 +2068,12 @@ export function BackupSection({ account }: { account: string }) {
         <p className="mt-2 text-[12px] text-muted" data-testid="backup-remote-error">{i18nT('apps.awsControl.console.backup_remote_error')}</p>
       )}
 
-      {data?.remote && (
+      {/* Gated on status data existing, NOT on `data.remote`. The remote half is
+        * opt-in behind `?remote=1`, which only this disclosure can request -- so
+        * gating the disclosure on remote data made the control that enables
+        * remote fetching wait for the fetch it enables, and the archive and
+        * Restore became unreachable. The rows below are already null-safe. */}
+      {data && (
         <div className="mt-2">
           <button
             onClick={() => setShowRemote((v) => !v)}
