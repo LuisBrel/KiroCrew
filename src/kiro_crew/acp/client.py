@@ -27,11 +27,21 @@ import signal
 import stat
 import subprocess as subprocess_mod
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence, TypeVar
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Collection,
+    Mapping,
+    Sequence,
+    TypeVar,
+)
 
 from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
@@ -54,12 +64,15 @@ from kiro_crew.acp.liveness import (
     consult_offloaded,
 )
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+from kiro_crew.acp.session_mcp import session_mcp_deny_rules, session_mcp_servers
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
+    CC_PERMISSION_MODE_BYPASS,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -112,6 +125,7 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
 )
 from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import (
@@ -133,7 +147,7 @@ from kiro_crew.hooks import (
 )
 from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import schedule_claim
-from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
+from kiro_crew.mcp_gateway.session_servers import injection_server_names, pooled_session_servers
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
@@ -150,7 +164,7 @@ from kiro_crew.sandbox import (
     wrap_argv,
     wrap_argv_async,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.skill_usage import get_global_skill_read_observer
 
@@ -610,6 +624,199 @@ def _resolve_claude_code_executable() -> str | None:
     # Casing-normalize (Windows): a `which`-resolved .EXE reaches the launcher shim
     # with its true on-disk name (see _normalize_exe_casing).
     return _normalize_exe_casing(shutil.which(CLAUDE_CODE_BIN, path=search_path))
+
+
+# Who owns the undo for a seeded ``<work_dir>/.claude/settings.local.json``, keyed
+# by resolved path. ``work_dir`` is caller-supplied and every keyless AcpClient
+# shares one default, so several claude sessions routinely seed the SAME file; a
+# per-client snapshot would let the second session record the first one's seed as
+# "the user's original" and write it back on reset, leaving Crew-authored settings
+# in the user's project with nothing left that would ever remove them. Each entry
+# holds the user's true original (``prior``), how many live sessions have claimed
+# it (``refs``), and the text last written (``seeded``) so the last session out can
+# tell Crew's own file from one a user or another process has since edited.
+_claude_settings_lock = threading.Lock()
+_claude_settings_owners: dict[str, dict[str, Any]] = {}
+
+
+def _claude_settings_key(path: Path) -> str:
+    """A stable identity for *path* that two clients agree on.
+
+    ``realpath`` rather than ``resolve(strict=True)``: the file usually does not
+    exist yet, and what matters is that ``./x/.claude`` and an absolute or
+    symlinked spelling of the same directory land on ONE registry entry.
+    """
+    return os.path.realpath(path)
+
+
+def _claude_settings_usable(path: Path) -> bool:
+    """Whether Crew may read, seed and restore *path* at all.
+
+    ``work_dir`` is routinely a checked-out project, so this path is attacker-
+    influenced: a repository can ship
+    ``.claude/settings.local.json -> ~/.aws/credentials`` (or a ``.claude``
+    directory that is itself a link). Following it would read those bytes into
+    the seed merge, and the restore write — which replaces the inode rather than
+    writing through the link — would then materialize them as an ordinary file
+    inside the project, where the file browser, the agent and the next ``git add``
+    can all reach them.
+
+    So a symlink at either component is REFUSED rather than followed, as is a
+    sensitive resolved target (the same guard
+    :func:`~kiro_crew.agent_discovery._read_agent_spec` applies to agent specs).
+    Refusing means exactly that: no read, no seed, no restore. Nothing the user
+    put there is read, rewritten or removed.
+
+    The residual is stated in the caller's warning rather than papered over: a
+    session on a refused path runs without Crew's seed, so it gets no
+    ``availableModels`` allowlist, no ``permissions.deny`` rules from
+    ``disabledTools``, and an inherited ``bypassPermissions`` in the linked file
+    is NOT stripped. Replacing the link instead would close that at the cost of
+    deleting a user's own configuration, which is not this seam's call to make.
+    """
+    for candidate in (path, path.parent):
+        try:
+            if candidate.is_symlink():
+                return False
+        except OSError:
+            return False
+    try:
+        real = path.resolve()
+    except (OSError, RuntimeError):
+        # RuntimeError is pathlib's signal for a symlink LOOP, which a project
+        # directory is one ``ln -s`` away from.
+        return False
+    return not is_sensitive_path(str(real))
+
+
+def _claim_claude_settings(path: Path) -> tuple[bool, tuple[str, int] | None]:
+    """Register a session's interest in *path*; return ``(usable, prior)``.
+
+    *prior* is ``(text, mode)`` for a file that already existed before ANY
+    session seeded it, or ``None`` when Crew is creating it (in which case reset
+    removes it). The read happens once per path: a later claimant is handed the
+    same original rather than re-reading a file the first claimant has already
+    overwritten.
+
+    *usable* is ``False`` for a path Crew must not touch (see
+    :func:`_claude_settings_usable`); *prior* is then ``None`` and the caller
+    must neither seed nor restore — a ``None`` prior otherwise means "remove the
+    file on reset", which is the one thing a refused path must not do.
+    """
+    key = _claude_settings_key(path)
+    with _claude_settings_lock:
+        entry = _claude_settings_owners.get(key)
+        if entry is not None:
+            entry["refs"] += 1
+            prior: tuple[str, int] | None = entry["prior"]
+            usable = bool(entry["usable"])
+            return (usable, (prior[0], prior[1]) if prior is not None else None)
+        usable = _claude_settings_usable(path)
+        prior = None
+        if usable:
+            try:
+                prior = (path.read_text(encoding="utf-8"), stat.S_IMODE(path.stat().st_mode))
+            except FileNotFoundError:
+                # The common case: no file yet, so the last session out removes
+                # the one Crew creates. Only absence is treated this way — an
+                # unreadable existing file must not be mistaken for "ours to
+                # delete", so any other OSError refuses the path instead.
+                prior = None
+            except OSError:
+                logger.warning(
+                    "%s exists but could not be read; leaving it untouched for this session",
+                    path,
+                    exc_info=True,
+                )
+                usable = False
+        _claude_settings_owners[key] = {
+            "prior": prior,
+            "refs": 1,
+            "seeded": None,
+            "usable": usable,
+        }
+        return (usable, prior)
+
+
+def _note_claude_settings_seed(path: Path, text: str) -> None:
+    """Record what was just written to *path*, for the foreign-edit check."""
+    key = _claude_settings_key(path)
+    with _claude_settings_lock:
+        entry = _claude_settings_owners.get(key)
+        if entry is not None:
+            entry["seeded"] = text
+
+
+def _release_claude_settings(
+    path: Path,
+) -> tuple[bool, tuple[str, int] | None, str | None, bool]:
+    """Drop a session's claim on *path*.
+
+    Returns ``(is_last, prior, seeded, usable)``. Only the last session out gets
+    ``is_last`` — the earlier ones must stand aside, since the file is still
+    configuring a live adapter. An unknown path also reports "not last": its undo
+    already ran, and a second restore would overwrite whatever came after.
+
+    ``usable`` is ``False`` for a path that was refused at claim time; the caller
+    must then do nothing at all, because a refused path was never seeded and a
+    ``None`` prior would otherwise read as "delete it".
+    """
+    key = _claude_settings_key(path)
+    with _claude_settings_lock:
+        entry = _claude_settings_owners.get(key)
+        if entry is None:
+            return (False, None, None, False)
+        entry["refs"] -= 1
+        usable = bool(entry["usable"])
+        if entry["refs"] > 0:
+            return (False, entry["prior"], entry["seeded"], usable)
+        _claude_settings_owners.pop(key, None)
+        return (True, entry["prior"], entry["seeded"], usable)
+
+
+def _atomic_write_preserving_access_control(
+    path: Path,
+    text: str,
+    *,
+    mode: int,
+    existing: bool,
+    fsync: bool = False,
+) -> None:
+    """``atomic_write`` that carries an existing file's access-control metadata.
+
+    ``atomic_write`` REPLACES the inode, so permission bits (``mode=``) are not
+    the whole story: a ``settings.local.json`` an administrator gave a named-user
+    or named-group POSIX ACL would come back with that ACL silently gone, and the
+    seed/restore pair runs on a file the session merely borrowed. Both writes go
+    through here so neither half can regress the other.
+
+    *existing* says whether there is a file to carry from — the seed creates one
+    on the common path, and opening a descriptor for a file that is not there
+    would raise. The carry is ADDITIVE to ``mode``, not a replacement for it, and
+    is skipped entirely where the xattr syscalls do not exist (Windows), because
+    holding any handle open across ``os.replace`` fails the write there.
+    """
+    src_fd: int | None = None
+    if existing:
+        try:
+            src_fd = open_access_control_source(path)
+        except OSError:
+            # Vanished or swapped for a link since the claim; write without the
+            # carry rather than failing the session over metadata.
+            logger.debug("could not open %s to carry its access control", path, exc_info=True)
+            src_fd = None
+    try:
+        atomic_write(
+            path,
+            text,
+            fsync=fsync,
+            mode=mode,
+            newline="",
+            preserve_access_control_from=src_fd,
+        )
+    finally:
+        if src_fd is not None:
+            os.close(src_fd)
 
 
 def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
@@ -2274,11 +2481,33 @@ class AcpClient:
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
         # Claude backend permission mode (Auto-mode / permission-UI parity).
-        # Inert on the kiro-cli path and unused by the public core; a companion
-        # that drives the _is_claude seam reads/writes it and wires the
-        # permission-mode method set + settings.local.json defaultMode. None =
-        # the backend default.
+        # Inert on the kiro-cli path. None = the backend's own default
+        # ("default", i.e. every tool decision is forwarded to the host), which is
+        # what _write_claude_local_settings leaves in place when nothing asked
+        # for a mode.
         self._permission_mode = permission_mode
+        # Snapshot of the project's own <work_dir>/.claude/settings.local.json,
+        # taken before this session seeds its keys into it: (text, file mode), or
+        # None when there was no such file. Restored/removed on reset, so a
+        # permission mode never outlives its session and a file the user owns is
+        # never left rewritten. See _write_claude_local_settings.
+        self._claude_settings_prior: tuple[str, int] | None = None
+        self._claude_settings_captured = False
+        # False when the settings path is one Crew must not read or write (a
+        # symlink, or a sensitive resolved target). The seed is then skipped
+        # entirely and reset touches nothing — see _claude_settings_usable.
+        self._claude_settings_usable = True
+        # Exact text this session last wrote there, so reset can decline to undo a
+        # file another session has since seeded over. See
+        # _restore_claude_local_settings.
+        self._claude_settings_seeded: str | None = None
+        # This session's translated ``mcpServers`` array, resolved once per spawn.
+        # Held here so the shared session-params call site is a pure in-memory
+        # read: the translation touches disk, and doing that AT the call site
+        # would put an executor hop on every backend's construction path
+        # (harness-parity H13). None = not resolved yet; cleared on reset so the
+        # next spawn re-reads the spec. See _session_mcp_servers.
+        self._session_mcp_cache: list[dict[str, Any]] | None = None
         self._session_key = session_key
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
@@ -2487,19 +2716,326 @@ class AcpClient:
         """
         return pooled_session_servers(self._mcp_gateway_overlay, self._agent, self._channel_id)
 
-    def _claude_session_mcp_servers(self) -> list:
-        """MCP server array passed to a claude ``session/new`` / ``session/load``.
+    def _resolve_session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Translate the agent spec into this session's ``mcpServers`` array.
 
-        Overridable seam. The Default is ``[]``, which is byte-identical for kiro-cli
-        (it gets its servers via ``--agent``) but is a REAL GAP for claude: the
-        claude-agent-acp adapter does not read ``kirocrew.mcp.json`` on its own, so a
-        claude session started on a build that does not override this has zero MCP
-        tools. The harness itself works — prompts, streaming, permissions — but Crew's
-        own tools are absent. An edition overrides this to inject the
-        kirocrew-core/cron + user MCP servers; closing it for the public build means
-        translating ``kirocrew.mcp.json`` into this array here.
+        Blocking (reads the agent spec and the gateway overlay), so it runs off
+        the loop from the spawn path and its result is cached for the call sites
+        — see :meth:`_session_mcp_servers` for why the call sites must not do
+        this work themselves.
+
+        The names of the pooled broker stubs the caller appends are resolved here
+        and passed down, because this layer is the one that holds the overlay: a
+        stub wraps — and is keyed by — the same name as the agent-spec entry it
+        rewrites, so translating both halves would put two elements with one
+        ``name`` into a single array (either the raw entry shadows the stub and the
+        session bypasses the broker, or both register and every pooled backend runs
+        twice — #927). Empty on error is the safe direction, the same one the KAS
+        projection takes: it re-declares a stubbed server, where the injection
+        still outranks it, rather than withholding a server nothing else supplies.
         """
-        return []
+        try:
+            stubbed: Collection[str] = injection_server_names(
+                self._mcp_gateway_overlay, self._agent
+            )
+        except Exception:
+            logger.warning(
+                "could not resolve pooled stub names; the session MCP array may re-declare one",
+                exc_info=True,
+            )
+            stubbed = frozenset()
+        return session_mcp_servers(self._agent, stub_server_names=stubbed)
+
+    def _session_mcp_servers(self) -> list[dict[str, Any]]:
+        """MCP server array passed to this session's ``session/new`` / ``session/load``.
+
+        Empty for kiro-cli, which receives the same servers through ``--agent``.
+        For a harness in ``ACP_BACKENDS_SESSION_MCP_ARRAY`` the array is the ONLY
+        channel — the adapter reads no agent spec of its own — so it is built by
+        translating this session's agent spec (see
+        :mod:`kiro_crew.acp.session_mcp`).
+
+        **In-memory, and deliberately so.** The translation reads disk, but it
+        runs once per spawn in :meth:`_resolve_session_mcp_servers` and lands in
+        ``_session_mcp_cache``; this accessor only hands the cached list out. That
+        is what keeps the shared session-params call site synchronous: awaiting an
+        executor hop there would put a new scheduling and failure point on EVERY
+        backend's construction path — kiro-cli included, which returns ``[]``
+        here and needs no I/O at all — and the kiro path is not allowed to change
+        in service of an adapter (harness-parity H13).
+
+        Asks the capability set rather than ``self._is_claude`` on purpose: where a
+        harness gets its MCP servers is a property of its transport, not of its
+        vendor, so the next such adapter joins the set instead of adding a second
+        branch here (harness-parity H6). The set check comes FIRST, so a harness
+        outside it returns before the cache is ever consulted and can never be
+        made to read a spec.
+
+        A cold cache resolves inline rather than returning nothing: a set member
+        whose spawn path does not pre-warm would otherwise come up with zero
+        tools, which is the exact defect this module exists to fix. That costs a
+        brief blocking read on the loop, which is why the spawn path warms it.
+
+        Per-spawn freshness is preserved: ``_reset_state`` clears the cache, so an
+        MCP install or toggle takes effect on the next session with no gateway
+        restart.
+        """
+        if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
+            return []
+        if self._session_mcp_cache is None:
+            self._session_mcp_cache = self._resolve_session_mcp_servers()
+        return list(self._session_mcp_cache)
+
+    def _claude_local_settings_path(self) -> Path:
+        return self._work_dir / ".claude" / "settings.local.json"
+
+    def _write_claude_local_settings(self) -> None:
+        """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
+
+        The highest-precedence project settings source the claude-agent-acp
+        adapter reads, and the only channel for two things Crew has to control:
+
+        1. ``permissions.defaultMode`` (``self._permission_mode``). The adapter
+           short-circuits its ``canUseTool`` callback ONLY for
+           ``bypassPermissions``; every other mode keeps forwarding tool
+           decisions to the host as ``session/request_permission``, which is what
+           puts a claude session under the same gate kiro-cli sessions run under.
+           Omitted when no mode was requested, leaving the adapter's own default
+           (ask) rather than asserting one — and an inherited ``bypassPermissions``
+           is actively STRIPPED from the file this session runs against unless
+           Crew itself asked for that mode. The base code swept the whole file on
+           every reset for exactly this reason ("so bypassPermissions doesn't
+           persist after a crash"); preserving a user's own project file, which is
+           what replaced the sweep, must not also preserve the one value that
+           takes every tool call out of the host gate. The original bytes still
+           come back on reset, so the user's setting is not edited — only the
+           window in which Crew drives the session is protected.
+        3. ``permissions.deny``, from
+           :func:`~kiro_crew.acp.session_mcp.session_mcp_deny_rules`: the agent
+           spec's ``disabledTools`` cannot ride along in the ``mcpServers`` array,
+           and silently dropping a restriction while forwarding the server it
+           narrows would widen the tool surface. Merged with (not over) any deny
+           rules the user's own file carries.
+        4. ``availableModels`` plus the resolved ``model``. The adapter merges
+           ``availableModels`` union+dedup across every settings source, so a user
+           ``~/.claude`` carrying ``['opus','sonnet']`` is enough to collapse a
+           versioned ``[1m]`` id (1M-token window) back to 200K. Writing the full
+           registry allowlist here makes the id resolve by exact match.
+
+        The user's file is PRESERVED, not replaced: its keys are merged under
+        ours, and the original bytes and mode are snapshotted so
+        :meth:`_restore_claude_local_settings` can put them back on reset. A
+        project ``settings.local.json`` belongs to the user, and ``work_dir`` is
+        routinely a real project directory rather than Crew's own workspace.
+
+        The snapshot is held per PATH in a process-level registry, not per
+        client: ``work_dir`` is caller-supplied and every keyless client shares
+        one default, so two claude sessions routinely hold the same directory. A
+        per-client snapshot would let the second session record the FIRST one's
+        seed as "the user's original" and write it back on reset, leaving
+        Crew-authored settings in the user's project with nothing left that would
+        ever remove them. The registry captures the original once and hands the
+        undo to whichever session resets last.
+
+        Blocking (reads and writes a file); callers run it off the loop.
+        """
+        local_settings = self._claude_local_settings_path()
+        if not self._claude_settings_captured:
+            self._claude_settings_usable, self._claude_settings_prior = _claim_claude_settings(
+                local_settings
+            )
+            self._claude_settings_captured = True
+        if not self._claude_settings_usable:
+            # A symlink, or a sensitive resolved target: reading it would pull
+            # those bytes into the merge and the restore would republish them as
+            # an ordinary project file. Left entirely alone, which costs this
+            # session the seed — say what that costs rather than degrade quietly.
+            logger.warning(
+                "%s is a symlink or resolves somewhere sensitive; not seeding it. This session "
+                "runs without Crew's availableModels allowlist and without the permissions.deny "
+                "rules from the agent spec, and an inherited bypassPermissions there is NOT "
+                "stripped. Remove the link to restore the session-scoped settings.",
+                local_settings,
+            )
+            return
+
+        data: dict[str, Any] = {}
+        if self._claude_settings_prior is not None:
+            try:
+                loaded = json.loads(self._claude_settings_prior[0])
+            except ValueError:
+                logger.warning(
+                    "%s is not valid JSON; seeding Crew's keys over it for this session "
+                    "(the original bytes are restored on reset)",
+                    local_settings,
+                )
+                loaded = None
+            if isinstance(loaded, dict):
+                data = dict(loaded)
+
+        perms = data.get("permissions")
+        merged_perms = dict(perms) if isinstance(perms, dict) else {}
+        # An inherited allow rule pre-approves a tool call inside the adapter, so
+        # it never reaches Crew's canUseTool callback -- the same short-circuit as
+        # bypassPermissions, only per-tool instead of session-wide. A project file
+        # written for a bare `claude` run legitimately carries these, but under
+        # Crew they would silently take matching calls out of the permission gate,
+        # governance ceiling and SEL audit, so they are dropped for the duration
+        # of this session. "ask" goes with them: it is the same allowlist grammar
+        # scoping who decides, and Crew's gate is the only thing that may decide
+        # here. _restore puts the user's bytes back verbatim on reset.
+        inherited_grants = [k for k in ("allow", "ask") if merged_perms.get(k)]
+        if inherited_grants:
+            logger.warning(
+                "%s declares permissions.%s; dropping them for this session so tool calls "
+                "stay under the host permission gate (the file is restored on reset)",
+                local_settings,
+                "/".join(inherited_grants),
+            )
+            for key in inherited_grants:
+                merged_perms.pop(key, None)
+        if self._permission_mode:
+            merged_perms["defaultMode"] = self._permission_mode
+        elif merged_perms.get("defaultMode") == CC_PERMISSION_MODE_BYPASS:
+            # Inherited from the user's own file, or left behind by a crashed
+            # pre-upgrade session. Either way the adapter would short-circuit its
+            # canUseTool callback for the whole session and no tool call would
+            # reach Crew's deny floor, sensitive-path check or governance ceiling.
+            # Dropped for the duration of this session only; _restore puts the
+            # user's bytes back verbatim on reset.
+            logger.warning(
+                "%s declares permissions.defaultMode=%s; dropping it for this session so "
+                "tool calls stay under the host permission gate (the file is restored on reset)",
+                local_settings,
+                CC_PERMISSION_MODE_BYPASS,
+            )
+            merged_perms.pop("defaultMode", None)
+        deny_rules = session_mcp_deny_rules(self._agent)
+        if deny_rules:
+            existing_deny = merged_perms.get("deny")
+            keep = (
+                [r for r in existing_deny if isinstance(r, str)]
+                if isinstance(existing_deny, list)
+                else []
+            )
+            merged_perms["deny"] = keep + [r for r in deny_rules if r not in keep]
+        # Assigned whenever the key was already there, even if the merge emptied
+        # it: stripping an inherited bypassPermissions can leave nothing behind,
+        # and skipping the assignment then would leave the ORIGINAL permissions
+        # block — bypass and all — in the file this session runs against.
+        if merged_perms or "permissions" in data:
+            data["permissions"] = merged_perms
+        # "claude_code" is the registry's provider key for this backend (the same
+        # literal model_registry itself indexes by).
+        allowlist = model_registry.available_models("claude_code")
+        if allowlist:
+            data["availableModels"] = allowlist
+        else:
+            # Only reachable with a corrupt/missing model registry (which the
+            # registry already warns about at import). Without the allowlist the
+            # adapter can collapse the [1m] id to 200K, so say so here rather
+            # than degrade silently.
+            logger.warning(
+                "model registry availableModels empty (corrupt or missing registry?); "
+                "settings.local.json written without an allowlist — the 1M-token "
+                "window may not resolve",
+            )
+        # self._model is a resolved provider id; DEFAULT_MODEL ("auto") is not one,
+        # and omitting the key is what lets the adapter pick the allowlist head.
+        if self._model and self._model != DEFAULT_MODEL:
+            data["model"] = self._model
+
+        # 0o600 for a file Crew creates; an existing file keeps the mode the user
+        # gave it, since this write is a merge into their file, not a takeover.
+        write_mode = (
+            0o600 if self._claude_settings_prior is None else self._claude_settings_prior[1]
+        )
+        local_settings.parent.mkdir(parents=True, exist_ok=True)
+        seeded = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        _atomic_write_preserving_access_control(
+            local_settings,
+            seeded,
+            mode=write_mode,
+            existing=self._claude_settings_prior is not None,
+            fsync=True,
+        )
+        # What Crew last put on disk, so the last session out can tell its own
+        # file from one a user or another process has since edited (see _restore).
+        self._claude_settings_seeded = seeded
+        _note_claude_settings_seed(local_settings, seeded)
+
+    def _restore_claude_local_settings(self) -> None:
+        """Undo this session's ``settings.local.json`` seed.
+
+        Puts the user's original bytes back, or removes the file when Crew created
+        it — so a permission mode (``bypassPermissions`` above all) never outlives
+        the session that asked for it, including when the session ends by having
+        its process die. Best-effort: a failure here must not mask whatever
+        brought the session down.
+
+        Only the LAST session holding this path acts (see
+        :func:`_release_claude_settings`). ``work_dir`` is caller-supplied and
+        every keyless client shares one default, so two claude sessions can hold
+        the same directory: without the ownership check the first to reset would
+        delete the file the second's adapter is configured from. The last one out
+        restores the original the FIRST claimant captured, which is the only copy
+        of it that is not already overwritten.
+
+        A file that no longer matches what Crew last wrote is left alone: a user
+        or another tool has edited it since, and their version is not ours to
+        replace.
+
+        Newlines are written verbatim (``newline=""``): the default applies
+        universal-newline translation, which would hand a Windows user back a
+        CRLF copy of their own LF file. The restore also carries the file's
+        access-control metadata, for the same reason the seed does — the write
+        replaces the inode, so a named ACL would otherwise be lost by the very
+        step meant to put the user's file back.
+
+        A path that was REFUSED at claim time is not touched here at all: it was
+        never seeded, and its ``None`` prior would otherwise read as "Crew created
+        this, remove it" — deleting a symlink the user put there.
+        """
+        path = self._claude_local_settings_path()
+        is_last, prior, seeded, usable = _release_claude_settings(path)
+        self._claude_settings_prior = None
+        self._claude_settings_seeded = None
+        self._claude_settings_captured = False
+        self._claude_settings_usable = True
+        if not is_last:
+            logger.debug(
+                "%s is still configuring another live session; leaving the undo to it", path
+            )
+            return
+        if not usable:
+            logger.debug("%s was never seeded (refused path); nothing to undo", path)
+            return
+        try:
+            if seeded is not None:
+                try:
+                    current = path.read_text(encoding="utf-8")
+                except OSError:
+                    current = None
+                if current != seeded:
+                    # current is None covers deletion as well as an unreadable
+                    # file, and both mean the same thing here: what Crew seeded is
+                    # no longer on disk. Treating absence as "unchanged" would let
+                    # reset re-create a file the user deliberately deleted mid
+                    # session, resurrecting settings they removed.
+                    logger.info(
+                        "%s changed since Crew seeded it (%s); leaving it to whoever owns it now",
+                        path,
+                        "gone" if current is None else "edited",
+                    )
+                    return
+            if prior is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write_preserving_access_control(
+                    path, prior[0], mode=prior[1], existing=path.exists()
+                )
+        except OSError:
+            logger.warning("could not restore %s after session reset", path, exc_info=True)
 
     @property
     def is_ready(self) -> bool:
@@ -2933,24 +3469,28 @@ class AcpClient:
             await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
 
         if self._is_claude:
-            # Dormant seam — see method docstring. Binary resolution only; the
-            # ~/.claude registration glue (settings.local.json, the MCP-registry
-            # reader) lived in the deleted cc_agent module and is re-added by the
-            # internal companion, not the public core.
-            #
-            # Per-session settings seed: a companion attaches
-            # _write_claude_local_settings (permissions.defaultMode + the
-            # availableModels allowlist that unlocks the 1M-token window). It
-            # MUST run on the PRIMARY spawn path — not only the rare
-            # model-substitution retry at _new_session_following_substitution —
-            # or a claude session collapses to the 200K default. Guarded via
-            # getattr so the public core (no such method) is byte-identical.
-            _seed = getattr(self, "_write_claude_local_settings", None)
-            if callable(_seed):
-                try:
-                    _seed()
-                except (OSError, ValueError, TypeError):
-                    logger.warning("initial seed of settings.local.json failed", exc_info=True)
+            # Per-session settings seed (permissions.defaultMode + the
+            # availableModels allowlist that unlocks the 1M-token window). It MUST
+            # run on the PRIMARY spawn path — not only the rare model-substitution
+            # retry at _new_session_following_substitution — or a claude session
+            # collapses to the 200K default. Off-loop: it reads and writes a file.
+            try:
+                await asyncio.to_thread(self._write_claude_local_settings)
+            except (OSError, ValueError, TypeError):
+                # A seed that cannot be written costs model/permission fidelity,
+                # not the session: the adapter falls back to its own settings
+                # sources, and tool calls still route through the host gate.
+                logger.warning("initial seed of settings.local.json failed", exc_info=True)
+            # Translate the agent spec into the session MCP array HERE, not at the
+            # session/new call site: that call site is shared with kiro-cli, and
+            # the translation reads disk. Resolving it in this adapter-only branch
+            # keeps the shared site a synchronous in-memory read, so the kiro
+            # construction path gains no executor hop and no new failure mode
+            # (harness-parity H13). Correctness does not depend on this warm —
+            # _session_mcp_servers resolves a cold cache itself, and the capability
+            # set (not this branch) is what decides whether the array is populated
+            # at all; the warm is what keeps the read off the loop.
+            self._session_mcp_cache = await asyncio.to_thread(self._resolve_session_mcp_servers)
             global _claude_acp_argv_cache  # noqa: PLW0603
             if _claude_acp_argv_cache is _UNRESOLVED:
                 _claude_acp_argv_cache = await asyncio.to_thread(_resolve_claude_acp_bin)
@@ -3442,13 +3982,16 @@ class AcpClient:
                         pass
         # Clean up sandbox temp files (macOS seatbelt profile)
         self._discard_sandbox_cleanup()
-        # Remove settings.local.json so bypassPermissions doesn't persist after crash
-        if self._is_claude:
-            _stale = self._work_dir / ".claude" / "settings.local.json"
-            try:
-                _stale.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # Undo this session's settings.local.json seed so bypassPermissions
+        # doesn't persist after a crash. Restores the user's own file when there
+        # was one, rather than deleting it — the seed is a merge into a project
+        # file Crew does not own (see _write_claude_local_settings).
+        if self._is_claude and self._claude_settings_captured:
+            self._restore_claude_local_settings()
+        # Drop the translated MCP array: the spec is read PER SPAWN, which is what
+        # lets installing or toggling a server take effect on the next session, so
+        # a replacement process must not inherit this one's snapshot.
+        self._session_mcp_cache = None
         # Save PIDs before clearing state — needed for untracking
         saved_pid = self._pid
         saved_child_pids = self._child_pids
@@ -3545,23 +4088,26 @@ class AcpClient:
         without a sessionId, which the caller treats as a hard failure).
 
         The substitution retry is a claude-only path (kiro-cli never emits this
-        advisory). On a build that does not override ``_claude_session_mcp_servers``,
-        ``mcpServers`` stays ``[]`` and the settings re-seed is best-effort via
-        ``getattr``: the re-seed helper is an edition override, so the base client
-        must tolerate its absence rather than assume it.
+        advisory), and so is the re-seed: the kiro-cli branch writes no
+        ``settings.local.json`` at all.
         """
         new_params: dict = {
             "cwd": await self._session_work_dir(),
-            # kiro-cli loads servers from --agent; claude-agent-acp must be
-            # told here -- it does not read kirocrew.mcp.json on its own. The
-            # Default hook returns [] (kiro-cli path unchanged); an internal
-            # companion that drives the _is_claude seam overrides
-            # _claude_session_mcp_servers() to populate the claude MCP array.
+            # kiro-cli loads servers from --agent; a harness in
+            # ACP_BACKENDS_SESSION_MCP_ARRAY must be told here -- it reads no
+            # agent spec of its own, so this array is the whole MCP surface of
+            # the session (translated from that same spec, see
+            # acp/session_mcp.py). Empty on the kiro-cli path.
             # Pooled broker stubs are appended for kiro-cli: a session-injected
             # server outranks the same-named entry in the agent spec, which is
             # how pooling takes effect without writing a spec anywhere.
+            # The first is an in-memory read of the cache the spawn path warmed,
+            # NOT an executor hop: this call site is shared with kiro-cli, and
+            # adapter work must not add a scheduling or failure point to that
+            # backend's construction path (harness-parity H13). The pooled read
+            # stays off the loop, as it already was.
             "mcpServers": [
-                *self._claude_session_mcp_servers(),
+                *self._session_mcp_servers(),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ],
         }
@@ -3600,20 +4146,17 @@ class AcpClient:
             self._model = substitute
             # Re-seed settings.local.json so the fresh SettingsManager the adapter
             # builds for the retry resolves the substitute model (it merges
-            # settings sources each session/new). The re-seed helper is an edition
-            # override, so guard for its absence rather than assume it exists.
-            _reseed = getattr(self, "_write_claude_local_settings", None)
-            if callable(_reseed):
-                try:
-                    _reseed()
-                except (OSError, ValueError, TypeError):
-                    # Narrow to realistic re-seed failure modes: OSError covers
-                    # disk / permission errors on the atomic write; ValueError
-                    # and TypeError cover registry / json shape surprises.
-                    # Never let re-seed failure mask the retry -- worst case, the
-                    # adapter resolves to whatever it had cached and we still
-                    # retry session/new on the substitute path.
-                    logger.warning("re-seed of settings.local.json failed", exc_info=True)
+            # settings sources each session/new).
+            try:
+                await asyncio.to_thread(self._write_claude_local_settings)
+            except (OSError, ValueError, TypeError):
+                # Narrow to realistic re-seed failure modes: OSError covers
+                # disk / permission errors on the atomic write; ValueError
+                # and TypeError cover registry / json shape surprises.
+                # Never let re-seed failure mask the retry -- worst case, the
+                # adapter resolves to whatever it had cached and we still
+                # retry session/new on the substitute path.
+                logger.warning("re-seed of settings.local.json failed", exc_info=True)
             self._last_substitution_model = None
             retry_id = await self._send_request(METHOD_SESSION_NEW, new_params)
             session_resp = await self._wait_for_response(
@@ -3674,14 +4217,15 @@ class AcpClient:
                     load_params: dict = {
                         "sessionId": resume_sid,
                         "cwd": await self._session_work_dir(),
-                        # kiro-cli gets its servers via --agent; the claude
-                        # backend must receive them here (it does not read
-                        # kirocrew.mcp.json itself). Default [] leaves kiro-cli
-                        # unchanged; a companion overrides the hook (see
-                        # session/new above). Pooled stubs are re-declared so a
-                        # resumed session keeps talking to the broker.
+                        # kiro-cli gets its servers via --agent; a session-array
+                        # backend must receive them here as well -- a resumed
+                        # session re-declares its whole MCP surface or comes back
+                        # with no tools (see session/new above). Pooled stubs are
+                        # re-declared so a resumed session keeps talking to the
+                        # broker. In-memory here, off-loop there, for the same
+                        # H13 reason as session/new above.
                         "mcpServers": [
-                            *self._claude_session_mcp_servers(),
+                            *self._session_mcp_servers(),
                             *(await asyncio.to_thread(self._pooled_mcp_servers)),
                         ],
                     }
