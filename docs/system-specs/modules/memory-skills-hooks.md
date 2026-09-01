@@ -1341,8 +1341,88 @@ set so repeat calls don't re-resolve.
 
 **CRUD operations** (via `SkillsLoader`):
 - `create_skill(name, content)` — creates `{name}/SKILL.md`, supports nested paths
-- `update_skill(name, content)` — overwrites existing SKILL.md
+- `update_skill(name, content)` — REPLACES the SKILL.md inode via `atomic_write()`
+  rather than writing through the existing one, so the document survives a write
+  that fails part-way. A hardlink to the old inode, or a handle already open on
+  it, therefore keeps seeing the pre-update bytes.
+  **What the replacement does NOT reproduce**, stated because an inode-replacing
+  write is where these get lost silently and the same limits apply to the steering
+  and `/api/file-write` update surfaces that adopted `atomic_write` first:
+  - **Ownership.** The fresh inode belongs to the gateway's own uid/gid. An
+    unprivileged writer cannot give a file away (`chown` to another user needs
+    `CAP_CHOWN`), so a *cross-owned* SKILL.md that the gateway can write changes
+    owner on save. Permission bits and the POSIX ACL are carried, so the effective
+    grant does not widen — the previous owner loses access rather than a new
+    principal gaining it — but the change is real and irreversible by this process.
+  - **A Windows DACL.** The carry is POSIX xattrs only
+    (`ACCESS_CONTROL_XATTRS_SUPPORTED` requires `os.listxattr`/`getxattr`/`setxattr`,
+    which Windows lacks), so on Windows the replacement lands on the DACL it
+    inherits from the containing directory rather than the one the replaced file
+    carried. A file the operator had tightened *below* its directory's inheritance
+    is therefore widened back to it. Closing this needs a `platform_compat`
+    primitive to READ a DACL — `restrict_to_owner` only writes one — and it belongs
+    to `atomic_write`, so it must land for all three surfaces at once rather than
+    by reverting one of them to an in-place write that a mid-write failure or a full
+    disk would turn into data loss.
 - `delete_skill(name)` — removes entire skill directory
+- All three address the leaf relative to a descriptor pinning the parent chain
+  (`pinned_fs`) where the platform has the descriptor-relative syscalls, so an
+  ancestor swapped for a link after resolution cannot redirect the write. Windows
+  keeps the by-name floor. `_DIR_FD_SUPPORTED` names exactly the extra
+  descriptor-relative calls these branches issue — `os.mkdir` (create, via
+  `create_and_open_dir_pinned`), `os.unlink` (update, via `atomic_write`'s staging
+  cleanup) and `os.stat` (delete, via `stat_at`) — on top of
+  `pinned_fs.supports_pinned_walk()`. `os.rmdir` is NOT probed: delete's removal is
+  a by-name `shutil.rmtree`, the residual noted below. `update_skill` additionally
+  requires `atomic_write.pinned_parent_replace_supported()` (the descriptor-relative
+  rename) and takes the by-name floor without it, because `atomic_write` refuses a
+  `parent_dir_fd` it cannot publish through rather than quietly writing by name.
+- Once the skill directory is pinned, `SKILL.md` is never addressed by name again —
+  including the metadata read. `_write_skill_md` passes the descriptor as
+  `open_access_control_source(skill_file, dir_fd=…)`, so the mode and the ACL come
+  from the inode inside the pinned directory. A by-name open there would let a
+  directory replaced at the skill's name supply both while the rename published
+  into the pinned original, handing the real skill back with permissions chosen by
+  whoever did the replacing.
+- These paths use `open_dir_pinned`, not `pin_parent`, because `self._dir / name` is
+  a lexical join nothing canonicalized — so that walk's own `realpath` is the first
+  resolution of the chain, not a second one. `pin_parent` is for a caller that
+  already holds a `realpath`ed path (the steering and file-write update surfaces);
+  used here it would refuse the ordinary symlinks that legitimately sit above the
+  skills root, a symlinked `$HOME` being the common one.
+- `create_skill` lands `SKILL.md` at the **umask default on both branches**: the
+  pinned `O_CREAT` passes `0o666` precisely because that is what the by-name floor's
+  `write_text` produces, so the pin changes no permission default and the two
+  branches cannot diverge per platform. It is also the mode `prompts.py`'s own
+  pinned `O_EXCL` create of user content passes, through the same `pinned_fs` walk.
+  A tighter default for user-authored skill bodies is a policy change that has to
+  cover both branches and both platforms, so it does not ride this migration.
+  The skill DIRECTORY does land at `0o700` on the pinned branch against the floor's
+  umask default, because `pinned_fs.create_and_open_dir_pinned` hardcodes that mode
+  for every caller; it is strictly tighter, and giving it a mode parameter is an
+  API change that belongs with the other `pinned_fs` work. `update_skill` preserves
+  the target's existing bits either way.
+- `update_skill` / `delete_skill` return `False` for a REFUSED target as well as a
+  missing one — a parent that cannot be pinned, or an access-control source that
+  cannot be opened `O_NOFOLLOW` — which the dashboard reports as its existing 404.
+  Callers must not read `False` as "the name does not exist".
+- `create_skill`'s `exists()` guard is a by-name check with a window after it, and
+  **both branches refuse a rival that wins that window** rather than writing through
+  it — the pinned branch via `create_and_open_dir_pinned(must_create=True)`, the
+  by-name floor via `mkdir(parents=True, exist_ok=False)`. Without the second, two
+  concurrent creates on a platform without `openat` would both `write_text` the same
+  `SKILL.md` and both report success, losing one submitted body and never producing
+  the documented 409.
+- `create_skill` is **all-or-nothing**: a failure mid-body (a short write, ENOSPC, an
+  interrupt) rolls back the `SKILL.md` *and* the directory the call created, both
+  through descriptors — the leaf via the directory's own fd, the directory via
+  `pinned_fs.remove_dir_verified`, which stages it aside under the pinned parent and
+  re-checks `(st_dev, st_ino)` against what this call created before removing it, so a
+  directory swapped in at the name is reported rather than deleted. Without the
+  rollback a half-made skill is permanent rather than untidy: the leftover directory
+  makes the `exists()` guard answer False forever, so every retry is a 409 over a
+  truncated body `list_skills()` still serves. A rollback that cannot finish is logged
+  (with the staging name when one was left) and never masks the original error.
 - Path traversal protection: `_safe_name()` rejects `..` and `\` (allows `/` for nesting)
 
 **Foreign-agent import:** only user-authored skills are eligible. Imported
