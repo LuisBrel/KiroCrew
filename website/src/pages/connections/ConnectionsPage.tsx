@@ -20,7 +20,7 @@ import type { ChatMessage, McpApplyChange, McpServer } from '../../types'
 import { fmtDate } from '../../i18n/format'
 import { Badge, Btn, ContentSkeleton, SearchInput } from '../../components/ui'
 import McpTab from '../overview/McpTab'
-import ProviderLogo from './ProviderLogo'
+import ProviderLogo, { PROVIDER_LOGO_SLUGS } from './ProviderLogo'
 import {
   CONNECTION_PROVIDERS,
   serverForConnection,
@@ -410,7 +410,154 @@ function ConnectionCard({
   const [returnAddress, setReturnAddress] = useState('')
   const [invalidReturnAddress, setInvalidReturnAddress] = useState(false)
   const approvalUrl = safeApprovalUrl(oauth?.oauthUrl || '')
-  const logo = <ProviderLogo slug={provider.slug} />
+
+  // The approval tab is opened by the CLICK and filled later, which is the only
+  // ordering the browser allows. POST /api/connections/mint answers as soon as
+  // the mint is SCHEDULED -- the URL does not exist yet and the card polls for it
+  // -- so a window.open() that waited for the URL would fire outside the click's
+  // user-activation window and be blocked as a popup. That holds on the warm path
+  // too: a preminted URL still surfaces on the next poll, not inside the click.
+  // So the click opens a blank tab and this ref holds it until there is somewhere
+  // to send it.
+  const approvalTabRef = useRef<Window | null>(null)
+  // Tri-state, not a boolean, because "no tab" and "a tab the browser refused"
+  // must read differently and `oauth.minted` cannot tell them apart: it stays
+  // false for the whole poll window, so a boolean gated on it let a blocked-popup
+  // user read "finish approving in your browser" about a tab they never got --
+  // the exact claim this change exists to stop making.
+  //   none    -- this attempt was not started from this card's Connect button
+  //   open    -- the click opened a tab and it is waiting for a URL
+  //   refused -- the click asked for a tab and the browser said no
+  const [clickTab, setClickTab] = useState<'none' | 'open' | 'refused'>('none')
+
+  const closeQuietly = (win: Window): boolean => {
+    try {
+      win.close()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // A granted tab would otherwise sit on a bare about:blank for the whole poll
+  // interval, which reads as a misfire on the page's core action. The document is
+  // same-origin by construction -- this component just created it -- so it can be
+  // written directly, and it is written as TEXT rather than markup so a
+  // translated string can never become nodes. No colours are set: `color-scheme`
+  // lets the browser pick, so the holding page cannot clash with a light or dark
+  // theme the way a hardcoded background would.
+  const describeApprovalTab = (tab: Window) => {
+    const body = tab.document.body
+    if (!body) return
+    const label = t('pages.connectionsPage.connecting')
+    tab.document.title = label
+    body.setAttribute(
+      'style',
+      'margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+      + 'color-scheme:light dark;font:14px system-ui,-apple-system,sans-serif',
+    )
+    body.textContent = label
+  }
+
+  // Takes the action that STARTS a mint, not the Connect button specifically:
+  // Authorize and Reconnect run the identical mint-and-poll path through
+  // `onReconnect`, so wiring the tab to one button left the other two opening
+  // nothing and — because their clicks left `clickTab` at `none` — still reading
+  // the "finish approving in your browser" claim about a page that never opened.
+  // The tab belongs to the moment a mint attempt starts, whichever button starts
+  // it.
+  const startMint = async (begin: () => Promise<unknown>) => {
+    let tab: Window | null = null
+    try {
+      // `noopener` is deliberately NOT passed: it makes window.open return null,
+      // and the handle IS the feature here. The reverse-tabnabbing reference it
+      // would have removed is severed on the next line instead, while the tab is
+      // still the same-origin blank document this call just created.
+      tab = window.open('', '_blank')
+      if (tab) tab.opener = null
+    } catch {
+      // A browser that refuses the tab outright is the same case as a blocked
+      // popup, and the fallback link below is the way in.
+      tab = null
+    }
+    if (tab) describeApprovalTab(tab)
+    approvalTabRef.current = tab
+    setClickTab(tab ? 'open' : 'refused')
+    // No reclaim branch here on purpose: a rejected mint ends the attempt without
+    // a URL, which the invariant effect below already recognises. One reclaimer
+    // rather than one per dead end.
+    await begin()
+  }
+
+  // Hand the URL to the tab the click opened. Declared BEFORE the reclaim effect
+  // so that a render which both delivers a URL and moves the card runs delivery
+  // first and leaves the reclaimer nothing to find. Keyed on the URL alone
+  // because it arrives once per attempt; a tab the user closed meanwhile is
+  // dropped rather than reopened, since re-opening a window someone deliberately
+  // closed is not ours to do -- the link below remains the way back.
+  useEffect(() => {
+    if (!approvalUrl) return
+    const tab = approvalTabRef.current
+    if (!tab) return
+    approvalTabRef.current = null
+    if (tab.closed) {
+      setClickTab('refused')
+      return
+    }
+    try {
+      tab.location.href = approvalUrl
+    } catch {
+      // The tab is no longer ours to drive. Recoverable rather than fatal: the
+      // link holds the same URL, and the heading must stop claiming a usable
+      // browser page, so this lands in the same state as a refused tab.
+      setClickTab('refused')
+    }
+  }, [approvalUrl])
+
+  // One invariant instead of a patch per dead end. While a tab is held, the only
+  // situations in which a URL can still arrive are the in-flight click itself and
+  // the waiting state; ANY other resting place -- Cancel, a mint that reported
+  // failed or expired, a mint request that was rejected outright -- means no URL
+  // is coming, so the blank tab is taken back instead of left for the user to
+  // close. Reclaiming also clears the ref, which is the half that matters beyond
+  // tidiness: a stale ref meant the next Connect click overwrote it and orphaned
+  // the first tab permanently.
+  //
+  // The clickTab reset sits ABOVE the ref guard deliberately. Delivery clears the
+  // ref, so guarding on it first left `clickTab` at `open` forever after a
+  // SUCCESSFUL connect -- and a later minted flow on the same card then re-made
+  // the exact claim this predicate exists to prevent, about a tab navigated away
+  // long before. A click's outcome must not outlive its attempt.
+  useEffect(() => {
+    if (busy === 'connect') return
+    if (state === 'waiting-for-approval') return
+    setClickTab('none')
+    const orphan = approvalTabRef.current
+    if (!orphan) return
+    approvalTabRef.current = null
+    if (!orphan.closed) closeQuietly(orphan)
+  }, [busy, state])
+
+  // Unmounting mid-flight (a search filter, a tab switch) would otherwise leave a
+  // blank tab nothing can ever fill, because the component that would deliver the
+  // URL is gone. Safe to close unconditionally here: the ref is non-null ONLY
+  // while the tab is still blank -- delivery clears it -- so this can never close
+  // a consent page the user is working in.
+  useEffect(() => () => {
+    const held = approvalTabRef.current
+    approvalTabRef.current = null
+    if (held && !held.closed) closeQuietly(held)
+  }, [])
+  // Asked of the module rather than of the element. `<ProviderLogo …/>` is always
+  // a truthy JSX element even for a slug it ships no mark for -- the component
+  // returns null when RENDERED, which `??` below cannot observe -- so building the
+  // element unconditionally made the lettered fallback unreachable and any
+  // provider without art rendered an empty gap where its mark should be. GitLab
+  // was exactly that: the art inventory covers GitHub, which the launch set holds
+  // back, and not GitLab, which it includes.
+  const logo = PROVIDER_LOGO_SLUGS.includes(provider.slug)
+    ? <ProviderLogo slug={provider.slug} />
+    : null
   // `official_mcp_server` used to be a subtitle line under the name; the brand
   // mark now carries provenance visually, so keep the assurance as the card's
   // accessible/hover description instead of a third row of chrome.
@@ -488,7 +635,26 @@ function ConnectionCard({
         </span>
       </header>
 
-      <p className="mb-2.5 mt-1.5 min-w-0 text-[12.5px] text-muted" title={valueProp}>
+      {/* A two-line FLOOR with a three-line ceiling, not a fixed height. The
+          value props differ in length -- GitLab's wraps to two lines where
+          Notion's takes one -- and text that sizes to its own copy makes each card
+          as tall as its description, so a row renders ragged. Reserving two lines
+          fixes that for every English value prop (the longest, GitLab's, is 83
+          chars and takes exactly two).
+
+          The ceiling is three rather than two because pinning it at two would
+          CLIP, and the clipped tail is the consequential part: GitLab's copy ends
+          in "this grant can also write", and translations run materially longer
+          (Italian 97 chars, Russian Notion 78 vs 58) -- so at the 3-column width a
+          verbose locale could hide a write-scope disclosure behind a hover-only
+          `title` that touch and keyboard users cannot reach. Growing that one card
+          by a line is the cheaper failure. Same trio as the agents gallery card,
+          which pins an exact height because no permission scope rides in its
+          text. */}
+      <p
+        className="mb-2.5 mt-1.5 line-clamp-3 min-h-[34px] min-w-0 text-[12.5px] leading-[17px] text-muted"
+        title={valueProp}
+      >
         {valueProp}
       </p>
 
@@ -498,7 +664,7 @@ function ConnectionCard({
             <a href={provider.docs_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-text">
               {t('pages.connectionsPage.documentation')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
             </a>
-            <Btn primary onClick={() => void onConnect()} disabled={!!busy}>
+            <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
               {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
               {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
             </Btn>
@@ -508,13 +674,18 @@ function ConnectionCard({
         {state === 'waiting-for-approval' && (
           <div className="space-y-3">
             <div className="text-[13px] font-medium text-text-strong">
-              {/* A minted URL opened no tab, so "finish approving in your browser"
-                  would point the user at a window that does not exist. Existing
-                  keys only -- the fuller copy rewrite needs a 14-locale pass and
-                  rides with the connections-copy slice. */}
-              {t(oauth?.minted
-                ? 'pages.connectionsPage.waiting_for_approval'
-                : 'pages.connectionsPage.finish_approving_in_browser')}
+              {/* Connect opens the approval tab itself, so "finish approving in
+                  your browser" can name a window that exists -- but only when the
+                  browser granted one. `oauth.minted` cannot carry this: it stays
+                  false for the whole poll window, so gating on it told a
+                  blocked-popup user to finish in a browser page they never got.
+                  The click's own outcome decides instead, and a flow this card did
+                  not start (`none`) keeps the original rule. Existing keys only:
+                  the fuller copy rewrite needs a 14-locale pass and rides with the
+                  connections-copy slice. */}
+              {t(clickTab === 'open' || (clickTab === 'none' && !oauth?.minted)
+                ? 'pages.connectionsPage.finish_approving_in_browser'
+                : 'pages.connectionsPage.waiting_for_approval')}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {approvalUrl ? (
@@ -587,7 +758,7 @@ function ConnectionCard({
               </span>
             </div>
             <div className="flex justify-end">
-              <Btn primary onClick={() => void onReconnect()} disabled={!!busy}>
+              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
                 {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />}
                 {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.authorize')}
               </Btn>
@@ -625,7 +796,7 @@ function ConnectionCard({
               </span>
             </div>
             <div className="flex justify-end">
-              <Btn primary onClick={() => void onReconnect()} disabled={!!busy}>
+              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
                 {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
                 {busy === 'connect' ? t('pages.connectionsPage.reconnecting') : t('pages.connectionsPage.reconnect')}
               </Btn>
