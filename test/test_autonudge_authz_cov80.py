@@ -26,7 +26,7 @@ from kiro_crew.autonudge_authz import (
     authorize_and_add_nudge,
     authorize_and_update_nudge,
 )
-from kiro_crew.monitoring.models import MonitorState
+from kiro_crew.monitoring.models import MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS, MonitorState
 
 pytestmark = pytest.mark.asyncio
 
@@ -516,6 +516,86 @@ async def test_update_monitor_conflict_records_a_denied_audit(
     assert loop is None and status == 409
     assert error == "existing monitor wake is in flight"
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
+
+
+async def test_update_monitor_rejects_redaction_expansion_over_limit(
+    audits: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingMonitorSvc:
+        def __init__(self) -> None:
+            self.patches: list[dict[str, Any]] = []
+
+        async def update_monitor(self, _loop_id: str, **patch: Any) -> Any:
+            self.patches.append(patch)
+            return SimpleNamespace(id="monitor-1")
+
+    svc = RecordingMonitorSvc()
+    expanded = "x" * (MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS + 1)
+    monkeypatch.setattr(
+        autonudge_authz,
+        "redact_exfiltration_urls",
+        lambda _value: (expanded, ["expanded"]),
+    )
+
+    loop, error, status = await autonudge_authz.authorize_and_update_monitor(
+        svc=svc,
+        loop_id="monitor-1",
+        session_key="chat-1-1",
+        patch={"wake_instructions": "short"},
+        source="dashboard",
+    )
+
+    assert loop is None and status == 400
+    assert error == (
+        "wake_instructions too long after redaction "
+        f"(max {MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} chars)"
+    )
+    assert svc.patches == []
+
+
+async def test_add_monitor_rejects_redaction_expansion_over_limit(
+    audits: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingMonitorSvc:
+        def __init__(self) -> None:
+            self.added: list[dict[str, Any]] = []
+
+        def get_by_slot(self, _slot_key: str) -> None:
+            return None
+
+        async def add_monitor(self, **values: Any) -> Any:
+            self.added.append(values)
+            return SimpleNamespace(id="monitor-1")
+
+    svc = RecordingMonitorSvc()
+    expanded = "x" * (MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS + 1)
+    monkeypatch.setattr(
+        autonudge_authz,
+        "redact_exfiltration_urls",
+        lambda _value: (expanded, ["expanded"]),
+    )
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            created_ts=1_000.0,
+            wake_instructions="short",
+        ),
+    )
+
+    assert loop is None and status == 400
+    assert error == (
+        "wake_instructions too long after redaction "
+        f"(max {MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} chars)"
+    )
+    assert svc.added == []
 
 
 async def test_add_monitor_conflict_preserves_existing_legacy_stop_sentinel(

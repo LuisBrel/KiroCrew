@@ -277,6 +277,7 @@ class _Ev:
         self.title = title
         self.context_usage_pct = 0.0
         self.usage = None
+        self.synthetic_completion = False
 
 
 class FakeProvider:
@@ -2434,6 +2435,22 @@ class TestDispatcher:
         assert sess.released == []
         assert sess.failures == []
         assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_transient_setup_failure_retries_as_busy(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d._render_config = mock.MagicMock(side_effect=OSError("temporary read failure"))
+        completion = MonitorCompletionHook("mon-1", "failure-a", mock.AsyncMock())
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert not completion.accepted
+        assert sess.released == [d._session_key("u1")]
 
     @pytest.mark.asyncio
     async def test_monitor_wake_shutdown_during_session_claim_is_busy(self) -> None:

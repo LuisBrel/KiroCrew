@@ -1013,9 +1013,12 @@ non-negative token counts, and records token usage as unknown when authoritative
 counts are unavailable. Duplicate, removed, replaced, legacy, and mismatched
 callbacks are no-ops. Recovery resumes an accepted in-flight wake toward its
 persisted completion-evidence deadline and a BUSY claim toward its persisted retry
-deadline. A user stop writes its terminal replacement snapshot before mutating the
-live record or cancelling its timer, so a failed disk write leaves memory, disk, and
-the active schedule aligned instead of allowing a later restart to resurrect work.
+deadline. A user or budget stop that races an accepted action keeps or re-arms that
+finite evidence deadline; completion still charges exactly once, while expiry clears
+only the stale correlation and preserves the terminal outcome. A user stop writes its
+terminal replacement snapshot before mutating the live record or cancelling its timer,
+so a failed disk write leaves memory, disk, and the active schedule aligned instead of
+allowing a later restart to resurrect work.
 A legacy claim with neither typed delivery nor an evidence deadline
 deactivates with `completion_evidence_unavailable` while retaining the
 acknowledged fingerprint, so restart cannot duplicate the wake. Completion stops
@@ -1040,12 +1043,13 @@ provider completion evidence after the event has arrived. Legacy dashboard nudge
 scheduling still returns immediately and still rearms from the existing
 `notify_turn_complete` `finally`; the completion hook neither replaces nor moves
 that lifecycle call. The pure `decide_monitor` policy performs no I/O. It
-checks the non-zero runtime/turn/token budgets first, classifies provider errors
+checks the non-zero runtime/turn/token/provider-error budgets first, classifies provider errors
 without a model turn, suppresses an unchanged observation, and permits
 `wake_actionable` only when the actionable fingerprint differs from the last
 acknowledged wake fingerprint. The defaults are 14,400 seconds, eight completed
-agent turns, 250,000 aggregate input/output tokens, and three consecutive
-provider errors. This substrate does not itself schedule live provider probes or
+agent turns, 250,000 aggregate input/output tokens, and three cumulative
+provider errors. A successful probe resets retry backoff but does not refund the
+finite provider-error budget. This substrate does not itself schedule live provider probes or
 expose a new MCP tool; those are later RFC implementation slices.
 
 **GitHub pull-request shadow probe** (`monitoring/github_pull_request.py`,
@@ -1677,6 +1681,11 @@ decision, and next deadline before returning. `NO_CHANGE`, `RECORD_ONLY`,
 `RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
 provider errors use bounded exponential backoff; terminal provider, success,
 blocked, and budget outcomes remain inspectable with stable reason codes.
+An incomplete persisted or cancelled handoff with no typed delivery marker is
+normalized onto the bounded BUSY retry path; an untyped dispatcher result fails
+closed as unavailable instead of orphaning the durable claim. Transient Slack or
+Discord setup failures before provider acceptance also retry as BUSY, while
+accepted turns alone enter the completion-evidence window.
 Every probe decision is applied to a staged copy and its replacement snapshot is
 fsynced before the live record or timer changes. A failed probe write therefore
 leaves the prior deadline, observation, and actionable-claim state intact in both
@@ -1687,6 +1696,10 @@ completion accounting, missing-evidence retirement, and unwired-controller
 deactivation. Timers are cancelled or re-armed only after the replacement is
 durable, so a failed write leaves both the live record and its existing timer
 unchanged.
+Monitor wake instructions are length-checked again after credential and URL
+redaction, so a replacement marker cannot expand a valid input into an invalid
+persisted record. An active record loaded without a wired controller is retained
+as a terminal blocked outcome instead of an inactive nonterminal state.
 Known actionable GitHub facts (failed checks, requested changes, unresolved
 review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint
@@ -1728,12 +1741,13 @@ redacted `[Monitor wake]` envelope; it is capped at 4,096 characters and is
 never stored as `loop.message`. Check results enter that agent-facing envelope as
 status counts only; provider-controlled check identities remain available to the
 human inspection surface but never become prompt text. Only Task 2's raw
-provider-completion hook clears
-the claim and charges the action-turn/token budgets. Dispatch or stream return is
-not completion evidence. Slack's legacy callback rejects synthetic timeout
-completions before shared monitor accounting, so even a structured record routed
-through that compatibility path cannot be charged from fabricated evidence. A
-raw completion received before a transport timeout
+provider-completion hook clears the claim and its delivery marker, and charges
+the action-turn/token budgets. Dispatch or stream return is
+not completion evidence. Genuine provider `end_turn` is successful completion;
+the ACP compatibility path marks its fabricated `end_turn` terminal with
+`synthetic_completion`, and every surface rejects that provenance together with
+synthetic timeout/error terminals before shared monitor accounting. A raw
+completion received before a transport timeout
 remains authoritative and is charged once even when the enclosing stream later
 times out. A pre-turn delivery failure retires the record as
 target unavailable without charging a turn or immediately retrying the same
@@ -1760,8 +1774,9 @@ retries, restart recovery, duplicate reports, and `UNAVAILABLE` do not increment
 it.
 
 Session close is a retained terminal transition, but history persistence owns
-whether that close commits. Retirement disarms the timer while preserving any
-accepted wake claim, delivery marker, and completion-evidence deadline. If
+whether that close commits. Retirement preserves any accepted wake claim,
+delivery marker, and completion-evidence deadline, and keeps only the bounded
+expiry timer needed to release that claim when raw completion never arrives. If
 retirement persistence fails, its transactional rollback leaves the active
 structured record in place and the generic close rollback never routes it
 through legacy `add()`. If history persistence fails after retirement commits,
@@ -1844,9 +1859,10 @@ a structured id through an owner check and the monitor stop authorizer's
 audit-before-mutation ordering. Browser legacy creation is create-only under the
 same service lock as structured creation, so a stale empty snapshot cannot
 replace an automation armed by another tab. Other legacy callers retain explicit
-replacement semantics, but no legacy create can replace a structured record
-while its wake is in flight, and the generic service update also fails closed for
-structured records.
+replacement semantics, but the agent-facing `monitor_start` and `monitor_watch`
+directives are create-only across both record kinds. They cannot silently replace
+a legacy loop with a structured monitor or discard a structured monitor's durable
+evidence. The generic service update also fails closed for structured records.
 
 ### Security Enforcement
 

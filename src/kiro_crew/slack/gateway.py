@@ -5452,7 +5452,10 @@ class GatewayOrchestrator:
             if wake_message is None:
 
                 def _capture_raw_completion(event: LLMEvent) -> None:
-                    if is_monitor_completion_evidence(event.stop_reason):
+                    if is_monitor_completion_evidence(
+                        event.stop_reason,
+                        synthetic=event.synthetic_completion,
+                    ):
                         _raw_dispositions.append(disposition_for_stop_reason(event.stop_reason))
 
                 response = await asyncio.wait_for(
@@ -5607,12 +5610,9 @@ class GatewayOrchestrator:
                 assert _completion_hook is not None
                 _completion_hook.mark_accepted()
                 return MonitorDispatchResult.DISPATCHED
-            result = (
-                MonitorDispatchResult.DISPATCHED if _turn_started else MonitorDispatchResult.BUSY
-            )
             if wake_message is None:
                 return False
-            return result
+            return MonitorDispatchResult.BUSY
         finally:
             if _acquired:
                 try:
@@ -6194,16 +6194,22 @@ class GatewayOrchestrator:
             """Route one controller-owned envelope without legacy decoration."""
             if loop.slot_key.startswith("slack:"):
                 result = await self._fire_slack_nudge(loop, envelope)
-                assert isinstance(result, MonitorDispatchResult)
+                if not isinstance(result, MonitorDispatchResult):
+                    logger.error("Slack monitor dispatcher returned an untyped result")
+                    return MonitorDispatchResult.UNAVAILABLE
                 return result
             if loop.slot_key.startswith("discord:"):
                 result = await self._fire_discord_nudge(loop, envelope)
-                assert isinstance(result, MonitorDispatchResult)
+                if not isinstance(result, MonitorDispatchResult):
+                    logger.error("Discord monitor dispatcher returned an untyped result")
+                    return MonitorDispatchResult.UNAVAILABLE
                 return result
             if is_channel_key(loop.slot_key):
                 return MonitorDispatchResult.UNAVAILABLE
             result = await self._fire_dashboard_nudge(loop, envelope)
-            assert isinstance(result, MonitorDispatchResult)
+            if not isinstance(result, MonitorDispatchResult):
+                logger.error("Dashboard monitor dispatcher returned an untyped result")
+                return MonitorDispatchResult.UNAVAILABLE
             return result
 
         controller: MonitorController | None = None

@@ -160,6 +160,9 @@ async def test_unwired_structured_monitor_is_not_armed_or_fired_on_start(tmp_pat
     try:
         loop = service._loops["monitor01"]
         assert not loop.active
+        assert loop.monitor is not None
+        assert loop.monitor.outcome is MonitorOutcome.BLOCKED
+        assert loop.monitor.stopped_reason == "session_unavailable"
         assert loop.id not in service._timers
         assert fired == []
     finally:
@@ -216,6 +219,9 @@ async def test_unwired_structured_monitor_timer_dispatches_zero_turns(tmp_path):
 
     assert fired == []
     assert not loop.active
+    assert loop.monitor is not None
+    assert loop.monitor.outcome is MonitorOutcome.BLOCKED
+    assert loop.monitor.stopped_reason == "session_unavailable"
 
 
 @pytest.mark.asyncio

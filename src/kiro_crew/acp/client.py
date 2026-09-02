@@ -5061,6 +5061,7 @@ class AcpClient:
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=STOP_REASON_END_TURN,
+                    synthetic_completion=True,
                     usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return

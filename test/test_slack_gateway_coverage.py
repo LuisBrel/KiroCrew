@@ -654,6 +654,29 @@ class TestFireSlackNudgeGuards:
         persist.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_structured_setup_failure_before_acceptance_retries_as_busy(self, monkeypatch):
+        orch = _slack_nudge_orchestrator()
+        loop = _loop()
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+        service = MagicMock()
+        service.record_monitor_turn_completion = AsyncMock()
+        service.monitor_dispatch_is_authorized = AsyncMock(return_value=True)
+        orch.autonudge_svc = service
+        monkeypatch.setattr(gw, "build_tool_gate", MagicMock(side_effect=RuntimeError("boom")))
+
+        result = await orch._fire_slack_nudge(loop, "[Monitor wake]")
+
+        assert result is monitor_models.MonitorDispatchResult.BUSY
+        service.mark_monitor_turn_accepted.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_structured_turn_applies_monitor_stop_directive(
         self,
         tmp_path,
@@ -794,7 +817,9 @@ class TestFireSlackNudgeGuards:
         order: list[str] = []
 
         async def _stream(*_args, **kwargs):
-            kwargs["on_complete"](SimpleNamespace(stop_reason="max_tokens"))
+            kwargs["on_complete"](
+                SimpleNamespace(stop_reason="max_tokens", synthetic_completion=False)
+            )
             if times_out:
                 await asyncio.Event().wait()
             return "reply body"

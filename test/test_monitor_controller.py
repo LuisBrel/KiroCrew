@@ -55,7 +55,12 @@ class _BlockingProvider:
         return self.result
 
 
-def _result(status: MonitorObservationStatus, fingerprint: str = "fp-1"):
+def _result(
+    status: MonitorObservationStatus,
+    fingerprint: str = "fp-1",
+    *,
+    supplemental_error: ProviderErrorKind | None = None,
+):
     canonical = {
         "kind": "github_pull_request",
         "target": "github.com/acme/widgets#7",
@@ -79,6 +84,7 @@ def _result(status: MonitorObservationStatus, fingerprint: str = "fp-1"):
             "" if error else fingerprint,
             status,
             provider_error=error,
+            supplemental_provider_error=supplemental_error,
             reason_code="provider_transient" if error else "review_ready",
         ),
     )
@@ -294,6 +300,29 @@ async def test_persisted_in_flight_claim_cannot_redispatch_after_restart(tmp_pat
     assert restored.monitor.outcome is None
     assert restored.next_due_ts == restored.monitor.completion_evidence_deadline == 7_380.0
     dispatched.assert_awaited_once()
+    restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_legacy_persisted_claim_without_delivery_keeps_finite_expiry(tmp_path):
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(return_value=MonitorDispatchResult.DISPATCHED),
+    )
+    await controller.tick(loop, now=120.0)
+    service.stop()
+    payload = json.loads(service._path.read_text())
+    payload["loops"][0]["monitor"].pop("wake_delivery")
+    service._path.write_text(json.dumps(payload))
+
+    restarted = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    await restarted.start()
+    restored = restarted.get_by_slot("chat-1")
+
+    assert restored is not None and restored.monitor is not None
+    assert restored.monitor.wake_delivery is MonitorDispatchResult.DISPATCHED
+    assert restored.next_due_ts == restored.monitor.completion_evidence_deadline
     restarted.stop()
 
 
@@ -567,6 +596,52 @@ async def test_probe_persistence_failure_leaves_live_claim_and_timer_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_supplemental_provider_failures_advance_the_bounded_error_streak(tmp_path):
+    """Readable canonical facts do not make an incomplete provider read free to retry."""
+    service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    loop = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(max_runtime_secs=600, max_provider_errors=2),
+        now=100.0,
+    )
+    assert loop.monitor is not None
+    result = _result(
+        MonitorObservationStatus.SUCCESS,
+        supplemental_error=ProviderErrorKind.TRANSIENT,
+    )
+
+    first = await service.apply_monitor_probe(
+        loop.id,
+        result,
+        now=120.0,
+        config_generation=loop.monitor.config_generation,
+    )
+
+    assert first is MonitorDecision.RETRY_PROVIDER
+    assert loop.monitor.provider_error_count == 1
+    assert loop.monitor.consecutive_provider_errors == 1
+    assert loop.monitor.last_provider_error is ProviderErrorKind.TRANSIENT
+    assert loop.monitor.last_observation == result.canonical
+
+    second = await service.apply_monitor_probe(
+        loop.id,
+        result,
+        now=121.0,
+        config_generation=loop.monitor.config_generation,
+    )
+
+    assert second is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.provider_error_count == 2
+    assert loop.monitor.consecutive_provider_errors == 2
+    assert loop.monitor.outcome is MonitorOutcome.BLOCKED
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_probe_publishes_the_durable_staged_state(tmp_path, monkeypatch):
     """Cancellation after snapshot durability cannot leave live state stale."""
     service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
@@ -804,6 +879,58 @@ async def test_cadence_edits_during_dispatch_preserve_evidence_deadline(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_terminal_claim_expiry_clears_only_the_correlation(tmp_path):
+    """An accepted stop remains terminal when its completion evidence expires."""
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(),
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=120.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    await service.record_monitor_dispatched(loop.id, "fp-1", now=121.0)
+    assert loop.monitor is not None
+    evidence_deadline = loop.monitor.completion_evidence_deadline
+    await service.stop_monitor(loop.id, now=122.0)
+
+    decision = await controller.tick(loop, now=evidence_deadline)
+
+    assert decision is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+    assert not loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline == 0.0
+    assert loop.next_due_ts == 0.0
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_session_close_claim_expiry_clears_only_the_correlation(tmp_path):
+    """A session-close stop keeps its accepted claim bounded until expiry."""
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(),
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=120.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    await service.record_monitor_dispatched(loop.id, "fp-1", now=121.0)
+    assert loop.monitor is not None
+    evidence_deadline = loop.monitor.completion_evidence_deadline
+    await service.retire_monitor_for_session_close(loop.id, now=122.0)
+
+    assert loop.next_due_ts == evidence_deadline
+    assert service._timers.get(loop.id) is not None
+    decision = await controller.tick(loop, now=evidence_deadline)
+
+    assert decision is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.outcome is MonitorOutcome.SESSION_CLOSE
+    assert not loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline == 0.0
+    assert loop.next_due_ts == 0.0
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_unavailable_delivery_is_terminal_without_retry(tmp_path):
     """Only a proven unroutable target retires an accepted wake."""
     service, loop, controller = await _armed(
@@ -1011,6 +1138,63 @@ async def test_stop_does_not_rewrite_an_existing_terminal_outcome(tmp_path):
 
     assert loop.monitor is not None
     assert loop.monitor.outcome is MonitorOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_restored_accepted_claim_without_delivery_retries_as_busy(tmp_path):
+    dispatched = AsyncMock(return_value=MonitorDispatchResult.DISPATCHED)
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.PENDING),
+        dispatch=dispatched,
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=105.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    await service.retire_monitor_for_session_close(loop.id, now=110.0)
+
+    await service.restore_monitor_after_failed_session_close(loop.id, now=120.0)
+
+    assert loop.monitor is not None
+    assert loop.monitor.wake_delivery is MonitorDispatchResult.BUSY
+    retry_at = loop.monitor.next_probe_at
+    assert await controller.tick(loop, now=retry_at) is MonitorDecision.WAKE_ACTIONABLE
+    dispatched.assert_awaited_once()
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_untyped_dispatch_result_fails_closed_without_orphaning_claim(tmp_path):
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(return_value=True),
+    )
+
+    decision = await controller.tick(loop, now=120.0)
+
+    assert decision is MonitorDecision.WAKE_ACTIONABLE
+    assert loop.monitor is not None
+    assert loop.monitor.outcome is MonitorOutcome.TARGET_UNAVAILABLE
+    assert not loop.monitor.wake_in_flight
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_restores_busy_retry_before_propagating(tmp_path):
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await controller.tick(loop, now=120.0)
+
+    assert loop.monitor is not None
+    assert loop.monitor.wake_in_flight
+    assert loop.monitor.wake_delivery is MonitorDispatchResult.BUSY
+    assert loop.monitor.next_probe_at > 120.0
+    service.stop()
 
 
 @pytest.mark.asyncio

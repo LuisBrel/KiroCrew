@@ -235,6 +235,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        replace_existing=False,
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record
@@ -290,6 +291,7 @@ async def _monitor_watch(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=monitor.budgets.max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        replace_existing=False,
         monitor=monitor,
     )
     if error is not None:
@@ -578,7 +580,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
             caller="autonudge-stop-compat",
         )
         if error is not None:
-            return f"Failed to stop structured monitor: {error}"
+            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
     elif is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:

@@ -86,6 +86,17 @@ async def authorize_and_update_monitor(
             return False
         return True
 
+    if (
+        isinstance(wake_instructions, str)
+        and len(wake_instructions) > MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS
+    ):
+        error = (
+            "wake_instructions too long after redaction "
+            f"(max {MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} chars)"
+        )
+        await _audit("denied", error)
+        return None, error, 400
+
     if not await _audit("invoked"):
         return None, "audit log unavailable — monitor not updated", 503
     try:
@@ -373,6 +384,12 @@ async def authorize_and_add_nudge(
             )
         monitor_wake_instructions, _ = redact_exfiltration_urls(monitor_wake_instructions)
         monitor_wake_instructions, _ = redact_credentials(monitor_wake_instructions)
+        if len(monitor_wake_instructions) > MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS:
+            return _deny(
+                "wake_instructions too long after redaction "
+                f"(max {MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} chars)",
+                400,
+            )
     if not slot_key or not message:
         return _deny("session_key (or slot_key) and message required", 400)
     try:

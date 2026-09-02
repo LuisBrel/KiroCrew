@@ -268,6 +268,39 @@ async def test_legacy_autonudge_stop_retains_only_structured_records(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_structured_stop_failure_is_audited_as_denied(tmp_path):
+    service = AutoNudgeService(base_dir=tmp_path)
+    await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(),
+    )
+    audit = MagicMock()
+    with (
+        patch("kiro_crew.autonudge.get_instance", return_value=service),
+        patch(
+            "kiro_crew.autonudge_authz.authorize_and_stop_monitor",
+            new=AsyncMock(return_value=(None, "audit unavailable", 503)),
+        ),
+        patch("kiro_crew.dashboard.session_directive_apply._audit", audit),
+    ):
+        result = await apply_session_directive(
+            SimpleNamespace(),
+            SimpleNamespace(key="chat-1", _app=""),
+            "dashboard:chat-1",
+            "autonudge_stop",
+            {"reason": "legacy caller"},
+        )
+
+    assert "Failed to stop structured monitor" in result
+    audit.assert_called_once_with("dashboard:chat-1", "autonudge_stop", "denied")
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_session_close_is_retained_and_failed_close_can_rollback(tmp_path):
     service = AutoNudgeService(base_dir=tmp_path)
     loop = await service.add_monitor(
@@ -305,18 +338,18 @@ async def test_failed_session_close_restores_dispatched_completion_evidence(tmp_
         now=100.0,
     )
     assert loop.monitor is not None
-    loop.monitor.wake_in_flight = True
-    loop.monitor.wake_delivery = MonitorDispatchResult.DISPATCHED
-    loop.monitor.last_wake_fingerprint = "actionable-fingerprint"
-    loop.monitor.completion_evidence_deadline = 150.0
-    loop.next_due_ts = loop.monitor.next_probe_at = 150.0
+    fingerprint = "actionable-fingerprint"
+    assert await service.mark_monitor_action_in_flight(loop.id, fingerprint, now=105.0)
+    service.mark_monitor_turn_accepted(loop.id, fingerprint)
+    await service.record_monitor_dispatched(loop.id, fingerprint, now=110.0)
+    deadline = loop.monitor.completion_evidence_deadline
 
     await service.retire_monitor_for_session_close(loop.id, now=120.0)
 
     assert loop.monitor.wake_in_flight is True
     assert loop.monitor.wake_delivery is MonitorDispatchResult.DISPATCHED
-    assert loop.monitor.completion_evidence_deadline == 150.0
-    assert loop.next_due_ts == loop.monitor.next_probe_at == 0.0
+    assert loop.monitor.completion_evidence_deadline == deadline
+    assert loop.next_due_ts == loop.monitor.next_probe_at == deadline
 
     await service.restore_monitor_after_failed_session_close(loop.id, now=125.0)
 
@@ -324,7 +357,7 @@ async def test_failed_session_close_restores_dispatched_completion_evidence(tmp_
     assert loop.monitor.outcome is None
     assert loop.monitor.wake_in_flight is True
     assert loop.monitor.wake_delivery is MonitorDispatchResult.DISPATCHED
-    assert loop.next_due_ts == loop.monitor.next_probe_at == 150.0
+    assert loop.next_due_ts == loop.monitor.next_probe_at == deadline
     service.stop()
 
 
@@ -343,6 +376,63 @@ async def test_structured_fields_cannot_silently_patch_a_legacy_loop(tmp_path):
 
     assert result.startswith("monitor_update cannot apply")
     assert "structured fields" in result
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_monitor_watch_does_not_replace_a_legacy_loop(tmp_path):
+    service = AutoNudgeService(base_dir=tmp_path)
+    legacy = await service.add("chat-1", "legacy prompt", idle_secs=60)
+    slot = SimpleNamespace(key="chat-1", workspace="default", _app="")
+    state = SimpleNamespace(_slots={"chat-1": slot}, sessions=None, channel_transports={})
+    with patch("kiro_crew.autonudge.get_instance", return_value=service):
+        result = await apply_session_directive(
+            state,
+            slot,
+            "dashboard:chat-1",
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+                "cadence_secs": 300,
+                "max_runtime_secs": 14_400,
+                "max_agent_turns": 8,
+                "max_tokens": 250_000,
+                "max_provider_errors": 3,
+                "wake_instructions": "Inspect the blocker.",
+            },
+        )
+
+    assert result.startswith("Failed to start structured monitor")
+    assert service.get_by_slot("chat-1") is legacy
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_monitor_start_does_not_replace_a_structured_monitor(tmp_path):
+    service = AutoNudgeService(base_dir=tmp_path)
+    structured = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(),
+    )
+    slot = SimpleNamespace(key="chat-1", workspace="default", _app="")
+    state = SimpleNamespace(_slots={"chat-1": slot}, sessions=None, channel_transports={})
+    with patch("kiro_crew.autonudge.get_instance", return_value=service):
+        result = await apply_session_directive(
+            state,
+            slot,
+            "dashboard:chat-1",
+            "monitor_start",
+            {"message": "legacy prompt", "idle_secs": 60},
+        )
+
+    assert result.startswith("Failed to start monitor loop")
+    assert service.get_by_slot("chat-1") is structured
     service.stop()
 
 

@@ -634,7 +634,7 @@ class DiscordDispatcher:
             if _acquired:
                 self.sessions.release(session_key)
                 logger.exception("Discord monitor pre-turn setup failed")
-                return MonitorDispatchResult.UNAVAILABLE
+                return MonitorDispatchResult.BUSY
             raise
         attachment_temp_paths: list[str] = []
 
@@ -889,8 +889,12 @@ class DiscordDispatcher:
                 return MonitorDispatchResult.BUSY
         except Exception:
             logger.exception("Discord transport_dispatch: error handling message")
-            if monitor_completion is not None and monitor_completion.accepted:
-                monitor_result = MonitorDispatchResult.DISPATCHED
+            if monitor_completion is not None:
+                monitor_result = (
+                    MonitorDispatchResult.DISPATCHED
+                    if monitor_completion.accepted
+                    else MonitorDispatchResult.BUSY
+                )
             if _acquired:
                 await self.sessions.record_failure(session_key)
         finally:
