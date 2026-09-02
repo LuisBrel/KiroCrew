@@ -38,7 +38,7 @@ class AzureDevOpsPullRequestProvider:
     """Read Azure DevOps Services through a preinstalled Azure CLI extension."""
 
     def __init__(self, *, fetch: AzureFetch | None = None) -> None:
-        self._fetch = fetch or self._fetch_with_az
+        self._fetch = fetch
 
     def probe(
         self,
@@ -48,16 +48,37 @@ class AzureDevOpsPullRequestProvider:
     ) -> PullRequestProbeResult:
         try:
             target = parse_azure_devops_pull_request_target(raw_target)
-            pull_request = _object(self._fetch(target, "pull_request"))
+            credentials = (
+                None
+                if self._fetch is not None
+                else KiroCrewConfig.load().load_credentials(propagate=False)
+            )
+
+            def fetch(resource: str) -> object:
+                if self._fetch is not None:
+                    return self._fetch(target, resource)
+                return self._fetch_with_az(target, resource, credentials or {})
+
+            pull_request = _object(fetch("pull_request"))
             if str(pull_request.get("status", "")).lower() in _TERMINAL_STATUSES:
                 statuses: list[object] = []
                 threads: list[object] = []
                 policies: list[object] = []
+                statuses_complete = threads_complete = policies_complete = True
             else:
-                statuses = _values(self._fetch(target, "statuses"))
-                threads = _values(self._fetch(target, "threads"))
-                policies = _values(self._fetch(target, "policies"))
-            facts = _facts(target, pull_request, statuses, threads, policies)
+                statuses, statuses_complete = _values(fetch("statuses"))
+                threads, threads_complete = _values(fetch("threads"))
+                policies, policies_complete = _values(fetch("policies"))
+            facts = _facts(
+                target,
+                pull_request,
+                statuses,
+                threads,
+                policies,
+                statuses_complete=statuses_complete,
+                threads_complete=threads_complete,
+                policies_complete=policies_complete,
+            )
         except PullRequestProviderError as exc:
             return provider_failure_result(exc)
         except PermissionError:
@@ -82,8 +103,11 @@ class AzureDevOpsPullRequestProvider:
         )
 
     @staticmethod
-    def _fetch_with_az(target: AzureDevOpsPullRequestTarget, resource: str) -> object:
-        credentials = KiroCrewConfig.load().load_credentials()
+    def _fetch_with_az(
+        target: AzureDevOpsPullRequestTarget,
+        resource: str,
+        credentials: Mapping[str, str],
+    ) -> object:
         organization_url = f"https://dev.azure.com/{target.organization}"
         common = [
             "--organization",
@@ -98,8 +122,6 @@ class AzureDevOpsPullRequestProvider:
                 "show",
                 "--id",
                 str(target.pull_request_id),
-                "--project",
-                target.project,
                 *common,
             ]
         elif resource == "policies":
@@ -110,8 +132,6 @@ class AzureDevOpsPullRequestProvider:
                 "list",
                 "--id",
                 str(target.pull_request_id),
-                "--project",
-                target.project,
                 *common,
             ]
         else:
@@ -157,6 +177,10 @@ def _facts(
     statuses: list[object],
     threads: list[object],
     policies: list[object],
+    *,
+    statuses_complete: bool,
+    threads_complete: bool,
+    policies_complete: bool,
 ) -> PullRequestFacts:
     repository = _object(pr["repository"])
     project = _object(repository["project"])
@@ -187,8 +211,6 @@ def _facts(
         raw_identity = item.get("id") or context_name or index
         identity = opaque_provider_check_identity("status", raw_identity)
         checks.append(PullRequestCheck(identity, _status_state(item.get("state"))))
-    if len(statuses) >= 100:
-        checks.append(PullRequestCheck("statuses:incomplete", "unknown"))
     for index, raw in enumerate(policies[:100]):
         item = _object(raw)
         configuration = item.get("configuration")
@@ -197,8 +219,6 @@ def _facts(
             policy_raw_identity = configuration.get("id") or index
         identity = opaque_provider_check_identity("policy", policy_raw_identity)
         checks.append(PullRequestCheck(identity, _status_state(item.get("status"))))
-    if len(policies) >= 100:
-        checks.append(PullRequestCheck("policies:incomplete", "unknown"))
     reviewers = pr.get("reviewers", [])
     if not isinstance(reviewers, list):
         raise ValueError("Azure DevOps reviewers are malformed")
@@ -232,7 +252,8 @@ def _facts(
         review_decision=review_decision,
         checks=tuple(checks),
         unresolved_review_threads=unresolved,
-        review_threads_complete=len(threads) < 100,
+        review_threads_complete=threads_complete,
+        checks_complete=statuses_complete and policies_complete,
     )
 
 
@@ -253,10 +274,12 @@ def _object(value: object) -> Mapping[str, Any]:
     return value
 
 
-def _values(value: object) -> list[object]:
+def _values(value: object) -> tuple[list[object], bool]:
     if isinstance(value, list):
-        return value
-    raw = _object(value).get("value")
+        return value, True
+    payload = _object(value)
+    raw = payload.get("value")
     if not isinstance(raw, list):
         raise ValueError("provider response values must be a list")
-    return raw
+    continuation = payload.get("continuationToken", payload.get("continuation_token"))
+    return raw, not bool(continuation)

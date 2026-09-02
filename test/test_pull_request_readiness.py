@@ -209,7 +209,7 @@ def test_common_facts_reject_unknown_provider_and_unbounded_check_states() -> No
         _facts(checks=(PullRequestCheck("build", "provider-native-running"),))
 
 
-def test_check_identity_and_bucket_overflow_are_bounded_and_fail_closed() -> None:
+def test_check_bucket_overflow_is_bounded_without_changing_provider_completeness() -> None:
     long_check = PullRequestCheck("x" * 500, "passed")
     checks = tuple(PullRequestCheck(f"check-{index:03d}", "passed") for index in range(101))
 
@@ -218,16 +218,17 @@ def test_check_identity_and_bucket_overflow_are_bounded_and_fail_closed() -> Non
     assert len(long_check.identity) <= 200
     assert len(result.canonical["checks"]["passed"]) == 100
     assert result.canonical["checks"]["unknown"] == ["checks:incomplete"]
-    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert result.observation.reason_code == "review_ready"
 
 
-def test_duplicate_check_rows_cannot_bypass_bucket_overflow() -> None:
+def test_duplicate_check_rows_remain_a_complete_provider_result() -> None:
     checks = tuple(PullRequestCheck("CI / test", "passed") for _ in range(101))
 
     result = build_pull_request_probe_result(_facts(checks=checks))
 
-    assert result.observation.status is MonitorObservationStatus.PENDING
-    assert result.observation.reason_code == "checks_incomplete"
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert result.observation.reason_code == "review_ready"
 
 
 def test_check_identity_replaces_instruction_forging_control_characters() -> None:

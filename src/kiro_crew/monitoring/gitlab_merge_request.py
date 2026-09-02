@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -23,7 +24,11 @@ from kiro_crew.monitoring.pull_request import (
     provider_error_result,
     provider_failure_result,
 )
-from kiro_crew.monitoring.targets import GitLabMergeRequestTarget, parse_gitlab_merge_request_target
+from kiro_crew.monitoring.targets import (
+    GitLabHostNotAllowed,
+    GitLabMergeRequestTarget,
+    parse_gitlab_merge_request_target,
+)
 
 _TIMEOUT_SECS = 30.0
 _MAX_OUTPUT_BYTES = 1024 * 1024
@@ -32,6 +37,12 @@ _MAX_PROVIDER_ITEMS = _PAGE_SIZE * 2
 _TERMINAL_STATES = {"merged", "closed"}
 
 GitLabFetch = Callable[[GitLabMergeRequestTarget, str, str], object]
+
+
+@dataclass(frozen=True)
+class _Collection:
+    items: list[object]
+    complete: bool
 
 
 class GitLabMergeRequestProvider:
@@ -44,7 +55,7 @@ class GitLabMergeRequestProvider:
         fetch: GitLabFetch | None = None,
     ) -> None:
         self._configured_hosts = tuple(gitlab_hosts) if gitlab_hosts is not None else None
-        self._fetch = fetch or self._fetch_with_glab
+        self._fetch = fetch
 
     def probe(
         self,
@@ -57,21 +68,43 @@ class GitLabMergeRequestProvider:
                 raw_target,
                 gitlab_hosts=self._gitlab_hosts(),
             )
-            mr = _object(self._fetch(target, "merge_request", ""))
-            head_revision = str(mr.get("sha", ""))
+
+            def fetch(resource: str, head_revision: str = "") -> object:
+                if self._fetch is not None:
+                    return self._fetch(target, resource, head_revision)
+                return self._fetch_with_glab(target, resource, head_revision)
+
+            mr = _object(fetch("merge_request"))
+            head_revision = str(mr.get("sha") or "")
             if str(mr.get("state", "")).lower() in _TERMINAL_STATES:
                 pipelines: list[object] = []
                 discussions: list[object] = []
+                discussions_complete = True
             else:
-                pipelines = _list(self._fetch(target, "pipelines", head_revision))
-                discussions = _list(self._fetch(target, "discussions", ""))
-            facts = _facts(target, mr, pipelines, discussions)
+                if self._fetch is None:
+                    head_pipeline = mr.get("head_pipeline")
+                    pipelines = [] if head_pipeline is None else [_object(head_pipeline)]
+                else:
+                    pipelines = _list(fetch("pipelines", head_revision))
+                discussions, discussions_complete = _collection(fetch("discussions"))
+            facts = _facts(
+                target,
+                mr,
+                pipelines,
+                discussions,
+                discussions_complete=discussions_complete,
+            )
         except PullRequestProviderError as exc:
             return provider_failure_result(exc)
         except PermissionError:
             return provider_error_result(
                 ProviderErrorKind.AUTHENTICATION,
                 "provider_authentication",
+            )
+        except GitLabHostNotAllowed:
+            return provider_error_result(
+                ProviderErrorKind.AUTHORIZATION,
+                "provider_authorization",
             )
         except SetupError:
             return provider_error_result(ProviderErrorKind.SETUP, "provider_setup")
@@ -106,15 +139,7 @@ class GitLabMergeRequestProvider:
         root = f"projects/{project}/merge_requests/{target.iid}"
         if resource == "merge_request":
             return GitLabMergeRequestProvider._get_glab_page(target, root)
-        if resource == "pipelines":
-            if not head_revision:
-                raise ValueError("GitLab response omitted the head revision")
-            collection = (
-                f"projects/{project}/pipelines?sha={quote(head_revision, safe='')}"
-                "&order_by=id&sort=desc&per_page=1&page=1"
-            )
-            return _list(GitLabMergeRequestProvider._get_glab_page(target, collection))
-        elif resource == "discussions":
+        if resource == "discussions":
             collection = f"{root}/discussions"
         else:
             raise ValueError("unsupported GitLab monitor resource")
@@ -129,7 +154,7 @@ class GitLabMergeRequestProvider:
             )
         )
         if len(first) < _PAGE_SIZE:
-            return first
+            return _Collection(first, True)
         second = _list(
             GitLabMergeRequestProvider._get_glab_page(
                 target,
@@ -140,7 +165,15 @@ class GitLabMergeRequestProvider:
                 ),
             )
         )
-        return [*first, *second]
+        if len(second) < _PAGE_SIZE:
+            return _Collection([*first, *second], True)
+        third = _list(
+            GitLabMergeRequestProvider._get_glab_page(
+                target,
+                f"{collection}?per_page={_PAGE_SIZE}&page=3",
+            )
+        )
+        return _Collection([*first, *second], not third)
 
     @staticmethod
     def _get_glab_page(target: GitLabMergeRequestTarget, endpoint: str) -> object:
@@ -166,6 +199,8 @@ def _facts(
     mr: Mapping[str, Any],
     pipelines: list[object],
     discussions: list[object],
+    *,
+    discussions_complete: bool = True,
 ) -> PullRequestFacts:
     raw_state = str(mr["state"]).lower()
     state = {"opened": "open", "merged": "merged", "closed": "closed"}.get(
@@ -184,11 +219,13 @@ def _facts(
     else:
         mergeability = "pending"
     checks: list[PullRequestCheck] = []
+    current_head_pipeline = False
     for item in pipelines[:_MAX_PROVIDER_ITEMS]:
         pipeline = _object(item)
         pipeline_sha = pipeline.get("sha")
         if isinstance(pipeline_sha, str) and pipeline_sha and pipeline_sha != mr.get("sha"):
             continue
+        current_head_pipeline = True
         status = str(pipeline.get("status", "")).lower()
         if status in {"failed", "canceled"}:
             normalized = "failed"
@@ -205,12 +242,16 @@ def _facts(
             normalized = "pending"
         else:
             normalized = "unknown"
-        identity = opaque_provider_check_identity(
-            "pipeline",
-            pipeline.get("id", "unknown"),
-        )
+        identity = opaque_provider_check_identity("pipeline", "current_head")
         checks.append(PullRequestCheck(identity, normalized))
         break
+    if not current_head_pipeline:
+        checks.append(
+            PullRequestCheck(
+                opaque_provider_check_identity("pipeline", "current_head"),
+                "unknown",
+            )
+        )
     approved_by = mr.get("approved_by")
     if merge_status == "requested_changes":
         review_decision = "changes_requested"
@@ -221,25 +262,27 @@ def _facts(
     else:
         review_decision = "none"
     unresolved = 0
-    complete = len(discussions) < _MAX_PROVIDER_ITEMS
     for discussion_raw in discussions[:_MAX_PROVIDER_ITEMS]:
         discussion = _object(discussion_raw)
         notes = _list(discussion.get("notes", []))
-        for note_raw in notes:
-            note = _object(note_raw)
-            if note.get("resolvable") is True and note.get("resolved") is not True:
-                unresolved += 1
+        if any(
+            _object(note_raw).get("resolvable") is True
+            and _object(note_raw).get("resolved") is not True
+            for note_raw in notes
+        ):
+            unresolved += 1
     return PullRequestFacts(
         kind="gitlab_merge_request",
         target=target.identity,
         state=state,
         draft=bool(mr.get("draft", mr.get("work_in_progress", False))),
-        head_revision=str(mr.get("sha", "")),
+        head_revision=str(mr.get("sha") or ""),
         mergeability=mergeability,
         review_decision=review_decision,
         checks=tuple(checks),
         unresolved_review_threads=unresolved,
-        review_threads_complete=complete,
+        review_threads_complete=discussions_complete,
+        checks_complete=current_head_pipeline,
     )
 
 
@@ -253,3 +296,9 @@ def _list(value: object) -> list[object]:
     if not isinstance(value, list):
         raise ValueError("provider response must be a list")
     return value
+
+
+def _collection(value: object) -> tuple[list[object], bool]:
+    if isinstance(value, _Collection):
+        return value.items, value.complete
+    return _list(value), True

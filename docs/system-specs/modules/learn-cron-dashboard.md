@@ -1687,18 +1687,24 @@ provider probe runs off the event loop behind one shared four-probe concurrency
 gate. Missing, unsupported, or untrusted provider CLI resolution is SEL-audited
 as denied before its setup error propagates; a resolved CLI must record its
 critical invocation event before spawn. Provider CLI resource limits are
-installed by the synchronous spawn shim after exec, so a threaded gateway never
-runs Python in a fork child. On Windows the provider child is created suspended,
+installed by the synchronous spawn shim after exec. Azure CLI configuration and
+extension visibility stays beneath the operator home or data home and outside the
+agent-writable project and workspace trees, so an agent-modified extension cannot
+run with the provider credential. A threaded gateway never runs Python in a fork
+child. On Windows the provider child is created suspended,
 assigned to the shared Job-object resource ceiling after parentage is confirmed,
 then resumed; a live owned child that cannot resume is killed and the probe fails
-loudly. GitLab
-merge requests, Azure pull requests, and Bitbucket pull requests skip
+loudly. GitLab merge requests, Azure pull requests, and Bitbucket pull requests skip
 supplemental check and review reads after the primary response reports a terminal
 state, so reduced endpoint permissions cannot hide a merged or closed outcome. GitLab
-pipeline reads request only the newest result for the merge request's current
-head revision, so a successful retry supersedes older failed runs. Discussion
-reads consume at most two 100-item pages, and a still-full second page remains
-explicitly incomplete. GitLab mergeability uses `detailed_merge_status` when present.
+uses the merge request's own `head_pipeline`, which selects the detached or fork
+pipeline GitLab associates with that merge request instead of guessing from same-SHA
+project history. A missing or mismatched head pipeline is incomplete check evidence,
+never review-ready. Discussion reads retain at most two 100-item pages and perform one
+bounded third-page sentinel read, so exactly 200 discussions are complete while a
+real overflow remains incomplete. Unresolved GitLab evidence is counted once per
+discussion, not once per reply note. GitLab mergeability uses
+`detailed_merge_status` when present.
 The legacy `merge_status` can still prove a conflict on older self-managed instances,
 but `can_be_merged` remains pending because that field does not include approval gates;
 only the modern detailed `mergeable` value proves review readiness.
@@ -1708,8 +1714,9 @@ with no vote do not create a review requirement, while an explicit negative vote
 remains actionable. Azure target normalization accepts provider-legal Unicode and
 punctuation in project and repository names, rejects Azure's forbidden name
 characters, and emits one percent-encoded canonical URL. An absent or explicit-null
-Azure source commit remains a pending unknown revision while merge computation is
-queued; it is not a malformed provider response. Bitbucket review readiness considers
+Azure source commit, GitLab head revision, or Bitbucket source commit remains a
+pending unknown revision while the provider settles; it is not a malformed provider
+response. Bitbucket review readiness considers
 only participants whose
 role is `REVIEWER`; authors and other participants cannot create a phantom review
 requirement. Async dashboard and MCP mutation paths await the shared, asynchronously
@@ -1750,6 +1757,9 @@ completion accounting, missing-evidence retirement, and unwired-controller
 deactivation. Timers are cancelled or re-armed only after the replacement is
 durable, so a failed write leaves both the live record and its existing timer
 unchanged.
+The slot-close admission fence is released in the outer close wrapper whenever
+cancellation or another abort leaves that slot generation live, so a disconnected
+close request cannot permanently make a visible slot unarmable.
 Monitor wake instructions are length-checked again after credential and URL
 redaction, so a replacement marker cannot expand a valid input into an invalid
 persisted record. An active record loaded without a wired controller is retained

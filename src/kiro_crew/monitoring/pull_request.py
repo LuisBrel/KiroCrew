@@ -60,7 +60,15 @@ def classify_provider_error_text(raw: str) -> ProviderErrorKind:
         return ProviderErrorKind.RATE_LIMITED
     if any(
         marker in lowered
-        for marker in ("http 401", "unauthorized", "not logged in", "authentication")
+        for marker in (
+            "http 401",
+            "unauthorized",
+            "not logged in",
+            "authentication",
+            "invalid token",
+            "expired token",
+            "revoked token",
+        )
     ):
         return ProviderErrorKind.AUTHENTICATION
     if any(marker in lowered for marker in ("http 404", "not found", "does not exist")):
@@ -314,11 +322,7 @@ def classify_pull_request_facts(
         return MonitorObservationStatus.ACTIONABLE, "merge_conflict"
     if facts.mergeability == "behind":
         return MonitorObservationStatus.ACTIONABLE, "branch_behind"
-    if not facts.checks_complete or any(
-        sum(check.state == state for check in facts.checks)
-        > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
-        for state in PULL_REQUEST_CHECK_STATES
-    ):
+    if not facts.checks_complete:
         return MonitorObservationStatus.PENDING, "checks_incomplete"
     if "pending" in check_states:
         return MonitorObservationStatus.PENDING, "checks_pending"

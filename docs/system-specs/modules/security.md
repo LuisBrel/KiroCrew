@@ -1254,7 +1254,12 @@ path when one exists, and routes the validated argv through
 general environment scrub runs first; the transport then restores only credentials
 explicitly scoped to that provider invocation. It drains stdout/stderr concurrently
 into fixed byte ceilings. Crossing a ceiling terminates and reaps the sandboxed
-process tree instead of buffering or orphaning the remainder. GitLab's
+process tree instead of buffering or orphaning the remainder. Process exit and both
+pipe joins retain independent finite deadlines, including after a timeout or a
+descendant that inherited a pipe. Each probe loads one credential snapshot with
+environment propagation disabled and threads that mapping through its supplemental
+reads; a read-only monitor therefore cannot widen the gateway's ambient environment
+or race another `os.environ.copy()`. GitLab's
 ambient-token decision is the same shared
 host-policy predicate used by the dashboard source panel, so self-managed hosts
 cannot drift onto the gitlab.com-token path. The transport also enforces fixed
@@ -1280,15 +1285,22 @@ Every provider head revision is either absent or bounded hexadecimal text before
 canonicalization, persistence, or prompt construction. Azure target parsing
 accepts canonical `%20` escapes in project and repository segments while keeping
 path separators, queries, fragments, and noncanonical encodings denied. The
-fixed-argv Azure provider process explicitly receives and exposes only its
-resolved `AZURE_CONFIG_DIR` (defaulting to the gateway user's `~/.azure`) through
+fixed-argv Azure provider process explicitly receives and exposes only its resolved
+`AZURE_CONFIG_DIR` and `AZURE_EXTENSION_DIR` (defaulting beneath the gateway user's
+`~/.azure`) through
 the otherwise-standard sandbox, so the documented `az login` credential store
-works without making that directory visible to agent subprocesses.
-Pods override `GLAB_CONFIG_DIR` and `AZURE_CONFIG_DIR` with roots beneath the
+works without making those directories visible to agent subprocesses. Both paths
+must resolve beneath `HOME` or `KIROCREW_HOME`; relative, escaping, and symlinked-out
+overrides fail before the sandbox receives a visibility exception. The minimal
+network environment includes HTTP(S), SOCKS/`ALL_PROXY`, and the standard requests,
+curl, and SSL certificate-bundle variables needed by provider CLIs behind corporate
+proxies, without forwarding unrelated gateway credentials.
+Pods override `GH_CONFIG_DIR`, `GLAB_CONFIG_DIR`, `AZURE_CONFIG_DIR`, and
+`AZURE_EXTENSION_DIR` with roots beneath the
 ephemeral pod home before any provider command runs. This keeps the live
 gateway's provider logins available to its own monitor probes while preventing a
-pod from inheriting the operator's persisted GitLab or Azure CLI identity through
-the intentionally shared process `HOME`; `pod down` reclaims both stores.
+pod from inheriting the operator's persisted GitHub, GitLab, or Azure CLI identity through
+the intentionally shared process `HOME`; `pod down` reclaims all of those stores.
 
 Azure status and policy display labels and Bitbucket build-status labels are
 provider-controlled text. The adapters replace them with stable, namespaced SHA-256

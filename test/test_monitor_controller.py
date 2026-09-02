@@ -1008,7 +1008,7 @@ async def test_busy_budget_stop_clears_late_acceptance_before_terminating(tmp_pa
     controller = MonitorController(
         service,
         AsyncMock(),
-        provider=_Provider(_result(MonitorObservationStatus.PENDING)),
+        providers={"github_pull_request": _Provider(_result(MonitorObservationStatus.PENDING))},
     )
 
     assert await controller.tick(loop, now=124.0) is MonitorDecision.NO_CHANGE

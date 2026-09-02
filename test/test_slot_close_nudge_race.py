@@ -148,10 +148,38 @@ async def test_loop_is_retired_before_the_persist_begins(tmp_path, monkeypatch) 
     resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
 
     assert resp.status == 200
-    assert order == ["loop:removed", "persist", "session_teardown"], (
-        "the loop must be gone before the closure is persisted, not after"
-    )
+    assert order == [
+        "loop:removed",
+        "persist",
+        "session_teardown",
+    ], "the loop must be gone before the closure is persisted, not after"
     svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_releases_the_live_slot_admission_fence(
+    tmp_path, monkeypatch
+) -> None:
+    state = _state_with_slot(tmp_path)
+    slot = state._slots[NAME]
+    entered = asyncio.Event()
+    parked = asyncio.Event()
+
+    async def _retire(_slot_key: str):
+        entered.set()
+        await parked.wait()
+
+    monkeypatch.setattr(handlers, "_retire_slot_nudge_loop", _retire)
+    close = asyncio.create_task(handlers.close_slot(state, slot, NAME))
+    await entered.wait()
+    assert slot._closing is True
+
+    close.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+
+    assert state.get_slot(NAME) is slot
+    assert slot._closing is False
 
 
 @pytest.mark.asyncio
@@ -170,9 +198,9 @@ async def test_close_with_no_armed_loop_is_unaffected(tmp_path, monkeypatch) -> 
     saved = state.conversation_log.read_messages(f"dashboard:{NAME}")
     assert [m["role"] for m in saved] == ["user", "assistant"]
     survivor = svc.get_by_slot("chat-2-9999")
-    assert survivor is not None and survivor.id == other.id, (
-        "closing one tab retired another tab's loop"
-    )
+    assert (
+        survivor is not None and survivor.id == other.id
+    ), "closing one tab retired another tab's loop"
     svc.stop()
 
 
@@ -194,9 +222,7 @@ async def test_failed_persist_gives_the_session_its_clock_back(tmp_path, monkeyp
     """A close that cannot persist must not silently retire the babysit loop."""
     state = _state_with_slot(tmp_path)
     svc = await _service(tmp_path, monkeypatch)
-    loop = await svc.add(
-        NAME, "check the PR", idle_secs=300, max_cycles=24, max_runtime_secs=3600
-    )
+    loop = await svc.add(NAME, "check the PR", idle_secs=300, max_cycles=24, max_runtime_secs=3600)
     loop.cycle_count = 3
     loop.created_ts = time.time() - 600
 
@@ -445,9 +471,7 @@ async def test_app_close_waits_for_a_queued_direct_arm(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_app_close_retires_the_latest_queued_arm_generation(
-    tmp_path, monkeypatch
-) -> None:
+async def test_app_close_retires_the_latest_queued_arm_generation(tmp_path, monkeypatch) -> None:
     state = _state_with_slot(tmp_path)
     state._slots[NAME]._app = "issue-radar"
     svc = await _service(tmp_path, monkeypatch)
@@ -514,9 +538,7 @@ async def test_issue_radar_arm_queued_behind_final_retirement_is_refused(
         return True
 
     monkeypatch.setattr("kiro_crew.apps.teardown.notify_slot_closed", _hook)
-    monkeypatch.setattr(
-        crew_runtime, "ensure_crew_session", AsyncMock(return_value=slot)
-    )
+    monkeypatch.setattr(crew_runtime, "ensure_crew_session", AsyncMock(return_value=slot))
     monkeypatch.setattr(
         crew_runtime,
         "compose_turn_prompt_async",

@@ -22,6 +22,13 @@ from kiro_crew.monitoring.provider_cli import provider_cli_env, run_provider_cli
 from kiro_crew.monitoring.pull_request import opaque_provider_check_identity
 
 
+@pytest.fixture(autouse=True)
+def _isolate_azure_cli_config_dirs(monkeypatch):
+    """Provider tests must not inherit Azure CLI paths from the CI host."""
+    monkeypatch.delenv("AZURE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("AZURE_EXTENSION_DIR", raising=False)
+
+
 def test_gitlab_failed_pipeline_beats_pending_mergeability():
     payloads = {
         "merge_request": {
@@ -44,7 +51,9 @@ def test_gitlab_failed_pipeline_beats_pending_mergeability():
     assert result.observation.status is MonitorObservationStatus.ACTIONABLE
     assert result.observation.reason_code == "checks_failed"
     assert result.canonical["kind"] == "gitlab_merge_request"
-    assert result.canonical["checks"]["failed"] == [opaque_provider_check_identity("pipeline", 2)]
+    assert result.canonical["checks"]["failed"] == [
+        opaque_provider_check_identity("pipeline", "current_head")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -54,7 +63,7 @@ def test_gitlab_failed_pipeline_beats_pending_mergeability():
             "can_be_merged",
             "pending",
             MonitorObservationStatus.PENDING,
-            "mergeability_pending",
+            "checks_incomplete",
         ),
         (
             "cannot_be_merged",
@@ -112,7 +121,7 @@ def test_gitlab_pipeline_identity_is_opaque_before_reaching_agent_context():
     result = provider.probe("https://gitlab.com/acme/widgets/-/merge_requests/8")
 
     assert result.canonical["checks"]["failed"] == [
-        opaque_provider_check_identity("pipeline", raw_identity)
+        opaque_provider_check_identity("pipeline", "current_head")
     ]
     assert raw_identity not in json.dumps(result.canonical)
 
@@ -161,7 +170,9 @@ def test_gitlab_uses_only_the_latest_pipeline_from_superseded_history():
     result = provider.probe("https://gitlab.com/acme/widgets/-/merge_requests/8")
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
-    assert result.canonical["checks"]["passed"] == [opaque_provider_check_identity("pipeline", 0)]
+    assert result.canonical["checks"]["passed"] == [
+        opaque_provider_check_identity("pipeline", "current_head")
+    ]
     assert result.canonical["checks"]["unknown"] == []
 
 
@@ -189,7 +200,36 @@ def test_gitlab_ignores_failed_pipelines_from_an_older_head_revision():
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
     assert result.canonical["checks"]["failed"] == []
-    assert result.canonical["checks"]["passed"] == [opaque_provider_check_identity("pipeline", 2)]
+    assert result.canonical["checks"]["passed"] == [
+        opaque_provider_check_identity("pipeline", "current_head")
+    ]
+
+
+@pytest.mark.parametrize(
+    "pipelines",
+    [[], [{"id": 1, "sha": "0dd", "status": "success"}]],
+)
+def test_gitlab_requires_a_pipeline_for_the_current_head(pipelines):
+    payloads = {
+        "merge_request": {
+            "state": "opened",
+            "draft": False,
+            "sha": "c0ffee",
+            "detailed_merge_status": "mergeable",
+        },
+        "pipelines": pipelines,
+        "discussions": [],
+    }
+    provider = GitLabMergeRequestProvider(
+        gitlab_hosts=[],
+        fetch=lambda _target, resource, _head_revision: payloads[resource],
+    )
+
+    result = provider.probe("https://gitlab.com/acme/widgets/-/merge_requests/8")
+
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "checks_incomplete"
+    assert result.canonical["checks_complete"] is False
 
 
 def test_gitlab_uses_only_the_latest_pipeline_after_a_same_head_retry():
@@ -216,7 +256,9 @@ def test_gitlab_uses_only_the_latest_pipeline_after_a_same_head_retry():
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
     assert result.canonical["checks"]["failed"] == []
-    assert result.canonical["checks"]["passed"] == [opaque_provider_check_identity("pipeline", 3)]
+    assert result.canonical["checks"]["passed"] == [
+        opaque_provider_check_identity("pipeline", "current_head")
+    ]
 
 
 def test_gitlab_unmet_approval_and_skipped_pipeline_stay_zero_turn_pending():
@@ -239,7 +281,9 @@ def test_gitlab_unmet_approval_and_skipped_pipeline_stay_zero_turn_pending():
 
     assert result.observation.status is MonitorObservationStatus.PENDING
     assert result.observation.reason_code == "review_required"
-    assert result.canonical["checks"]["passed"] == [opaque_provider_check_identity("pipeline", 2)]
+    assert result.canonical["checks"]["passed"] == [
+        opaque_provider_check_identity("pipeline", "current_head")
+    ]
 
 
 def test_gitlab_requested_changes_are_actionable():
@@ -263,6 +307,65 @@ def test_gitlab_requested_changes_are_actionable():
     assert result.observation.status is MonitorObservationStatus.ACTIONABLE
     assert result.observation.reason_code == "changes_requested"
     assert result.canonical["review_decision"] == "changes_requested"
+
+
+def test_gitlab_missing_head_revision_stays_pending():
+    payloads = {
+        "merge_request": {
+            "state": "opened",
+            "draft": False,
+            "sha": None,
+            "detailed_merge_status": "preparing",
+        },
+        "pipelines": [],
+        "discussions": [],
+    }
+    provider = GitLabMergeRequestProvider(
+        gitlab_hosts=[],
+        fetch=lambda _target, resource, _head_revision: payloads[resource],
+    )
+
+    result = provider.probe("https://gitlab.com/acme/widgets/-/merge_requests/8")
+
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "pull_request_state_unknown"
+    assert result.canonical["head_revision"] == ""
+
+
+def test_gitlab_counts_unresolved_discussions_instead_of_notes():
+    payloads = {
+        "merge_request": {
+            "state": "opened",
+            "draft": False,
+            "sha": "c0ffee",
+            "detailed_merge_status": "mergeable",
+        },
+        "pipelines": [{"id": 2, "sha": "c0ffee", "status": "success"}],
+        "discussions": [
+            {"notes": [{"resolvable": True, "resolved": False} for _index in range(5)]}
+        ],
+    }
+    provider = GitLabMergeRequestProvider(
+        gitlab_hosts=[],
+        fetch=lambda _target, resource, _head_revision: payloads[resource],
+    )
+
+    result = provider.probe("https://gitlab.com/acme/widgets/-/merge_requests/8")
+
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.canonical["unresolved_review_threads"] == 1
+
+
+def test_gitlab_revoked_host_is_a_terminal_authorization_failure():
+    provider = GitLabMergeRequestProvider(
+        gitlab_hosts=[],
+        fetch=lambda *_args: pytest.fail("revoked host reached the provider"),
+    )
+
+    result = provider.probe("https://git.corp/acme/widgets/-/merge_requests/8")
+
+    assert result.observation.provider_error is ProviderErrorKind.AUTHORIZATION
+    assert result.observation.reason_code == "provider_authorization"
 
 
 @pytest.mark.parametrize(
@@ -311,9 +414,8 @@ def test_gitlab_native_fetch_reads_only_the_latest_current_head_pipeline(monkeyp
                 "draft": False,
                 "sha": "c0ffee",
                 "detailed_merge_status": "mergeable",
+                "head_pipeline": {"id": 99, "sha": "c0ffee", "status": "success"},
             }
-        elif "/pipelines?" in endpoint:
-            payload = [{"id": 99, "sha": "c0ffee", "status": "success"}]
         else:
             payload = ([{"notes": []}] * 100) if endpoint.endswith("page=1") else []
         return subprocess.CompletedProcess(["glab"], 0, stdout=json.dumps(payload), stderr="")
@@ -328,11 +430,42 @@ def test_gitlab_native_fetch_reads_only_the_latest_current_head_pipeline(monkeyp
     )
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
-    pipeline_endpoint = next(endpoint for endpoint in endpoints if "/pipelines?" in endpoint)
-    assert "sha=c0ffee" in pipeline_endpoint
-    assert "order_by=id&sort=desc&per_page=1&page=1" in pipeline_endpoint
-    assert sum("/pipelines?" in endpoint for endpoint in endpoints) == 1
+    assert sum("/pipelines?" in endpoint for endpoint in endpoints) == 0
     assert sum("/discussions?" in endpoint for endpoint in endpoints) == 2
+
+
+def test_gitlab_exactly_two_full_discussion_pages_are_complete(monkeypatch):
+    endpoints: list[str] = []
+
+    def succeed(_executable, argv, **_kwargs):
+        endpoint = argv[1]
+        endpoints.append(endpoint)
+        if endpoint.endswith("merge_requests/8"):
+            payload = {
+                "state": "opened",
+                "draft": False,
+                "sha": "c0ffee",
+                "detailed_merge_status": "mergeable",
+                "head_pipeline": {"id": 99, "sha": "c0ffee", "status": "success"},
+            }
+        elif endpoint.endswith("page=3"):
+            payload = []
+        else:
+            payload = [{"notes": []}] * 100
+        return subprocess.CompletedProcess(["glab"], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.gitlab_merge_request.run_provider_cli",
+        succeed,
+    )
+
+    result = GitLabMergeRequestProvider(gitlab_hosts=[]).probe(
+        "https://gitlab.com/acme/widgets/-/merge_requests/8"
+    )
+
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert result.canonical["review_threads_complete"] is True
+    assert sum("/discussions?" in endpoint for endpoint in endpoints) == 3
 
 
 def test_azure_requested_changes_and_active_thread_are_actionable():
@@ -400,6 +533,34 @@ def test_azure_optional_unvoted_reviewer_does_not_block_review_ready():
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
     assert result.canonical["review_decision"] == "none"
+
+
+def test_azure_exact_page_size_is_complete_without_a_continuation_token():
+    payloads = {
+        "pull_request": {
+            "status": "active",
+            "isDraft": False,
+            "repository": {"name": "widgets", "project": {"name": "project"}},
+            "lastMergeSourceCommit": {"commitId": "def"},
+            "mergeStatus": "succeeded",
+            "reviewers": [],
+        },
+        "statuses": {
+            "value": [
+                {"context": {"name": f"check-{index}"}, "state": "succeeded"}
+                for index in range(100)
+            ]
+        },
+        "threads": {"value": [{"status": "closed"} for _index in range(100)]},
+        "policies": {"value": []},
+    }
+    provider = AzureDevOpsPullRequestProvider(fetch=lambda _target, resource: payloads[resource])
+
+    result = provider.probe("https://dev.azure.com/acme/project/_git/widgets/pullrequest/9")
+
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert result.canonical["checks_complete"] is True
+    assert result.canonical["review_threads_complete"] is True
 
 
 def test_azure_null_source_commit_remains_pending():
@@ -532,6 +693,70 @@ def test_bitbucket_non_reviewer_participant_does_not_require_a_review():
 
     assert result.observation.status is MonitorObservationStatus.SUCCESS
     assert result.canonical["review_decision"] == "none"
+
+
+def test_bitbucket_loads_one_non_propagating_credential_snapshot(monkeypatch):
+    credential_calls: list[bool] = []
+    fetch_credentials: list[object] = []
+    credentials = {
+        "BITBUCKET_EMAIL": "user@example.com",
+        "BITBUCKET_API_TOKEN": "probe-token",
+    }
+    payloads = {
+        "pull_request": {
+            "state": "OPEN",
+            "draft": False,
+            "source": {"commit": {"hash": "fed"}},
+            "participants": [],
+        },
+        "statuses": {"values": [], "next": None},
+        "tasks": {"values": [], "next": None},
+        "conflicts": {"values": [], "next": None},
+    }
+
+    def load_credentials(*, propagate=True):
+        credential_calls.append(propagate)
+        return credentials
+
+    def fetch(_target, resource, supplied_credentials):
+        fetch_credentials.append(supplied_credentials)
+        return payloads[resource]
+
+    monkeypatch.setattr(
+        bitbucket_module,
+        "KiroCrewConfig",
+        SimpleNamespace(load=lambda: SimpleNamespace(load_credentials=load_credentials)),
+    )
+    monkeypatch.setattr(BitbucketPullRequestProvider, "_fetch_https", staticmethod(fetch))
+
+    result = BitbucketPullRequestProvider().probe(
+        "https://bitbucket.org/acme/widgets/pull-requests/10"
+    )
+
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert credential_calls == [False]
+    assert fetch_credentials == [credentials] * 4
+
+
+def test_bitbucket_missing_source_commit_stays_pending():
+    payloads = {
+        "pull_request": {
+            "state": "OPEN",
+            "draft": False,
+            "source": {"commit": None},
+            "participants": [],
+        },
+        "statuses": {"values": [], "next": None},
+        "tasks": {"values": [], "next": None},
+        "conflicts": {"values": [], "next": None},
+    }
+    provider = BitbucketPullRequestProvider(fetch=lambda _target, resource: payloads[resource])
+
+    result = provider.probe("https://bitbucket.org/acme/widgets/pull-requests/10")
+
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "pull_request_state_unknown"
+    assert result.canonical["head_revision"] == ""
 
 
 @pytest.mark.parametrize(
@@ -692,11 +917,23 @@ def test_azure_forbidden_is_terminal_and_omits_provider_text(monkeypatch):
     assert "super-secret" not in result.observation.reason_code
 
 
-def test_azure_cli_calls_pin_project_and_repository_from_the_target(monkeypatch):
+def test_azure_cli_uses_supported_project_scoping_for_each_command(monkeypatch):
     calls: list[list[str]] = []
+    credential_calls: list[bool] = []
+    credentials = {"AZURE_DEVOPS_EXT_PAT": "probe-token"}
 
-    def succeed(_executable, argv, **_kwargs):
+    def load_credentials(*, propagate=True):
+        credential_calls.append(propagate)
+        return credentials
+
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.azure_devops_pull_request.KiroCrewConfig",
+        SimpleNamespace(load=lambda: SimpleNamespace(load_credentials=load_credentials)),
+    )
+
+    def succeed(_executable, argv, **kwargs):
         calls.append(list(argv))
+        assert kwargs["credentials"] is credentials
         if argv[:3] == ["repos", "pr", "show"]:
             payload = {
                 "status": "active",
@@ -733,9 +970,11 @@ def test_azure_cli_calls_pin_project_and_repository_from_the_target(monkeypatch)
         for call in calls
     )
     repository_commands = [call for call in calls if call[:2] == ["repos", "pr"]]
-    assert all("--project" in call and "project" in call for call in repository_commands)
+    assert all("--project" not in call for call in repository_commands)
     invoke_commands = [call for call in calls if call[:2] == ["devops", "invoke"]]
+    assert all("project=project" in call for call in invoke_commands)
     assert all("repositoryId=widgets" in call for call in invoke_commands)
+    assert credential_calls == [False]
 
 
 def test_bitbucket_not_found_is_terminal():
@@ -791,7 +1030,11 @@ def test_bitbucket_https_fetch_pins_auth_host_and_response_bound(monkeypatch):
         "https://bitbucket.org/acme/widgets/pull-requests/10"
     )
 
-    result = BitbucketPullRequestProvider._fetch_https(target, "statuses")
+    result = BitbucketPullRequestProvider._fetch_https(
+        target,
+        "statuses",
+        credentials.load_credentials(),
+    )
 
     assert result == {"values": []}
     assert requests == [
@@ -822,7 +1065,11 @@ def test_bitbucket_https_fetch_rejects_incomplete_credentials(monkeypatch):
     )
 
     with pytest.raises(PermissionError, match="incomplete"):
-        BitbucketPullRequestProvider._fetch_https(target, "pull_request")
+        BitbucketPullRequestProvider._fetch_https(
+            target,
+            "pull_request",
+            credentials.load_credentials(),
+        )
 
 
 def test_bitbucket_https_fetch_rejects_oversized_response(monkeypatch):
@@ -860,7 +1107,11 @@ def test_bitbucket_https_fetch_rejects_oversized_response(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="exceeds"):
-        BitbucketPullRequestProvider._fetch_https(target, "pull_request")
+        BitbucketPullRequestProvider._fetch_https(
+            target,
+            "pull_request",
+            credentials.load_credentials(),
+        )
 
     assert audits == ["invoked", "failed"]
 
@@ -1072,13 +1323,49 @@ def test_provider_cli_audit_and_kill_fallbacks_fail_closed(monkeypatch):
     assert proc.killed is True
 
 
-def test_provider_cli_environments_are_scoped_and_disable_dynamic_install(monkeypatch):
+def test_provider_cli_process_shutdown_keeps_every_wait_bounded(monkeypatch):
+    class Process:
+        stdout = BytesIO()
+        stderr = BytesIO()
+
+        def __init__(self):
+            self.killed = False
+            self.wait_timeouts: list[float] = []
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            if len(self.wait_timeouts) == 1:
+                raise subprocess.TimeoutExpired(["glab"], timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    proc = Process()
+    monkeypatch.setattr(provider_cli_module, "_kill_provider_tree", lambda _proc: None)
+
+    provider_cli_module._stop_provider_process(proc)
+
+    assert proc.killed is True
+    assert proc.wait_timeouts == [
+        provider_cli_module._PROCESS_EXIT_TIMEOUT_SECS,
+        provider_cli_module._PROCESS_EXIT_TIMEOUT_SECS,
+    ]
+    assert proc.stdout.closed is True
+    assert proc.stderr.closed is True
+
+
+def test_provider_cli_environments_are_scoped_and_disable_dynamic_install(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-for-providers")
     monkeypatch.setenv("GITLAB_TOKEN", "ambient-gitlab-token")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     monkeypatch.setenv("PYTHONPATH", "/tmp/agent-python")
     monkeypatch.setenv("VIRTUAL_ENV", "/tmp/agent-venv")
     monkeypatch.setenv("CONDA_PREFIX", "/tmp/agent-conda")
+    monkeypatch.setenv("ALL_PROXY", "socks5://proxy.example:1080")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/corporate-ca.pem")
+    monkeypatch.setenv("CURL_CA_BUNDLE", "/tmp/curl-ca.pem")
 
     azure = provider_cli_env(
         "az",
@@ -1090,7 +1377,12 @@ def test_provider_cli_environments_are_scoped_and_disable_dynamic_install(monkey
     )
 
     assert azure["AZURE_DEVOPS_EXT_PAT"] == "azure-token"
+    assert azure["AZURE_CONFIG_DIR"] == os.fspath(tmp_path / "home" / ".azure")
+    assert azure["AZURE_EXTENSION_DIR"] == os.fspath(tmp_path / "home" / ".azure" / "cliextensions")
     assert azure["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"] == "no"
+    assert azure["ALL_PROXY"] == "socks5://proxy.example:1080"
+    assert azure["REQUESTS_CA_BUNDLE"] == "/tmp/corporate-ca.pem"
+    assert azure["CURL_CA_BUNDLE"] == "/tmp/curl-ca.pem"
     assert "GITLAB_TOKEN" not in azure
     assert "AWS_SECRET_ACCESS_KEY" not in azure
     assert "SSH_AUTH_SOCK" not in azure
@@ -1128,7 +1420,7 @@ def test_provider_cli_routes_through_sandbox_and_restores_only_explicit_credenti
     tmp_path,
 ):
     calls = []
-    azure_config_dir = os.fspath(tmp_path / "azure-config")
+    azure_config_dir = os.fspath(tmp_path / "home" / "azure-config")
 
     def fake_sandbox(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -1162,5 +1454,38 @@ def test_provider_cli_routes_through_sandbox_and_restores_only_explicit_credenti
     assert len(calls) == 1
     assert calls[0][1]["mode"] == "standard"
     assert calls[0][1]["strip_python_env"] is True
-    assert calls[0][1]["extra_visible_dirs"] == (azure_config_dir,)
+    assert calls[0][1]["extra_visible_dirs"] == (
+        azure_config_dir,
+        os.path.join(azure_config_dir, "cliextensions"),
+    )
     assert calls[0][1]["env"]["AZURE_CONFIG_DIR"] == azure_config_dir
+
+
+def test_provider_cli_rejects_azure_visibility_outside_owned_homes(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
+    monkeypatch.setenv("KIROCREW_HOME", os.fspath(tmp_path / "crew"))
+    monkeypatch.setenv("AZURE_CONFIG_DIR", os.fspath(tmp_path.parent / "outside"))
+
+    with pytest.raises(provider_cli_module.SetupError, match="must stay beneath"):
+        provider_cli_env("az")
+
+
+@pytest.mark.parametrize("extension_suffix", ["", "extensions"])
+def test_provider_cli_rejects_agent_writable_azure_extension_dir(
+    monkeypatch,
+    tmp_path,
+    extension_suffix,
+):
+    home = tmp_path / "home"
+    project = home / "project"
+    monkeypatch.setenv("HOME", os.fspath(home))
+    monkeypatch.setenv("AZURE_CONFIG_DIR", os.fspath(home / ".azure"))
+    monkeypatch.setenv("AZURE_EXTENSION_DIR", os.fspath(project / extension_suffix))
+    monkeypatch.setattr(
+        provider_cli_module,
+        "agent_writable_roots",
+        lambda: (project,),
+    )
+
+    with pytest.raises(provider_cli_module.SetupError, match="agent-writable"):
+        provider_cli_env("az")

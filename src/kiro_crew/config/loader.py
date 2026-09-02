@@ -9663,7 +9663,7 @@ class KiroCrewConfig:
                 return ad.get("model") or ""
         return ""
 
-    def load_credentials(self) -> dict[str, str]:
+    def load_credentials(self, *, propagate: bool = True) -> dict[str, str]:
         """Load credentials from ~/.kiro/crew/.env and environment variables.
 
         .env format: KEY=VALUE (one per line, # comments, no quotes required).
@@ -9735,13 +9735,14 @@ class KiroCrewConfig:
         # Children that need the withheld credentials get them via their own
         # .env read or via an explicit env= kwarg on Popen (the sandbox and ACP
         # spawners already do this).
-        scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
-        for k, v in creds.items():
-            if not v:
-                continue
-            if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
-                continue
-            os.environ.setdefault(k, v)
+        if propagate:
+            scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
+            for k, v in creds.items():
+                if not v:
+                    continue
+                if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
+                    continue
+                os.environ.setdefault(k, v)
 
         return creds
 

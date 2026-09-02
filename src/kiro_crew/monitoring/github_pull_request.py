@@ -168,6 +168,24 @@ class GitHubPullRequestProvider:
                     unresolved_review_threads=unresolved,
                     review_threads_complete=complete,
                 )
+            return build_pull_request_probe_result(
+                PullRequestFacts(
+                    kind="github_pull_request",
+                    target=response.target.identity,
+                    state=response.state,
+                    draft=response.draft,
+                    head_revision=response.head_revision,
+                    mergeability=response.mergeability,
+                    review_decision=response.review_decision,
+                    checks=response.checks,
+                    checks_complete=response.checks_complete,
+                    unresolved_review_threads=response.unresolved_review_threads,
+                    review_threads_complete=response.review_threads_complete,
+                ),
+                previous_observation=previous_observation,
+                response=response,
+                supplemental_provider_error=supplemental_error,
+            )
         except SetupError as exc:
             if _transient_os_error(exc.__cause__):
                 return _provider_error(ProviderErrorKind.TRANSIENT, "provider_transient")
@@ -185,24 +203,6 @@ class GitHubPullRequestProvider:
                 ProviderErrorKind.TRANSIENT,
                 "provider_malformed_response",
             )
-        return build_pull_request_probe_result(
-            PullRequestFacts(
-                kind="github_pull_request",
-                target=response.target.identity,
-                state=response.state,
-                draft=response.draft,
-                head_revision=response.head_revision,
-                mergeability=response.mergeability,
-                review_decision=response.review_decision,
-                checks=response.checks,
-                checks_complete=response.checks_complete,
-                unresolved_review_threads=response.unresolved_review_threads,
-                review_threads_complete=response.review_threads_complete,
-            ),
-            previous_observation=previous_observation,
-            response=response,
-            supplemental_provider_error=supplemental_error,
-        )
 
     def _checks(
         self,

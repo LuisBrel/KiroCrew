@@ -7,13 +7,16 @@ import os
 import subprocess
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
+from pathlib import Path
 from typing import IO
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.github_runner import (
     SetupError,
+    agent_writable_roots,
     provider_executable_candidates,
     validate_provider_executable,
 )
@@ -30,16 +33,20 @@ _OVERRIDE_ENV = {
 }
 _PASSTHROUGH = {
     "glab": frozenset({"GLAB_CONFIG_DIR", "GITLAB_TOKEN"}),
-    "az": frozenset({"AZURE_CONFIG_DIR", "AZURE_DEVOPS_EXT_PAT"}),
+    "az": frozenset({"AZURE_CONFIG_DIR", "AZURE_DEVOPS_EXT_PAT", "AZURE_EXTENSION_DIR"}),
 }
 _NETWORK_ENV = frozenset(
     {
         "HTTP_PROXY",
         "HTTPS_PROXY",
+        "ALL_PROXY",
         "NO_PROXY",
         "http_proxy",
         "https_proxy",
+        "all_proxy",
         "no_proxy",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     }
@@ -59,6 +66,8 @@ _INJECTION_ENV_KEYS = frozenset(
 _MAX_STDOUT_BYTES = 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
+_PIPE_JOIN_TIMEOUT_SECS = 2.0
+_PROCESS_EXIT_TIMEOUT_SECS = 2.0
 logger = logging.getLogger(__name__)
 
 
@@ -110,10 +119,42 @@ def provider_cli_env(
     if executable == "glab":
         env["GLAMOUR_STYLE"] = "notty"
     else:
-        env.setdefault("AZURE_CONFIG_DIR", os.path.join(os.path.expanduser("~"), ".azure"))
+        operator_home = os.environ.get("HOME") or os.path.expanduser("~")
+        raw_config_dir = env.get(
+            "AZURE_CONFIG_DIR",
+            os.path.join(operator_home, ".azure"),
+        )
+        env["AZURE_CONFIG_DIR"] = _validated_azure_dir(raw_config_dir, "AZURE_CONFIG_DIR")
+        raw_extension_dir = env.get(
+            "AZURE_EXTENSION_DIR",
+            os.path.join(env["AZURE_CONFIG_DIR"], "cliextensions"),
+        )
+        env["AZURE_EXTENSION_DIR"] = _validated_azure_dir(
+            raw_extension_dir,
+            "AZURE_EXTENSION_DIR",
+        )
         env["AZURE_CORE_ONLY_SHOW_ERRORS"] = "1"
         env["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"] = "no"
     return env
+
+
+def _validated_azure_dir(raw: str, variable: str) -> str:
+    """Confine Azure CLI read exceptions to an operator-owned home tree."""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise SetupError(f"{variable} must be an absolute path")
+    resolved = candidate.resolve(strict=False)
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    roots = {Path(home).expanduser().resolve(strict=False)}
+    crew_home = os.environ.get("KIROCREW_HOME")
+    if crew_home:
+        roots.add(Path(crew_home).expanduser().resolve(strict=False))
+    if not any(resolved != root and root in resolved.parents for root in roots):
+        raise SetupError(f"{variable} must stay beneath HOME or KIROCREW_HOME")
+    writable_roots = tuple(root.resolve(strict=False) for root in agent_writable_roots())
+    if any(resolved == root or root in resolved.parents for root in writable_roots):
+        raise SetupError(f"{variable} must stay outside agent-writable roots")
+    return os.fspath(resolved)
 
 
 def run_provider_cli(
@@ -140,7 +181,11 @@ def run_provider_cli(
     try:
         args = [binary, *argv]
         base_env = provider_cli_env(executable, credentials=credentials)
-        visible_dirs = (base_env["AZURE_CONFIG_DIR"],) if executable == "az" else ()
+        visible_dirs = (
+            (base_env["AZURE_CONFIG_DIR"], base_env["AZURE_EXTENSION_DIR"])
+            if executable == "az"
+            else ()
+        )
         spawn_args, spawn_env, cleanup_path = sandboxed_spawn_argv(
             args,
             mode="standard",
@@ -168,7 +213,8 @@ def run_provider_cli(
             _finish_suspended_provider_spawn(proc)
             assert proc.stdout is not None
             assert proc.stderr is not None
-            with ThreadPoolExecutor(max_workers=2) as readers:
+            readers = ThreadPoolExecutor(max_workers=2)
+            try:
                 stdout_future = readers.submit(
                     _read_limited,
                     proc.stdout,
@@ -184,11 +230,16 @@ def run_provider_cli(
                 try:
                     returncode = proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    _kill_provider_tree(proc)
-                    proc.wait()
+                    _stop_provider_process(proc)
                     raise
-                stdout = stdout_future.result()
-                stderr = stderr_future.result()
+                try:
+                    stdout = stdout_future.result(timeout=_PIPE_JOIN_TIMEOUT_SECS)
+                    stderr = stderr_future.result(timeout=_PIPE_JOIN_TIMEOUT_SECS)
+                except FutureTimeoutError as exc:
+                    _stop_provider_process(proc)
+                    raise SetupError("provider CLI pipes did not close") from exc
+            finally:
+                readers.shutdown(wait=False, cancel_futures=True)
     except Exception:
         _audit_provider_cli(executable, "failed")
         raise
@@ -258,6 +309,24 @@ def _kill_provider_tree(proc: subprocess.Popen[bytes]) -> None:
     except (OSError, ValueError):
         with suppress(ProcessLookupError):
             proc.kill()
+
+
+def _stop_provider_process(proc: subprocess.Popen[bytes]) -> None:
+    """Bound process-tree termination and unblock both pipe readers."""
+    _kill_provider_tree(proc)
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            with suppress(OSError, ValueError):
+                stream.close()
+    try:
+        proc.wait(timeout=_PROCESS_EXIT_TIMEOUT_SECS)
+    except subprocess.TimeoutExpired:
+        with suppress(Exception):
+            proc.kill()
+        try:
+            proc.wait(timeout=_PROCESS_EXIT_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired as exc:
+            raise SetupError("provider CLI process did not terminate") from exc
 
 
 def _audit_provider_cli(executable: str, outcome: str, *, critical: bool = False) -> None:

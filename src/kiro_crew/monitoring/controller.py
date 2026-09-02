@@ -144,6 +144,8 @@ class MonitorController:
             if state.wake_delivery is MonitorDispatchResult.BUSY:
                 if now < state.next_probe_at:
                     return MonitorDecision.NO_CHANGE
+                if await self._service.stop_monitor_if_budget_exhausted(loop.id, now=now):
+                    return MonitorDecision.STOP_BUDGET
                 return await self._dispatch_claimed(loop, state, now=now)
             if (
                 state.wake_delivery is MonitorDispatchResult.DISPATCHED

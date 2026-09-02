@@ -385,7 +385,8 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     id,
     slotKey,
     active,
-    actionable: monitor.stopped_reason !== 'invalid_monitor_record',
+    actionable: monitor.stopped_reason !== 'invalid_monitor_record'
+      && outcome !== 'session_close',
     version,
     monitorKind: text(monitor.kind),
     objective: text(monitor.objective),

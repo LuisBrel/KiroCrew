@@ -160,6 +160,24 @@ describe('automation transport normalizer', () => {
     expect(deriveAutomationStatus(record!)).toBe('blocked')
   })
 
+  it('keeps session-close tombstones non-actionable', () => {
+    const record = normalizeAutomationRecord(structuredLoop({
+      active: false,
+      outcome: 'session_close',
+      stopped_reason: 'session_closed',
+    }))
+
+    expect(record).toMatchObject({
+      kind: 'structured_monitor',
+      active: false,
+      actionable: false,
+      terminal: {
+        outcome: 'session_close',
+        reason: 'session_closed',
+      },
+    })
+  })
+
   it.each([
     { cadence_secs: 86_401 },
     { budgets: { max_runtime_secs: 604_801, max_agent_turns: 8, max_tokens: 250_000, max_provider_errors: 3 } },

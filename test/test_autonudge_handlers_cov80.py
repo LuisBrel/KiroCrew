@@ -354,6 +354,7 @@ async def test_monitor_list_excludes_persistence_only_fields(
     loop.monitor.last_observation = {
         "blocking_review": "none",
         "checks": {"failed": [], "passed": [], "pending": [], "unknown": []},
+        "checks_complete": True,
         "draft": False,
         "head_revision": "abc123",
         "kind": "github_pull_request",

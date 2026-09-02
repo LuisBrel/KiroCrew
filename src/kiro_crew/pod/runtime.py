@@ -1743,7 +1743,7 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     ``KIRO_API_KEY`` (the pod agent's model
     credential) and ``KIROCREW_OWNER_ID`` (dashboard ownership, not a channel or
     source-provider identity). Provider CLI config roots are redirected beneath
-    the pod home so ``glab`` and ``az`` cannot reuse the operator's persisted
+    the pod home so ``gh``, ``glab`` and ``az`` cannot reuse the operator's persisted
     login sessions through the deliberately inherited real ``HOME``. ``AWS_*``
     is kept on purpose (pods run agent turns),
     and the generic ``_TOKEN`` scrub deliberately excludes ``AWS_`` so
@@ -1753,8 +1753,10 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     env = {
         **os.environ,
         "HOME": os.environ.get("HOME", str(Path.home())),
+        "GH_CONFIG_DIR": str(home_dir / ".config" / "gh"),
         "GLAB_CONFIG_DIR": str(home_dir / ".config" / "glab-cli"),
         "AZURE_CONFIG_DIR": str(home_dir / ".azure"),
+        "AZURE_EXTENSION_DIR": str(home_dir / ".azure" / "cliextensions"),
         "KIROCREW_HOME": str(home_dir),
         "KIROCREW_PORT": str(port),
         "KIROCREW_PROJECT_DIR": str(checkout),
@@ -1801,6 +1803,7 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         or k.startswith("WECOM_")
         or k.startswith("MICROSOFT_APP_")
         or k.startswith("FEISHU_")
+        or k.startswith("JIRA_TOKEN_")
         or (k.endswith("_TOKEN") and not k.startswith("AWS_"))
     ]:
         env.pop(key, None)

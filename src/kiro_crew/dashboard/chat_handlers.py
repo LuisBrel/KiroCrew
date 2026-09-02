@@ -3772,6 +3772,21 @@ async def close_slot(
     *,
     pre_pop_check: Callable[[], None] | None = None,
 ) -> None:
+    """Close a slot while releasing its admission fence on every aborted path."""
+    try:
+        await _close_slot(state, slot, name, pre_pop_check=pre_pop_check)
+    finally:
+        if state.get_slot(name) is slot:
+            slot._closing = False
+
+
+async def _close_slot(
+    state: DashboardState,
+    slot: "_ChatSlot",
+    name: str,
+    *,
+    pre_pop_check: Callable[[], None] | None = None,
+) -> None:
     """Close (archive) one live slot the way the tab ✕ does: tombstone it, retire
     its auto-nudge loop, notify its owning app, persist it as closed, and tear
     down the per-tab session.

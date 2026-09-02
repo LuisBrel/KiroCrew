@@ -39,7 +39,7 @@ class BitbucketPullRequestProvider:
     """Read Bitbucket Cloud over one host-pinned bounded HTTPS client."""
 
     def __init__(self, *, fetch: BitbucketFetch | None = None) -> None:
-        self._fetch = fetch or self._fetch_https
+        self._fetch = fetch
 
     def probe(
         self,
@@ -49,16 +49,27 @@ class BitbucketPullRequestProvider:
     ) -> PullRequestProbeResult:
         try:
             target = parse_bitbucket_pull_request_target(raw_target)
-            pr = _object(self._fetch(target, "pull_request"))
+            credentials = (
+                None
+                if self._fetch is not None
+                else KiroCrewConfig.load().load_credentials(propagate=False)
+            )
+
+            def fetch(resource: str) -> object:
+                if self._fetch is not None:
+                    return self._fetch(target, resource)
+                return self._fetch_https(target, resource, credentials or {})
+
+            pr = _object(fetch("pull_request"))
             if str(pr.get("state", "")).upper() in _TERMINAL_STATES:
                 statuses: list[object] = []
                 tasks: list[object] = []
                 conflicts: list[object] = []
                 statuses_complete = tasks_complete = conflicts_complete = True
             else:
-                statuses, statuses_complete = _page(self._fetch(target, "statuses"))
-                tasks, tasks_complete = _page(self._fetch(target, "tasks"))
-                conflicts, conflicts_complete = _page(self._fetch(target, "conflicts"))
+                statuses, statuses_complete = _page(fetch("statuses"))
+                tasks, tasks_complete = _page(fetch("tasks"))
+                conflicts, conflicts_complete = _page(fetch("conflicts"))
             facts = _facts(
                 target,
                 pr,
@@ -113,7 +124,11 @@ class BitbucketPullRequestProvider:
         )
 
     @staticmethod
-    def _fetch_https(target: BitbucketPullRequestTarget, resource: str) -> object:
+    def _fetch_https(
+        target: BitbucketPullRequestTarget,
+        resource: str,
+        credentials: Mapping[str, str],
+    ) -> object:
         workspace = quote(target.workspace, safe="")
         repository = quote(target.repository, safe="")
         root = (
@@ -126,7 +141,6 @@ class BitbucketPullRequestProvider:
             "tasks": "/tasks?pagelen=100",
             "conflicts": "/conflicts?pagelen=100",
         }[resource]
-        credentials = KiroCrewConfig.load().load_credentials()
         headers = {"Accept": "application/json"}
         email = credentials.get("BITBUCKET_EMAIL", "")
         token = credentials.get("BITBUCKET_API_TOKEN", "")
@@ -173,8 +187,10 @@ def _facts(
         raw_state,
         "closed" if raw_state == "SUPERSEDED" else "unknown",
     )
-    source = _object(pr.get("source", {}))
-    commit = _object(source.get("commit", {}))
+    source_raw = pr.get("source")
+    source = {} if source_raw is None else _object(source_raw)
+    commit_raw = source.get("commit")
+    commit = {} if commit_raw is None else _object(commit_raw)
     checks: list[PullRequestCheck] = []
     for index, raw in enumerate(statuses[:100]):
         item = _object(raw)
@@ -187,7 +203,7 @@ def _facts(
             normalized = "pending"
         else:
             normalized = "unknown"
-        raw_identity = item.get("uuid") or item.get("key") or item.get("name") or index
+        raw_identity = item.get("key") or item.get("name") or item.get("uuid") or index
         identity = opaque_provider_check_identity("status", raw_identity)
         checks.append(PullRequestCheck(identity, normalized))
     if not statuses_complete:
@@ -219,7 +235,7 @@ def _facts(
         target=target.identity,
         state=state,
         draft=bool(pr.get("draft", False)),
-        head_revision=str(commit.get("hash", "")),
+        head_revision=str(commit.get("hash") or ""),
         mergeability=(
             "conflicting" if conflicts else "mergeable" if conflicts_complete else "pending"
         ),
