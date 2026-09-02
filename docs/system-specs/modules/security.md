@@ -901,7 +901,67 @@ token with an attached `=` value never disturbs the split, whatever the option, 
 it is skipped as before; a bare `--` ends option parsing exactly as git reads it.
 The invariant this buys: an unrecognised option can change the answer only toward
 MORE protection, so the erasure class cannot silently reopen when git grows a new
-value-taking option. (Note the earlier retraction of a 35-entry option table on
+value-taking option. The same fallback covers word FRAGMENTS: the scan tokenizes
+on whitespace while the shell fuses a quoted or escape-continued span into one
+word, so a value like `--push-option='ci skip'` arrives as fragments whose tail
+would read as a refspec. `_push_token_is_word_fragment` walks the shell's own
+quote/escape state over each raw token — backslash escapes outside quotes, inside
+double quotes, and inside `$'...'` ANSI-C strings, but is literal inside plain
+single quotes — and any token whose state does not return to normal (an open
+quote, or a trailing escape that consumed the separator) poisons the positional
+split the same protective way. An ESCAPED quote is data, not a delimiter: a
+character-count/parity test was bypassed by `\"` in review, which is why the walk
+tracks state rather than counting. Complete words keep their precise reading in
+both directions — `"feat\"x"` is not flagged, and the quote-splice `'ma'\''in'`
+still reads as exactly the protected-branch row. The `$`-lookback for ANSI-C can
+misread `$$'` (PID expansion) as ANSI-C, which only ever OVER-flags, never the
+reverse. Word-PRODUCING syntax is handled before the split assigns slots at all:
+a `$` anywhere in any token lands the segment on the ungated branch (parameter
+expansion word-splits AFTER this scan — `V='ci.skip main'; git push --repo=origin
+--push-option $V` hands git a `main` refspec the split never saw — and this slot
+must not be weaker than the refspec slot's existing `$` posture), while glob
+characters (`*` `?` `[`) and extglob patterns (`@(` `+(` `!(`) in any token keep
+the wildcard-refspec identity, since
+pathname expansion can produce words and none of those characters is legal in a
+refname. Shell OPERATORS are consumed by the shell, never by git, so they are
+handled before any argv-level reading (and before `--`, which is git's
+end-of-options, not the shell's): a `#`-opened comment truncates the segment's
+remaining tokens; a redirection token is excluded with the shell's own arity (an
+attached target — `2>err`, `2>&1` — is self-contained, a bare operator consumes
+the next word), which keeps `git push origin feature-x 2>&1` allowed while
+`git push origin </dev/null` reads as the precise remote-only shape instead of
+scanning a phantom refspec; a bare `&` (a single ampersand is not a segment
+separator upstream, only `&&` is) or operator glue mid-word marks the split
+untrusted AND scans the operator-delimited pieces, so a protected name cannot
+hide behind glue — except that a word glued to a WELL-FORMED redirection
+(`origin>/dev/null`, `main>log`) decomposes precisely instead: the pre-operator
+word stays positional and the redirection is consumed, because bash reads it
+exactly that way and the fallback's bare tag was the WRONG catalog identity for
+a remote-only push (an identity miss is itself a hazard under per-rule
+opt-out). Redirection arity also recognises bash NAMED descriptors
+(`{name}>...` is all redirection — read as a word, the `{name}` became a
+phantom refspec erasing every tag) and quoted TARGETS (`>'log'` — the operator
+grammar admits no quotes, so a quote can only sit in the target group;
+refusing the whole token for it had mislabelled the shape), while fragment
+tokens (open quote state) still poison the split protectively. Quoted operator characters are data and none of this fires. A segment
+whose CUMULATIVE quote/escape state is still open at its end continues into the
+next line — bash line continuation (`\<newline>` vanishes) and quoted newlines
+splice words across the newline segment boundary, so `origin ma\` + newline +
+`in` pushes `main` while no scanned token spells it — and lands on the ungated
+sentinel (the `ma$in` posture); a mid-segment open whose quote closes before
+segment end stays on the disableable fallback, because in-segment joining can
+only fuse whitespace into a word (never a valid refname) and the pieces stay
+visible to the superset scan. The invariant
+has two different strengths, stated honestly: the OPTION-ARITY axis fails
+protective by construction (an unrecognised option lands in the fallback), while
+the SHELL-SYNTAX axis rests on the metacharacter inventory being complete — a
+construct the scan does not know parses as an ordinary word — so that inventory
+is pinned as a checked property
+(`test_every_bash_metacharacter_is_accounted_for` maps every bash metacharacter
+to the layer that accounts for it: upstream separators, upstream
+substitution/expansion ungating, the `$`/glob pre-checks, redirection/comment
+consumption, the fragment walk, or a documented benign rationale). (Note the
+earlier retraction of a 35-entry option table on
 the dangerous-PREFIX axis is not precedent against these tables: prefix matching
 is a set intersection where extra names are inert, while arity decides which
 tokens are refspecs at all, so a table here does change outcomes.)
