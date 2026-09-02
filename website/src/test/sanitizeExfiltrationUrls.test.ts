@@ -57,6 +57,15 @@ describe('sanitizeExfiltrationUrls: exempt-host narrowing', () => {
     expect(out).not.toContain(url)
     expect(out).toContain('github.com.evil.example')
   })
+
+  it('matches the exempt host case-insensitively', () => {
+    // RFC 4343: DNS host case is not significant. A mixed-case `GitHub.com`
+    // must resolve to the exempt entry so the long benign query renders
+    // unchanged, not redacted.
+    const url = `https://GitHub.com/kirodotdev/KiroCrew/issues/new?${LONG_BENIGN_QUERY}`
+    const text = `see ${url} for details`
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
+  })
 })
 
 describe('sanitizeExfiltrationUrls: unconditional tier applies to exempt hosts', () => {
