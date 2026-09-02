@@ -57,6 +57,15 @@ logger = logging.getLogger(__name__)
 APP_NAME = "aws-control"
 KIND_SNAPSHOT = "snapshot"
 KIND_SESSIONS = "sessions"
+
+#: Wall clock for one backup push to S3, passed by both runners into
+#: :func:`storage.put_file` rather than relying on its 600s default. The
+#: nightly snapshot push runs unattended, and an owner-triggered sessions
+#: archive may legitimately need the full hour -- the size ceiling is
+#: ``storage._MAX_PINNED_TRANSFER_BYTES`` (5 GiB), which at 3600s still
+#: requires a ~12 Mbit/s uplink, so a slower push fails at the bound rather
+#: than holding the owner-billed transfer open indefinitely. Tests assert the
+#: constant reaches the uploader on both paths, so it cannot go unread.
 _PUSH_TIMEOUT_SECS = 3600
 
 
