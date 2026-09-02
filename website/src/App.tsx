@@ -2970,11 +2970,14 @@ export default function App() {
         {/* `tb-has-update` shifts the collapse ladder's rungs (index.css): the
             update pill is a conditional, non-shrinking sibling of the ladder,
             so while it is mounted the group's fixed content is wider by the
-            pill's footprint and every rung must fire that much earlier. The
-            class keys off the same selector the pill itself reads, so they
-            move together; during the pill's lazy-chunk fetch the class can
-            lead the pill by a moment, which costs readout room briefly and
-            harms nothing. */}
+            pill's footprint and the ≥640px rungs fire that much earlier. Below
+            640px no rung shifts (#7698): a phone hands the group ≤240px
+            routinely, so a shifted terminal rung blanked the readouts for the
+            whole time an update was pending; the nowrap backstop clips the
+            squeeze instead. The class keys off the same selector the pill
+            itself reads, so they move together; during the pill's lazy-chunk
+            fetch the class can lead the pill by a moment, which costs readout
+            room briefly and harms nothing. */}
         <div className={`tb-right relative${updateAvailable ? ' tb-has-update' : ''}`}>
 
           {/* Theme decoration: extra aside control (e.g. a stardate / clock). */}

@@ -1825,16 +1825,21 @@ file-tree-container{
      the squeeze band is not. The dev-only en-XA pseudolocale is excluded from
      the budget; the segments' nowrap backstop degrades it to a clean
      leading-edge clip.
-   - <640px the pill is icon-only (34px measured + 6px gap = 40), so only the
-     terminal rung shifts, and by that footprint — an unconditional 208 there
-     would blank the whole capsule on phones for nothing. The named readout
-     rungs need no <640 form: their elements render only on the desktop layout,
-     which never exists below the 768px form switch.
+   - <640px the pill is icon-only (34px measured + 6px gap = 40) and the ladder
+     takes NO shift at all: the group's base terminal rung below (200px) is the
+     only rung that fires there. A shifted rung once lived here at 240px, and
+     because a phone hands the right group ≤240px ROUTINELY, it blanked the
+     CPU/MEM/DSK and credits readouts the entire time an update was pending
+     (issue #7698) — trading a 40px squeeze band for the whole capsule. In the
+     200–240px band with the pill mounted the segments' nowrap backstop
+     degrades to a leading-edge clip instead, which is the recoverable harm.
+     The named readout rungs likewise need no <640 form: their elements render
+     only on the desktop layout, which never exists below the 768px form
+     switch.
 
-   Without the shift, the band between the base rung and the true content width
-   kept the readouts while the content no longer fit, and flex squeeze wrapped
-   them into two clipped lines inside the h-7 capsule. */
-@container (max-width:240px){ .tb-has-update .tb-capsule > *:not(:first-child){display:none} }
+   Without the ≥640px shift, the band between the base rung and the true
+   content width kept the readouts while the content no longer fit, and flex
+   squeeze wrapped them into two clipped lines inside the h-7 capsule. */
 @media (min-width:640px){
   @container (max-width:738px){ .tb-has-update .tb-drop-metrics{display:none} }
   @container (max-width:600px){ .tb-has-update .tb-drop-usage{display:none} }
