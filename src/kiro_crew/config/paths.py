@@ -446,9 +446,40 @@ def _under_system_tmp(path: Path) -> bool:
     and one a checkout may legitimately live under. Windows keeps
     ``gettempdir()`` (``%TEMP%``) as its only root. A root that cannot be
     resolved is skipped rather than guessed.
+
+    Deliberately does NOT try to distinguish an operator-selected ``TMPDIR``
+    from the OS's own general-purpose default. A round of this fence tried
+    excluding ``gettempdir()``'s result whenever ``TMPDIR``/``TEMP``/``TMP`` was
+    SET, reasoning that a set variable meant a deliberate operator choice worth
+    protecting like any other ancestor. That reasoning does not hold cross-
+    platform: macOS sets ``TMPDIR`` via launchd for every process regardless of
+    operator intent, so the exclusion fired unconditionally there, made
+    ``gettempdir()``'s own per-user temp root (``/var/folders/.../T``) stop
+    being treated as a boundary, and reopened the exact regression this
+    predicate exists to prevent — refusing an ordinary command merely naming
+    that directory — on every macOS run, including this project's own
+    ``Gateway Tests (macOS)`` CI job, which pins ``KIROCREW_HOME`` under it for
+    the identical isolation reason Linux CI does. There is no cheap, reliable
+    signal for "this environment variable reflects a deliberate choice" that
+    holds across every platform's own default, so a caller that needs to
+    distinguish an operator-selected root takes the cost on its own side
+    instead — ``sandbox.py``'s ancestor walk protects one unconditionally,
+    since doing so there is free.
     """
     roots: list[Path] = []
-    candidates = [tempfile.gettempdir()]
+    candidates: list[str] = []
+    try:
+        candidates.append(tempfile.gettempdir())
+    except OSError:
+        # `gettempdir()` itself probes every candidate directory for a writable
+        # one and raises when none qualifies -- rare, but this predicate is now
+        # reachable from the per-command ancestor walk (`_is_system_tmp_root`),
+        # not only the gateway-start callers it originally served. Skipping the
+        # unusable root and falling through to the POSIX literal (or, on
+        # Windows, to an empty root list) keeps this a normal "not under any
+        # known temp root" answer rather than an uncaught exception that would
+        # crash whatever is deciding whether to allow a command.
+        pass
     if os.name == "posix":
         candidates.append("/tmp")
     for candidate in candidates:
@@ -471,6 +502,32 @@ def _under_system_tmp(path: Path) -> bool:
     except (OSError, ValueError):  # pragma: no cover - defensive: unresolvable path
         target = path
     return any(target == root or root in target.parents for root in roots)
+
+
+def _is_system_tmp_root(path: Path) -> bool:
+    """Whether *path* IS the system temp root itself, not merely somewhere under it.
+
+    A companion to :func:`_under_system_tmp`, built on it rather than re-deriving its
+    root list: *path* is the boundary exactly when it is under (or equal to) a temp
+    root but its PARENT is not -- climbing one level further exits the temp tree
+    entirely. Distinguishes "the temp root itself, general-purpose and shared by
+    everything" from "somewhere strictly beneath it", which for a caller walking a
+    configured path's ancestors is a uniquely identifying directory, not a landmark
+    to stop at.
+
+    Needed as its own predicate rather than reusing ``_under_system_tmp`` directly:
+    that one answers "is this path ephemeral", true for the whole subtree, while an
+    ancestor walk needs to know exactly where the SHARED territory begins so it can
+    keep protecting everything below that point and stop exactly there -- not
+    stop at the first step that happens to already be under the root.
+
+    Answers with `_under_system_tmp`'s single, platform-uniform root list -- see
+    that function's own docstring for why it does NOT try to distinguish an
+    operator-selected ``TMPDIR`` from the OS's own general-purpose default.
+    """
+    if not _under_system_tmp(path):
+        return False
+    return not _under_system_tmp(path.parent)
 
 
 def _in_linked_git_worktree(path: Path) -> bool:
