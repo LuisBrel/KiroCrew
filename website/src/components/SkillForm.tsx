@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { Document, isAlias, isMap, isScalar, isSeq, parseDocument, Scalar, visit } from 'yaml'
 import type { Node, Pair, YAMLSeq } from 'yaml'
 import { Input } from './ui'
@@ -871,6 +871,50 @@ export function parseSkillContent(raw: string, key: string): SkillFormData {
   return isRewritable(split.block, doc) ? { ...parsed, frontmatter: split.block } : { ...parsed, raw }
 }
 
+/** The name the skills create handler will store this under, mirrored from
+ *  `api_skills_create` in `src/kiro_crew/dashboard/handlers/prompts.py`.
+ *
+ *  This is NOT `sanitizePromptName`, and the difference is deliberate: the skills
+ *  rule PERMITS `/` so a name can nest (`utils/code`), it strips leading and
+ *  trailing SLASHES as well as hyphens, and it collapses runs of `/` to a single
+ *  separator. The handler applies, in this exact order:
+ *
+ *    safe_name = re.sub(r"[^a-z0-9\-/]", "-", name.lower()).strip("-").strip("/")
+ *    safe_name = re.sub(r"/+", "/", safe_name)
+ *
+ *  so the order matters and is reproduced faithfully: replace every character
+ *  outside [a-z0-9-/] with `-`, then Python's `.strip("-")` (leading/trailing
+ *  hyphens) BEFORE `.strip("/")` (leading/trailing slashes), then collapse `/`
+ *  runs. Hyphen-then-slash is the order Python runs, and it can change the result
+ *  (`-/` strips to `` while `/` first would leave a `-`), so it is not swapped.
+ *
+ *  The `u` flag is load-bearing. Without it the class matches UTF-16 code UNITS,
+ *  so one astral character -- an emoji, a rare CJK ideograph -- becomes TWO
+ *  hyphens where the server writes one, and the preview would disagree with the
+ *  saved name for every name containing one. A drift guard
+ *  (website/src/test/SkillFormName.test.tsx) pins this to the handler expression. */
+export function sanitizeSkillName(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9/-]/gu, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '')
+    .replace(/\/+/g, '/')
+}
+
+/** Why the server would refuse to save under this name, or null when it would.
+ *
+ *  Skills have NO name byte cap in the handler (unlike prompts), so the only
+ *  refusal a name can earn is `no-stem`: everything sanitized away and nothing
+ *  survives. There is deliberately no `too-long` branch to mirror -- inventing
+ *  one would predict a refusal the server never makes. */
+export function skillNameProblem(raw: string): 'no-stem' | null {
+  if (!raw.trim()) return null
+  return sanitizeSkillName(raw) ? null : 'no-stem'
+}
+
 export default function SkillForm({ data, onChange, hideIdentity, allowRaw = true }: SkillFormProps) {
   /* A skill whose frontmatter YAML does not parse arrives with `raw` set, because
      the structured form cannot locate its fields in bytes the parser rejected.
@@ -880,6 +924,27 @@ export default function SkillForm({ data, onChange, hideIdentity, allowRaw = tru
 
   const set = <K extends keyof SkillFormData>(key: K, value: SkillFormData[K]) =>
     onChange({ ...data, [key]: value })
+
+  // useId keeps the hint's id unique even when two SkillForms are mounted at
+  // once (create modal + an open inline editor).
+  const nameHintId = `${useId()}-skill-name-hint`
+  // The effective skill name is category-then-name: SkillsTab POSTs
+  // `category ? "{category}/{name}" : name`, so the preview and the problem check
+  // must operate on that COMBINED value, not on `name` alone, or the filename
+  // shown would disagree with what the server actually sanitizes.
+  const combinedName = data.category ? `${data.category}/${data.name}` : data.name
+  const typed = combinedName.trim() !== ''
+  const stem = sanitizeSkillName(combinedName)
+  const nameProblem = skillNameProblem(combinedName)
+  // ONE sentence for the valid/empty state, plus the refusal string for the
+  // no-stem case. The empty state passes the literal `<name>` placeholder so
+  // there is no second catalog string that would rot the moment a translator
+  // improved one of the pair.
+  const nameHint = !typed
+    ? i18nT('components.skillForm.name_preview', { filename: '<name>' })
+    : nameProblem === 'no-stem'
+      ? i18nT('components.skillForm.invalid_name_hint')
+      : i18nT('components.skillForm.name_preview', { filename: stem })
 
   const switchToRaw = () => {
     const assembled = assembleSkillContent({ ...data, raw: undefined })
@@ -951,7 +1016,21 @@ export default function SkillForm({ data, onChange, hideIdentity, allowRaw = tru
           {/* label-has-for can't resolve the control through the custom <Input>
               component; the runtime association via htmlFor + id + aria-label is correct. */}
           <label htmlFor="skill-name" className="text-[13px] font-semibold text-text mb-1 block">{i18nT('components.skillForm.name')}</label>
-          <Input id="skill-name" aria-label={i18nT('components.skillForm.name')} placeholder={i18nT('components.skillForm.e_g_my_tool')} value={data.name} onChange={e => set('name', e.target.value)} className="w-full" />
+          <Input id="skill-name" aria-label={i18nT('components.skillForm.name')} aria-describedby={nameHintId} placeholder={i18nT('components.skillForm.e_g_my_tool')} value={data.name} onChange={e => set('name', e.target.value)} className="w-full" />
+          {/* The hint carries the one fact only the server used to know: the name
+              the file gets, computed from category-then-name as the server sees
+              it. It is associated (aria-describedby) rather than merely adjacent,
+              and announced on change (aria-live) so a screen-reader user learns
+              the name was rewritten, or that Create is disabled because the server
+              would refuse it. `polite` waits for a pause, so it does not speak on
+              every keystroke. */}
+          <p
+            id={nameHintId}
+            aria-live="polite"
+            className={`text-[11px] mt-1 ${nameProblem ? 'text-danger' : 'text-muted'}`}
+          >
+            {nameHint}
+          </p>
         </div>
         <div>
           <label htmlFor="skill-category" className="text-[13px] font-semibold text-text mb-1 block">{i18nT('components.skillForm.category')} <span className="text-muted font-normal">{i18nT('components.skillForm.optional')}</span></label>
