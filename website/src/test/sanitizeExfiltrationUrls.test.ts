@@ -100,4 +100,21 @@ describe('sanitizeExfiltrationUrls: unconditional tier applies to exempt hosts',
     const text = `link ${url} end`
     expect(sanitizeExfiltrationUrls(text)).toBe(text)
   })
+
+  it('does NOT redact a sub-200-char base64 blob at an exempt host (accepted residual)', () => {
+    // ACCEPTED-RESIDUAL PIN. This is the deliberate tradeoff, not a bug: for the
+    // exempt hosts the base64-blob and aggregate-length heuristics are skipped,
+    // so a query under 200 chars carrying a 40+ char base64 blob (but no literal
+    // AKIA/ssh/PEM/Slack credential marker and fewer than 20 consecutive %XX
+    // octets) rides through UNCHANGED. The guard is display-only (the agent can
+    // already fetch any URL via tools), so this is an accepted residual. Pinned
+    // here so a future re-tightening of the exempt tier fails loudly instead of
+    // silently changing this documented behavior.
+    const blob = 'A'.repeat(48) // 48-char base64 run; whole query stays < 200 chars
+    const url = `https://github.com/x/y/issues/new?body=${blob}`
+    const query = url.slice(url.indexOf('?') + 1)
+    expect(query.length).toBeLessThan(200)
+    const text = `see ${url} for details`
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
+  })
 })
