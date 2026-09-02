@@ -297,6 +297,7 @@ const slotKeyedMaps = (state: ChatState) => [
   state.slotContextPct, state.slotContextTokens, state.stopPressedAt,
   state.followups, state.folderSuggestions,
   state.pendingQuestions, state.subagentQueued,
+  state.automations,
   // A surviving pane marker makes a recreated slot's hydrate early-return into
   // nothing, so these must die with the transcript they describe. The retained
   // server count belongs with them: kept past an eviction it would read as a
@@ -311,9 +312,7 @@ const slotKeyedMaps = (state: ChatState) => [
  *  A reconcile can only evict a slot it visits, so this has to cover the same
  *  ephemeral surfaces `evictSlotState` clears — including the two that are not plain
  *  slot-keyed maps: `mcpApps`, whose keys carry the slot as a prefix, and
- *  `slotHistory`, where a slot can outlive every map entry. Retained automation
- *  evidence is deliberately excluded; only its authoritative seed/tombstone
- *  lifecycle removes it. */
+ *  `slotHistory`, where a slot can outlive every map entry. */
 const slotKeysWithResidue = (state: ChatState): Set<string> => new Set([
   ...slotKeyedMaps(state).flatMap(m => Object.keys(m)),
   ...Object.keys(state.mcpApps ?? {}).map(k => k.split(MCP_APP_KEY_SEP)[0]),
@@ -326,7 +325,8 @@ const slotKeysWithResidue = (state: ChatState): Set<string> => new Set([
  *  here, so the two cannot disagree about what a departing slot leaves behind.
  *  Both spellings are removed: `safeKey` is identity for ordinary slot names and
  *  a no-op on an already-rewritten key, so one pass covers a caller holding
- *  either form. Retained automation evidence outlives slot teardown. */
+ *  either form. Durable automation evidence remains on the server and is
+ *  available through the per-slot projection while the session exists. */
 /** Evict every slot carrying residue that the authoritative list does not name.
  *  Both authoritative writers (`sseSlots`, `fetchSlots.fulfilled`) reconcile
  *  through here, so neither can drift from the other. The active slot is never
@@ -2757,6 +2757,17 @@ export const selectSidebarWorkflowActive = createSelector(
 export const selectSidebarWorkflowActiveKeys = createSelector(
   [selectSidebarWorkflowActive],
   (active) => Object.keys(active),
+)
+
+/** Slot keys with a live automation. Memoization keeps the sidebar shell from
+ * repainting when only a probe count or terminal detail changes. */
+export const selectSidebarAutomationRunningKeys = createSelector(
+  [(state: RootState) => state.chat.automations],
+  (automations) => Object.values(automations ?? {})
+    .filter(record => record.kind === 'legacy_goal_loop'
+      ? record.active
+      : record.active && !record.terminal)
+    .map(record => record.slotKey),
 )
 
 /**

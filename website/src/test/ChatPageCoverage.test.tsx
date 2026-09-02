@@ -77,6 +77,7 @@ interface ChatInputProps {
   onAgentClick?: (rect: DOMRect) => void
   automation?: { kind?: string } | null
   automationCreationReady?: boolean
+  automationSnapshotFailed?: boolean
   onAutomationChange?: (automation: AutomationRecord | null) => void
 }
 let chatInputProps: ChatInputProps | null = null
@@ -373,6 +374,29 @@ afterEach(() => {
 })
 
 describe('ChatPage active-slot automation hydration', () => {
+  it('surfaces a failed snapshot and keeps bounded creation guarded', async () => {
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockRejectedValue(new Error('owner unavailable'))
+
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.automationSnapshotFailed).toBe(true))
+    expect(chatInputProps?.automationCreationReady).toBe(false)
+  })
+
+  it('caches a non-null mutation result before updating the store', async () => {
+    const next = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: null })
+    const { qc, store } = renderChatPage([])
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(true))
+
+    act(() => { chatInputProps?.onAutomationChange?.(next) })
+
+    expect(qc.getQueryData(['session-automation', 'chat-1'])).toEqual(next)
+    expect(store.getState().chat.automations['chat-1']).toEqual(next)
+  })
+
   it('forgets the cached legacy snapshot after a successful stop', async () => {
     const loop = {
       id: 'legacy-1', slot_key: 'chat-1', message: 'Keep going', idle_secs: 60,

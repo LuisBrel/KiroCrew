@@ -41,6 +41,7 @@ const activeMonitor: StructuredMonitor = {
 const activeLegacyLoop: LegacyGoalLoop = {
   kind: 'legacy_goal_loop', id: 'legacy-1', slotKey: 'chat-1', message: 'Keep checking.',
   idleSecs: 300, maxCycles: 24, cycleCount: 2, active: true, lastFireAt: 0,
+  nextDueAt: 1_900_000_000, maxRuntimeSecs: 14_400, stoppedReason: '',
 }
 
 function renderPopover(
@@ -112,9 +113,50 @@ describe('SessionAutomationPopover', () => {
 
     expect(screen.getByRole('button', { name: 'Start monitor' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Use legacy goal loop (costly)' }))
-      .toBeDisabled()
+      .toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
     expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('keeps Stop reachable for a live monitor with an unrecognized wire value', () => {
+    const invalid = normalizeAutomationRecord(structuredMonitorLoop({
+      last_decision: 'future_decision',
+    }))
+
+    renderPopover(invalid)
+
+    expect(screen.getByRole('button', { name: 'Stop monitor' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Restart monitor' })).toBeNull()
+  })
+
+  it('preserves the legacy loop deadline through the compatibility bridge', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_899_999_880_000)
+
+    renderPopover(activeLegacyLoop)
+
+    expect(screen.queryByText('Next cycle not yet scheduled')).toBeNull()
+    expect(screen.getByText(/Next cycle in/)).toBeInTheDocument()
+  })
+
+  it('surfaces a failed cold snapshot while leaving the server-guarded legacy fallback enabled', () => {
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <SessionAutomationPopover
+          slotKey="chat-1"
+          automation={null}
+          open
+          onOpenChange={() => {}}
+          onChange={() => {}}
+          creationReady={false}
+          snapshotFailed
+        />
+      </QueryClientProvider>,
+    )
+
+    expect(screen.getByText('The monitor request failed. Try again.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start monitor' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Use legacy goal loop (costly)' })).toBeEnabled()
   })
 
   it.each(['', '0', '-1', '1.5', 'NaN'])('rejects %j as an unbounded cadence', async value => {
@@ -303,6 +345,31 @@ describe('SessionAutomationPopover', () => {
     await waitFor(() => {
       expect(onChange).toHaveBeenCalledWith(normalizeAutomationRecord(response))
     })
+  })
+
+  it('does not resurrect a cleared monitor from a delayed create response', async () => {
+    let resolveCreate!: (value: unknown) => void
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockImplementation(() => (
+      new Promise(resolve => { resolveCreate = resolve })
+    ))
+    const { client, onChange, rerenderAutomation } = renderPopover(null)
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalled())
+
+    rerenderAutomation(activeMonitor)
+    rerenderAutomation(null)
+    await act(async () => {
+      resolveCreate({ ok: true, monitor: structuredMonitorLoop() })
+      await Promise.resolve()
+    })
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-automation', 'chat-1'] })
   })
 
   it('renders typed classification without decoding canonical provider facts', () => {

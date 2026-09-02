@@ -1427,13 +1427,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       }
       return structuredRecord ?? legacyRecord
     },
+    staleTime: 0,
   })
   // A live record wins over the cold read. After a removal frame, the WS hook
   // invalidates this query before clearing Redux, so stale cached absence or
   // presence can never enable a replacing create while the refresh is pending.
   const automation = liveAutomation ?? automationSnapshot.data ?? null
+  const automationId = automation?.id
   const automationCreationReady = !!automation
     || (automationSnapshot.isSuccess && !automationSnapshot.isFetching)
+  const automationSnapshotFailed = automationSnapshot.isError
   const approvalMode = useAppSelector(s => s.dashboard.approvalMode)
 
   // ── Reasoning effort dropdown click-outside ──
@@ -6708,7 +6711,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // bound to the slot, so a historical card never opens a successor loop's
     // controls.
     if (m.role === 'nudge') {
-      const ownLoop = nudgeMatchesLoop(m, automation?.id)
+      const ownLoop = nudgeMatchesLoop(m, automationId)
       return <NudgeCard key={key} message={m} disclosureKey={key} onOpenLoop={ownLoop ? () => setAutomationOpen(true) : undefined} />
     }
     if (m.kind === 'stop_event' || m.meta?.kind === 'stop_event') return <StopEventCard key={m.meta?.id as string ?? key} message={m} />
@@ -6840,7 +6843,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // through renderUserContentCb), so they are omitted to keep it stable.
     // cursorIsForActiveSlot/slotOldestIndex/handleLoadEarlier belong here: a switch
     // back restores the cursor while changing no other dep, stranding Fork shut.
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, automation, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot])
 
   // Hoisted out of the row map so every TurnBlock receives the SAME function
   // identity per render — an inline closure there re-created it per row per
@@ -8445,8 +8448,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               automation={automation}
               automationOpen={automationOpen}
               automationCreationReady={automationCreationReady}
+              automationSnapshotFailed={automationSnapshotFailed}
               onAutomationChange={(next: AutomationRecord | null) => {
-                if (next) dispatch(sseAutomation(next))
+                if (next) {
+                  queryClient.setQueryData(['session-automation', next.slotKey], next)
+                  dispatch(sseAutomation(next))
+                }
                 else if (automation?.kind === 'legacy_goal_loop') {
                   queryClient.setQueryData(['session-automation', automation.slotKey], null)
                   dispatch(sseAutomation({ ...automation, active: false }))

@@ -27,6 +27,8 @@ interface Props {
   onChange: (automation: AutomationRecord | null) => void
   /** True only after both per-slot REST reads prove creation cannot replace an unseen record. */
   creationReady?: boolean
+  /** The cold snapshot failed; create remains guarded while the server-backed legacy fallback stays reachable. */
+  snapshotFailed?: boolean
   interrupted?: boolean
 }
 
@@ -89,7 +91,9 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     cycle_count: loop.cycleCount,
     active: loop.active,
     last_fire_ts: loop.lastFireAt,
-    next_due_ts: 0,
+    next_due_ts: loop.nextDueAt ?? 0,
+    max_runtime_secs: loop.maxRuntimeSecs ?? 0,
+    stopped_reason: loop.stoppedReason,
   }
 }
 
@@ -121,6 +125,7 @@ export default function SessionAutomationPopover({
   onOpenChange,
   onChange,
   creationReady = true,
+  snapshotFailed = false,
   interrupted = false,
 }: Props) {
   const monitor = automation?.kind === 'structured_monitor' ? automation : null
@@ -174,13 +179,14 @@ export default function SessionAutomationPopover({
     },
     onSuccess: (result, request) => {
       const next = normalizeAutomationRecord(result.monitor)
-      if (automationRef.current === request.captured
+      if (request.captured !== null
+        && automationRef.current === request.captured
         && next?.kind === 'structured_monitor') {
         onChange(next)
       }
-      // Refetch remains the authoritative follow-up. Applying the bounded
-      // response above keeps disconnected clients current, while the captured
-      // identity prevents it from replacing a newer WebSocket frame.
+      // Refetch remains authoritative. Only an existing captured identity can
+      // safely accept the bounded response; a null create identity cannot be
+      // distinguished from a later clear tombstone.
       queryClient.invalidateQueries({ queryKey: ['session-automation', request.slotKey] })
       onOpenChange(false)
     },
@@ -547,11 +553,16 @@ export default function SessionAutomationPopover({
             {errors.request}
           </p>
         ) : null}
+        {!errors.request && snapshotFailed ? (
+          <p role="status" aria-live="polite" className={`mt-3 ${errorClass}`}>
+            {i18nT('components.sessionAutomationPopover.request_failed')}
+          </p>
+        ) : null}
 
         <div className="mt-4 flex flex-wrap justify-end gap-2">
           {!monitor ? (
             <>
-              <Btn type="button" disabled={!creationReady} onClick={() => setLegacyMode(true)}>{i18nT('components.sessionAutomationPopover.use_legacy_costly')}</Btn>
+              <Btn type="button" onClick={() => setLegacyMode(true)}>{i18nT('components.sessionAutomationPopover.use_legacy_costly')}</Btn>
               <SendBtn type="button" disabled={busy || !creationReady} onClick={writeMonitor}>{i18nT('components.sessionAutomationPopover.start_monitor')}</SendBtn>
             </>
           ) : terminal ? (

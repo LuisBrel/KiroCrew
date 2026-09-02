@@ -17,7 +17,7 @@ import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys, selectAutomationForSlot } from '../store/chatSlice'
+import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys, selectSidebarAutomationRunningKeys, selectAutomationForSlot } from '../store/chatSlice'
 import { sseSlotTitle, setSidebarOrder } from '../store/dashboardSlice'
 import { useDigitModifierHeld, jumpLabelFor, IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
@@ -1531,6 +1531,7 @@ const SessionRow = memo(function SessionRow({
     // never change rather than annotating a finished turn.
     const needsInputLabel = i18nT('pages.chatSidebar.needs_your_answer')
     const monitorStatus = monitor ? deriveAutomationStatus(monitor) : null
+    const monitorOwnsRunning = !!monitor && monitor.active && !monitor.terminal
     const monitorLabel = monitorStatus
       ? i18nT('components.sessionAutomationPopover.sidebar_status', {
         status: i18nT(MONITOR_STATUS_KEYS[monitorStatus]),
@@ -1671,7 +1672,7 @@ const SessionRow = memo(function SessionRow({
         key: 'goal_loop',
         when: !!goalLoop,
         build: () => (
-          <div className={ROW_STATUS_LINE_CLS} title={goalLoopStalled ? i18nT('pages.chatSidebar.goal_loop_interrupted_title') : goalLoop && goalLoop.max_cycles > 0 ? i18nT('pages.chatSidebar.goal_loop_cycle', { count: goalLoop.cycle_count, total: goalLoop.max_cycles }) : i18nT('pages.chatSidebar.goal_loop_cycle_no_cap', { count: goalLoop?.cycle_count ?? 0 })}>
+          <div className={ROW_STATUS_LINE_CLS} title={goalLoopStalled ? i18nT('pages.chatSidebar.goal_loop_interrupted_title') : goalLoop && goalLoop.maxCycles > 0 ? i18nT('pages.chatSidebar.goal_loop_cycle', { count: goalLoop.cycleCount, total: goalLoop.maxCycles }) : i18nT('pages.chatSidebar.goal_loop_cycle_no_cap', { count: goalLoop?.cycleCount ?? 0 })}>
             <Goal size={ROW_ICON_PX} className={`shrink-0 ${goalLoopStalled ? 'text-danger' : 'text-accent animate-pulse'}`} aria-hidden />
             <span className="truncate"><span className={`font-medium ${goalLoopStalled ? 'text-danger' : 'text-accent'}`}>{goalLoopLabel}{goalLoopStalled ? ` — ${i18nT('pages.chatSidebar.loop_interrupted')}` : ''}</span>{goalLoopDetail ? <span className="text-muted"> · {goalLoopDetail}</span> : null}</span>
           </div>
@@ -1711,7 +1712,7 @@ const SessionRow = memo(function SessionRow({
         // with a definite direction, and rotation reads as progress where a
         // fading dot reads as a mere marker.
         key: 'running',
-        when: isRunning && (!monitor || s.running),
+        when: isRunning && (!monitorOwnsRunning || s.running),
         build: () => {
           const text = slotStatusText(statusDetail, simplifiedToolNames, uiLang)
           // `title` because this is the one status text that is unbounded — a tool
@@ -1729,7 +1730,8 @@ const SessionRow = memo(function SessionRow({
         // Passive monitor state is useful only after stronger row signals have
         // had their turn. An unread completion wins over retained terminal state.
         key: 'structured_monitor_passive',
-        when: !!monitor && monitorStatus !== 'action_running' && !isUnread,
+        when: !!monitor && monitor.active && !monitor.terminal
+          && monitorStatus !== 'action_running' && !isUnread,
         build: () => (
           <div className={ROW_STATUS_LINE_CLS} title={monitorLabel}>
             <MonitorRadar
@@ -2726,11 +2728,7 @@ function ChatSidebar({
   const workflowActiveSet = useMemo(() => new Set(workflowActiveKeys), [workflowActiveKeys])
   // As above, the shell needs only active automation membership. A probe count
   // or terminal detail update re-renders its row without repainting the list.
-  const automationRunningKeys = useAppSelector(s => Object.values(s.chat.automations ?? {})
-    .filter(record => record.kind === 'legacy_goal_loop'
-      ? record.active
-      : record.active && !record.terminal)
-    .map(record => record.slotKey), shallowEqual)
+  const automationRunningKeys = useAppSelector(selectSidebarAutomationRunningKeys, shallowEqual)
   const automationRunningSet = useMemo(
     () => new Set(automationRunningKeys),
     [automationRunningKeys],

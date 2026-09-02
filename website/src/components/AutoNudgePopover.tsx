@@ -22,6 +22,8 @@ export interface AutoNudgeLoop {
    *  Already serialized by the backend's `asdict(loop)` — the field simply
    *  was not surfaced here before (#6482). */
   next_due_ts: number
+  max_runtime_secs?: number
+  stopped_reason?: string
 }
 
 interface Props {

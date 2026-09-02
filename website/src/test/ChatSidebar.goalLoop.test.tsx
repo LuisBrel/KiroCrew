@@ -240,9 +240,11 @@ describe('chat sidebar — structured monitor status', () => {
     expect(container.querySelector('.lucide-radar.animate-pulse')).toBeNull()
   })
 
-  it('retains a budget-stopped monitor as a static terminal status', () => {
-    const slots = [{ key: 'k', title: 'monitor', running: false, messages: 5 }]
-    const { getByText, container } = renderSidebar(slots, {
+  it('lets a retained terminal monitor yield the row to its last message', () => {
+    const slots = [{
+      key: 'k', title: 'monitor', running: false, messages: 5, last_message: 'final answer',
+    }]
+    const { getByText, queryByText, container } = renderSidebar(slots, {
       automations: { k: structuredMonitor({
         active: false,
         action: { wakeInFlight: false, wakeDelivery: '' },
@@ -250,7 +252,8 @@ describe('chat sidebar — structured monitor status', () => {
       }) },
     })
 
-    expect(getByText('Monitor · budget stopped')).toBeTruthy()
+    expect(getByText('final answer')).toBeTruthy()
+    expect(queryByText(/Monitor/)).toBeNull()
     expect(container.querySelector('.lucide-radar.animate-pulse')).toBeNull()
   })
 

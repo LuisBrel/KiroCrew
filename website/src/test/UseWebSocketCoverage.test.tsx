@@ -844,6 +844,8 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().automations[ACTIVE]).toMatchObject({ kind: 'structured_monitor' })
+    expect(testQueryClient.getQueryData(['session-automation', ACTIVE]))
+      .toMatchObject({ kind: 'structured_monitor' })
 
     act(() => {
       ws.simulateMessage({

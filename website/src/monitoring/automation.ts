@@ -46,6 +46,8 @@ export interface LegacyGoalLoop {
   cycleCount: number
   active: boolean
   lastFireAt: number
+  nextDueAt?: number
+  maxRuntimeSecs?: number
   stoppedReason: string
 }
 
@@ -159,14 +161,19 @@ function owns(value: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key)
 }
 
-function structuredFallback(loop: JsonObject, monitor: JsonObject | null): StructuredMonitor {
+function structuredFallback(
+  loop: JsonObject,
+  monitor: JsonObject | null,
+  slotKey: string,
+): StructuredMonitor {
   const budgets = object(monitor?.budgets)
   const outcome = text(monitor?.outcome)
+  const active = loop.active === true && !outcome
   return {
     kind: 'structured_monitor',
     id: text(loop.id),
-    slotKey: dashboardAutomationSlotKey(text(loop.slot_key)),
-    active: false,
+    slotKey,
+    active,
     actionable: false,
     version: positive(monitor?.version, 1),
     monitorKind: text(monitor?.kind, 'unknown'),
@@ -197,18 +204,14 @@ function structuredFallback(loop: JsonObject, monitor: JsonObject | null): Struc
       tokenUsageKnown: monitor?.token_usage_known === true,
     },
     action: {
-      wakeInFlight: false,
-      wakeDelivery: '',
+      wakeInFlight: monitor?.wake_in_flight === true,
+      wakeDelivery: text(monitor?.wake_delivery),
     },
     terminal: outcome ? {
       outcome,
       reason: text(monitor?.stopped_reason, text(loop.stopped_reason)),
       stoppedAt: finite(monitor?.stopped_at),
-    } : {
-      outcome: 'blocked',
-      reason: 'invalid_monitor_record',
-      stoppedAt: finite(monitor?.stopped_at),
-    },
+    } : null,
   }
 }
 
@@ -238,6 +241,8 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       cycleCount: count(loop.cycle_count),
       active: !removed && loop.active === true,
       lastFireAt: finite(loop.last_fire_ts),
+      nextDueAt: finite(loop.next_due_ts),
+      maxRuntimeSecs: count(loop.max_runtime_secs),
       stoppedReason: text(loop.stopped_reason),
     }
   }
@@ -316,7 +321,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     && monitor.wake_instructions.length
       <= STRUCTURED_MONITOR_LIMITS.wakeInstructions.maximumLength
     && lifecycleValid
-  if (!supported) return structuredFallback(loop, monitor)
+  if (!supported) return structuredFallback(loop, monitor, slotKey)
 
   return {
     kind: 'structured_monitor',
@@ -329,7 +334,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     objective: text(monitor.objective),
     target: text(monitor.target),
     cadenceSecs: positive(monitor.cadence_secs, STRUCTURED_MONITOR_DEFAULTS.cadenceSecs),
-    nextProbeAt: finite(monitor.next_probe_at, finite(loop.next_due_ts)),
+    nextProbeAt: finite(monitor.next_probe_at) || finite(loop.next_due_ts),
     wakeInstructions: text(monitor.wake_instructions),
     budgets: {
       maxRuntimeSecs: positive(budgets.max_runtime_secs, STRUCTURED_MONITOR_DEFAULTS.maxRuntimeSecs),
@@ -377,7 +382,8 @@ export function deriveAutomationStatus(record: AutomationRecord): MonitorStatus 
   if (record.action.wakeInFlight && record.action.wakeDelivery === 'dispatched') {
     return 'action_running'
   }
-  if (record.latest.decision === 'retry_provider' || record.action.wakeDelivery === 'busy') {
+  if (record.latest.decision === 'retry_provider'
+    || (record.action.wakeInFlight && record.action.wakeDelivery === 'busy')) {
     return 'backing_off'
   }
   return record.usage.probes === 0 ? 'arm_pending' : 'active'

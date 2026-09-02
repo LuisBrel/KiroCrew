@@ -190,6 +190,7 @@ describe('slot teardown parity', () => {
     'slotMessages', 'slotActivity', 'slotRun', 'slotHydrated', 'slotSide',
     'slotSideClosed', 'slotStatusDetail', 'slotContextPct', 'slotContextTokens',
     'stopPressedAt', 'followups', 'folderSuggestions', 'subagentQueued',
+    'automations',
     'slotPaneHasMore', 'slotPaneBounded',
     // Client-only and unrecoverable, so a slot that leaves has to take it with it.
     'thinkingOrphans',
@@ -204,7 +205,6 @@ describe('slot teardown parity', () => {
     for (const map of perSlotMaps) {
       expect(keysOf(next, map)).toEqual(['chat-1'])
     }
-    expect(next.automations['chat-2']).toEqual(terminalMonitor('chat-2'))
     expect(next.slotHistory).toEqual(['chat-1'])
   })
 

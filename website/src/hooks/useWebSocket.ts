@@ -370,6 +370,18 @@ export function useWebSocket() {
       automationSeedQueuedRef.current = false
       const seedGen = ++automationSeedGenRef.current
       const liveAtStart = new Map(automationLiveGenRef.current)
+      const cacheUpdatesAtStart = new Map<string, number>()
+      for (const [queryKey] of queryClient.getQueriesData<
+        ReturnType<typeof normalizeAutomationRecord>
+      >({ queryKey: ['session-automation'] })) {
+        if (queryKey.length === 2 && typeof queryKey[1] === 'string') {
+          const slotKey = dashboardAutomationSlotKey(queryKey[1])
+          cacheUpdatesAtStart.set(
+            slotKey,
+            queryClient.getQueryState(queryKey)?.dataUpdateCount ?? 0,
+          )
+        }
+      }
       // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
       // connect handler, ahead of notification sync and the subagent subscribe, so
       // an exception escaping here would silently strand those — a cosmetic seed
@@ -415,19 +427,37 @@ export function useWebSocket() {
             ? (legacyResult.value.loops ?? []).map(normalizeAutomationRecord)
                 .filter(record => record?.kind === 'legacy_goal_loop')
             : []
-          const structuredRecords = structuredStarted && monitorResult.status === 'fulfilled'
+          const structuredSnapshotRecords = structuredStarted && monitorResult.status === 'fulfilled'
             ? (monitorResult.value.monitors ?? []).map(normalizeAutomationRecord)
                 .filter(record => record?.kind === 'structured_monitor')
             : []
           const stillFresh = (record: NonNullable<ReturnType<typeof normalizeAutomationRecord>>) =>
             (automationLiveGenRef.current.get(record.slotKey) ?? 0)
               === (liveAtStart.get(record.slotKey) ?? 0)
-          const protectedSlots = [...automationLiveGenRef.current]
+          const protectedSlotSet = new Set([...automationLiveGenRef.current]
             .filter(([slot, generation]) => generation !== (liveAtStart.get(slot) ?? 0))
-            .map(([slot]) => slot)
-          const records = [...legacyRecords, ...structuredRecords].filter(stillFresh)
-          const presentSlots = new Set(records.map(record => record.slotKey))
-          const protectedSlotSet = new Set(protectedSlots)
+            .map(([slot]) => slot))
+          for (const [queryKey] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ['session-automation'] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== 'string') continue
+            const slotKey = dashboardAutomationSlotKey(queryKey[1])
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) {
+              protectedSlotSet.add(slotKey)
+            }
+          }
+          const protectedSlots = [...protectedSlotSet]
+          const records = [...legacyRecords, ...structuredSnapshotRecords.filter(record => record.active)]
+            .filter(record => stillFresh(record) && !protectedSlotSet.has(record.slotKey))
+          // Terminal monitors stay out of the global Redux collection, but they
+          // still prove that an existing per-slot evidence cache is present.
+          const presentSlots = new Set([
+            ...records.map(record => record.slotKey),
+            ...structuredSnapshotRecords
+              .filter(record => stillFresh(record) && !protectedSlotSet.has(record.slotKey))
+              .map(record => record.slotKey),
+          ])
           for (const [queryKey, cached] of queryClient.getQueriesData<
             ReturnType<typeof normalizeAutomationRecord>
           >({ queryKey: ['session-automation'] })) {
@@ -435,6 +465,11 @@ export function useWebSocket() {
               || queryKey.length !== 2
               || protectedSlotSet.has(cached.slotKey)
               || presentSlots.has(cached.slotKey)) continue
+            // A mutation or focused REST refetch may populate this per-slot
+            // cache while the reconnect snapshot is still in flight. Only an
+            // entry known to predate the seed can be absent authoritatively.
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(cached.slotKey)) continue
             const complete = cached.kind === 'legacy_goal_loop'
               ? legacyComplete
               : structuredComplete
@@ -1807,11 +1842,10 @@ export function useWebSocket() {
                 // A failed refetch must not leave the detail query able to
                 // resurrect a record the live stream authoritatively removed.
                 queryClient.setQueryData(['session-automation', slot], null)
+                // The removal is authoritative for the current frame, but a
+                // refresh still catches a successor created concurrently.
+                queryClient.invalidateQueries({ queryKey: ['session-automation', slot] })
               }
-              // The active composer uses a per-slot REST read as its
-              // create-safety proof. Refresh that proof before applying a live
-              // removal so cached absence/presence cannot enable replacement.
-              queryClient.invalidateQueries({ queryKey: ['session-automation', slot] })
               // Bump BEFORE dispatching so an in-flight seed is invalidated even
               // if its .then() runs immediately after this frame is handled.
               automationLiveGenRef.current.set(
@@ -1823,7 +1857,13 @@ export function useWebSocket() {
                 break
               }
               const record = normalizeAutomationRecord(nudge)
-              if (record) dispatch(sseAutomation(record))
+              if (record) {
+                // The live projection is already authoritative and normalized;
+                // cache it directly instead of issuing one REST request for
+                // every probe frame.
+                queryClient.setQueryData(['session-automation', slot], record)
+                dispatch(sseAutomation(record))
+              }
             }
             break
           }

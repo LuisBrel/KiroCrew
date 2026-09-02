@@ -16,7 +16,8 @@ describe('automation transport normalizer', () => {
     expect(record).toEqual({
       kind: 'legacy_goal_loop', id: 'legacy-1', slotKey: 'chat-1',
       message: 'Keep going', idleSecs: 60, maxCycles: 0, cycleCount: 7,
-      active: true, lastFireAt: 123, stoppedReason: '',
+      active: true, lastFireAt: 123, nextDueAt: 0, maxRuntimeSecs: 0,
+      stoppedReason: '',
     })
   })
 
@@ -138,10 +139,14 @@ describe('automation transport normalizer', () => {
     ['observation reason', { last_observation_reason_code: null }],
   ])('fails closed for a malformed current-schema %s', (_name, patch) => {
     const record = normalizeAutomationRecord(structuredLoop(patch))
+    const expectedActive = !('active' in patch) || patch.active !== false
 
     expect(record).toMatchObject({
-      kind: 'structured_monitor', actionable: false, active: false,
+      kind: 'structured_monitor',
+      actionable: false,
+      active: expectedActive,
     })
+    if (expectedActive) expect(record).toMatchObject({ terminal: null })
   })
 
   it.each([
@@ -218,5 +223,16 @@ describe('automation transport normalizer', () => {
   ] as const)('reports monitor state %s as %s', (patch, expected) => {
     const record = normalizeAutomationRecord(structuredLoop(patch))
     expect(deriveAutomationStatus(record!)).toBe(expected)
+  })
+
+  it('does not retain a stale busy delivery after the wake is no longer in flight', () => {
+    const record = normalizeAutomationRecord(structuredLoop({
+      probe_count: 1,
+      wake_in_flight: false,
+      wake_delivery: 'busy',
+      last_decision: 'no_change',
+    }))
+
+    expect(deriveAutomationStatus(record!)).toBe('active')
   })
 })

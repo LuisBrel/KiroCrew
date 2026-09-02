@@ -1876,9 +1876,11 @@ evidence. The generic service update also fails closed for structured records.
 The active chat does not depend on a successful WebSocket handshake to discover
 the one-record invariant. It reads both per-slot REST projections through one
 React Query entry, fails closed on a malformed, conflicting, or failed snapshot,
-and keeps bounded-monitor Start and the legacy-create handoff disabled until both
-reads prove the slot empty. A live automation frame invalidates that slot query
-before its Redux upsert is applied. A removal frame first replaces the cached
+and keeps bounded-monitor Start disabled until both reads prove the slot empty.
+The legacy-create handoff remains available after a read failure because its
+server-side create-only lock rejects a concurrent record without replacement.
+A live automation frame updates that slot query alongside its Redux upsert. A
+removal frame first replaces the cached
 slot snapshot with `null`, then invalidates it and applies the Redux tombstone;
 a failed refresh therefore cannot resurrect the removed record, while an
 in-flight refresh still keeps creation disabled. A live normalized record still
@@ -1888,6 +1890,9 @@ of trusting their response body, preserving live-frame precedence while still
 rehydrating the result when no WebSocket is available. The active-slot REST snapshot
 remains query-local: it can render while disconnected, but its record or absence never
 mutates the Redux collection and therefore cannot overwrite or delete a newer live frame.
+The reconnect-wide collection seeds only active monitors; terminal evidence is hydrated
+through that per-slot projection and is evicted locally with its session, so retained
+server evidence cannot grow the sidebar's process-lifetime slot map without bound.
 After a successful legacy stop, the chat clears that slot's REST snapshot before removing
 the Redux record, so reopening the editor while WebSocket delivery is unavailable cannot
 revive the stopped loop from cached state.
@@ -1928,7 +1933,10 @@ removal, so `slack:<ts>` state addresses the visible `slack_<ts>` slot. A live
 frame for one slot does not discard unaffected legacy or terminal records from the
 seed. When a complete seed omits a cached slot, it tombstones that slot's React
 Query detail entry alongside the Redux removal, so the cold snapshot cannot
-revive the removed automation. Structured state wins if both responses name one slot.
+revive the removed automation. The omission may tombstone only a detail entry whose
+React Query update timestamp predates the seed; a mutation or focused REST refresh
+that lands while the seed is in flight is newer evidence and survives. Structured
+state wins if both responses name one slot.
 Chat detail and sidebar select from that collection, so target, status, activity
 lanes, and terminal retention cannot disagree because two components cached
 different wire records. Slot teardown clears ephemeral conversation state but
