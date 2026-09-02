@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import subprocess
 from collections.abc import Sequence
@@ -17,8 +18,10 @@ from kiro_crew.monitoring.github_pull_request import (
     parse_github_pull_request_target,
 )
 from kiro_crew.monitoring.models import (
+    MonitorBudgets,
     MonitorDecision,
     MonitorObservationStatus,
+    MonitorOutcome,
     MonitorState,
     ProviderErrorKind,
     monitor_state_to_dict,
@@ -60,11 +63,17 @@ def _primary(**changes: object) -> dict[str, object]:
 
 
 def _threads(
-    nodes: list[dict[str, object]] | None = None,
+    nodes: Sequence[object] | None = None,
     *,
     has_next: bool = False,
     cursor: str | None = None,
 ) -> dict[str, object]:
+    normalized_nodes: list[object] = []
+    source_nodes = list(nodes) if nodes is not None else [{"isResolved": True}] * 2
+    for node in source_nodes:
+        if isinstance(node, dict) and "isOutdated" not in node:
+            node = {**node, "isOutdated": False}
+        normalized_nodes.append(node)
     return {
         "data": {
             "repository": {
@@ -74,11 +83,7 @@ def _threads(
                             "hasNextPage": has_next,
                             "endCursor": cursor,
                         },
-                        "nodes": (
-                            nodes
-                            if nodes is not None
-                            else [{"isResolved": True}, {"isResolved": True}]
-                        ),
+                        "nodes": normalized_nodes,
                     }
                 }
             }
@@ -98,7 +103,20 @@ class _FakeRunner:
 
 
 def _provider(*payloads: dict[str, object]) -> tuple[GitHubPullRequestProvider, _FakeRunner]:
-    runner = _FakeRunner(payloads)
+    expanded: list[dict[str, object]] = []
+    for payload in payloads:
+        if payload.get("state") == "OPEN" and "statusCheckRollup" in payload:
+            primary = deepcopy(payload)
+            expanded.append(primary)
+            expanded.append(
+                {
+                    "headRefOid": primary["headRefOid"],
+                    "statusCheckRollup": primary.pop("statusCheckRollup"),
+                }
+            )
+        else:
+            expanded.append(payload)
+    runner = _FakeRunner(expanded)
     return (
         GitHubPullRequestProvider(
             resolver=lambda: "/trusted/bin/gh",
@@ -175,6 +193,7 @@ def test_clean_pull_request_has_allowlisted_canonical_observation_and_fingerprin
             "pending": [],
             "unknown": [],
         },
+        "checks_complete": True,
         "draft": False,
         "head_revision": _HEAD,
         "kind": "github_pull_request",
@@ -188,7 +207,7 @@ def test_clean_pull_request_has_allowlisted_canonical_observation_and_fingerprin
     assert result.observation.status is MonitorObservationStatus.SUCCESS
     assert result.observation.reason_code == "review_ready"
     assert result.observation.fingerprint == (
-        "8d7a3844c6c0c44350e62e7823a62c941b9484a140a517326c630e780a8be30f"
+        "fe6dc90df56bdd1b5f40dc900d3c8af145899e64fbeeac3c86f296cd481d63c5"
     )
     primary_argv, primary_kwargs = runner.calls[0]
     assert primary_argv == [
@@ -197,10 +216,7 @@ def test_clean_pull_request_has_allowlisted_canonical_observation_and_fingerprin
         "view",
         "https://github.com/owner/repo/pull/123",
         "--json",
-        (
-            "number,state,isDraft,headRefOid,mergeable,mergeStateStatus,"
-            "reviewDecision,statusCheckRollup"
-        ),
+        ("number,state,isDraft,headRefOid,mergeable,mergeStateStatus," "reviewDecision"),
     ]
     assert primary_kwargs["audit_caller"] == "core:monitor"
     assert primary_kwargs["pin_host"] == "github.com"
@@ -274,11 +290,11 @@ def test_check_identity_is_redacted_before_it_enters_canonical_state() -> None:
     serialized = json.dumps(result.canonical, sort_keys=True)
     assert token not in serialized
     assert "internal.example.test" not in serialized
-    assert "request?id" not in serialized
+    assert "id=secret" not in serialized
 
 
-def test_latest_check_rerun_wins_without_collection_order_affecting_fingerprint() -> None:
-    """Choosing list order instead of the latest run can hide or invent a failure."""
+def test_same_label_check_runs_remain_independent_without_order_affecting_fingerprint() -> None:
+    """Display labels cannot prove that distinct workflow runs supersede each other."""
     older_failure = {
         "__typename": "CheckRun",
         "name": "test",
@@ -297,7 +313,7 @@ def test_latest_check_rerun_wins_without_collection_order_affecting_fingerprint(
         "conclusion": "SUCCESS",
         "startedAt": "2026-08-22T00:00:00Z",
         "completedAt": "2026-08-22T00:01:00Z",
-        "detailsUrl": "https://github.com/owner/repo/actions/runs/100/job/202",
+        "detailsUrl": "https://github.com/owner/repo/actions/runs/200/job/202",
     }
     first_provider, _ = _provider(
         _primary(statusCheckRollup=[older_failure, newer_success]),
@@ -312,16 +328,45 @@ def test_latest_check_rerun_wins_without_collection_order_affecting_fingerprint(
     second = second_provider.probe("https://github.com/owner/repo/pull/123")
 
     assert first.canonical["checks"] == {
-        "failed": [],
+        "failed": ["CI / test"],
         "passed": ["CI / test"],
         "pending": [],
         "unknown": [],
     }
+    assert first.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert first.observation.reason_code == "checks_failed"
     assert first.observation.fingerprint == second.observation.fingerprint
 
 
-def test_independent_same_named_workflows_remain_distinct() -> None:
-    """Display labels cannot collapse checks from separate workflow runs."""
+def test_duplicate_failed_check_rows_preserve_multiplicity_in_the_fingerprint() -> None:
+    """A second same-labelled blocker must change the durable observation."""
+    first_provider, _ = _provider(
+        _primary(statusCheckRollup=[_check_run(conclusion="FAILURE")]),
+        _threads(),
+    )
+    second_provider, _ = _provider(
+        _primary(
+            statusCheckRollup=[
+                _check_run(conclusion="FAILURE"),
+                {
+                    **_check_run(conclusion="FAILURE"),
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/200/job/202",
+                },
+            ]
+        ),
+        _threads(),
+    )
+
+    first = first_provider.probe("https://github.com/owner/repo/pull/123")
+    second = second_provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert first.canonical["checks"]["failed"] == ["CI / test"]
+    assert second.canonical["checks"]["failed"] == ["CI / test", "CI / test"]
+    assert first.observation.fingerprint != second.observation.fingerprint
+
+
+def test_distinct_workflow_dispatches_with_same_labels_remain_independent() -> None:
+    """A new run id cannot identify which workflow definition produced a check."""
     provider, _ = _provider(
         _primary(
             statusCheckRollup=[
@@ -351,6 +396,68 @@ def test_independent_same_named_workflows_remain_distinct() -> None:
     assert result.observation.reason_code == "checks_failed"
 
 
+def test_independent_workflows_with_same_check_name_remain_distinct() -> None:
+    provider, _ = _provider(
+        _primary(
+            statusCheckRollup=[
+                {
+                    **_check_run(conclusion="FAILURE"),
+                    "workflowName": "Backend",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/100/job/201",
+                },
+                {
+                    **_check_run(conclusion="SUCCESS"),
+                    "workflowName": "Frontend",
+                    "startedAt": "2026-08-23T00:00:00Z",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/200/job/301",
+                },
+            ]
+        ),
+        _threads(),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["checks"] == {
+        "failed": ["Backend / test"],
+        "passed": ["Frontend / test"],
+        "pending": [],
+        "unknown": [],
+    }
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+
+
+def test_independent_same_workflow_jobs_with_same_name_remain_distinct() -> None:
+    """Display names cannot prove that two check runs are rerun attempts."""
+    provider, _ = _provider(
+        _primary(
+            statusCheckRollup=[
+                {
+                    **_check_run(conclusion="FAILURE"),
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/100/job/201",
+                    "startedAt": "2026-08-21T00:00:00Z",
+                },
+                {
+                    **_check_run(conclusion="SUCCESS"),
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/100/job/202",
+                    "startedAt": "2026-08-22T00:00:00Z",
+                },
+            ]
+        ),
+        _threads(),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["checks"] == {
+        "failed": ["CI / test"],
+        "passed": ["CI / test"],
+        "pending": [],
+        "unknown": [],
+    }
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+
+
 def test_distinct_raw_check_identities_cannot_collapse_during_redaction() -> None:
     """Sanitization must not let one provider check hide another check's failure."""
     provider, _ = _provider(
@@ -378,8 +485,8 @@ def test_distinct_raw_check_identities_cannot_collapse_during_redaction() -> Non
     assert result.canonical["checks"]["passed"] == ["CI / [provider-url]"]
 
 
-def test_same_named_check_runs_without_stable_identity_remain_distinct() -> None:
-    """Rows without a stable run identity cannot be assumed to be reruns."""
+def test_same_workflow_checks_without_dispatch_identity_remain_independent() -> None:
+    """A display-name match alone cannot prove that one job supersedes another."""
     provider, _ = _provider(
         _primary(
             statusCheckRollup=[
@@ -465,8 +572,8 @@ def test_status_context_failure_cannot_be_hidden_by_same_named_check_run() -> No
     assert result.observation.status is MonitorObservationStatus.ACTIONABLE
 
 
-def test_startedless_queued_rerun_supersedes_an_older_completed_run() -> None:
-    """A newly queued run has no timestamp but must not expose a stale green state."""
+def test_same_dispatch_queued_attempt_cannot_hide_an_older_completion() -> None:
+    """Ambiguous same-dispatch attempts remain independent and fail closed."""
     queued = _check_run(status="QUEUED", conclusion="")
     queued["startedAt"] = None
     queued["detailsUrl"] = "https://github.com/owner/repo/actions/runs/100/job/202"
@@ -486,7 +593,7 @@ def test_startedless_queued_rerun_supersedes_an_older_completed_run() -> None:
 
     assert result.canonical["checks"] == {
         "failed": [],
-        "passed": [],
+        "passed": ["CI / test"],
         "pending": ["CI / test"],
         "unknown": [],
     }
@@ -553,8 +660,26 @@ def _check_run(*, status: str = "COMPLETED", conclusion: str = "SUCCESS") -> dic
         (
             {"mergeStateStatus": "BLOCKED"},
             None,
-            MonitorObservationStatus.ACTIONABLE,
-            "merge_blocked",
+            MonitorObservationStatus.PENDING,
+            "mergeability_pending",
+        ),
+        (
+            {
+                "mergeStateStatus": "BLOCKED",
+                "statusCheckRollup": [_check_run(status="IN_PROGRESS", conclusion="")],
+            },
+            None,
+            MonitorObservationStatus.PENDING,
+            "checks_pending",
+        ),
+        (
+            {
+                "mergeStateStatus": "BLOCKED",
+                "reviewDecision": "REVIEW_REQUIRED",
+            },
+            None,
+            MonitorObservationStatus.PENDING,
+            "review_required",
         ),
         (
             {"isDraft": True},
@@ -738,8 +863,8 @@ def test_review_threads_paginate_and_fold_order_independently() -> None:
     assert first.canonical["unresolved_review_threads"] == 1
     assert first.canonical["review_threads_complete"] is True
     assert first.observation.fingerprint == second.observation.fingerprint
-    assert len(first_runner.calls) == 3
-    assert "cursor=cursor-1" in first_runner.calls[2][0]
+    assert len(first_runner.calls) == 4
+    assert "cursor=cursor-1" in first_runner.calls[3][0]
 
 
 def test_review_thread_string_variables_use_raw_graphql_fields() -> None:
@@ -752,8 +877,8 @@ def test_review_thread_string_variables_use_raw_graphql_fields() -> None:
 
     provider.probe("https://github.com/123/true/pull/123")
 
-    first_page = runner.calls[1][0]
-    second_page = runner.calls[2][0]
+    first_page = runner.calls[2][0]
+    second_page = runner.calls[3][0]
     assert ["-f", "owner=123"] == first_page[5:7]
     assert ["-f", "repo=true"] == first_page[7:9]
     assert ["-F", "number=123"] == first_page[9:11]
@@ -777,7 +902,8 @@ def test_review_thread_page_cap_is_pending_instead_of_success() -> None:
     assert result.canonical["review_threads_complete"] is False
     assert result.observation.status is MonitorObservationStatus.PENDING
     assert result.observation.reason_code == "review_threads_incomplete"
-    assert len(runner.calls) == 11
+    assert result.observation.supplemental_provider_error is None
+    assert len(runner.calls) == 12
 
 
 def test_review_thread_missing_next_cursor_is_pending_instead_of_success() -> None:
@@ -792,7 +918,7 @@ def test_review_thread_missing_next_cursor_is_pending_instead_of_success() -> No
     assert result.canonical["review_threads_complete"] is False
     assert result.observation.status is MonitorObservationStatus.PENDING
     assert result.observation.reason_code == "review_threads_incomplete"
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 3
 
 
 def test_review_thread_graphql_errors_make_partial_data_pending() -> None:
@@ -809,8 +935,8 @@ def test_review_thread_graphql_errors_make_partial_data_pending() -> None:
     assert "provider-controlled detail" not in repr(result)
 
 
-def test_review_thread_graphql_errors_without_usable_data_are_provider_error() -> None:
-    """An error-only GraphQL envelope cannot replace the last valid observation."""
+def test_review_thread_graphql_errors_without_usable_data_preserve_primary_facts() -> None:
+    """An error-only supplemental envelope cannot erase a valid primary observation."""
     provider, _ = _provider(
         _primary(),
         {"data": None, "errors": [{"message": "provider-controlled detail"}]},
@@ -821,16 +947,37 @@ def test_review_thread_graphql_errors_without_usable_data_are_provider_error() -
         previous_observation={"head_revision": "previous-head"},
     )
 
-    assert result.response is None
-    assert result.canonical == {}
-    assert result.observation.provider_error is ProviderErrorKind.TRANSIENT
-    assert result.observation.reason_code == "provider_malformed_response"
+    assert result.response is not None
+    assert result.canonical["head_revision"] == _HEAD
+    assert result.canonical["review_threads_complete"] is False
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.TRANSIENT
+    assert result.observation.reason_code == "review_threads_incomplete"
     assert "provider-controlled detail" not in repr(result)
 
 
+def test_generic_blocked_state_preserves_supplemental_provider_error() -> None:
+    """GitHub's generic BLOCKED state is uncertainty, not a known blocker."""
+    provider, _ = _provider(
+        _primary(mergeStateStatus="BLOCKED"),
+        {"data": None, "errors": [{"message": "provider-controlled detail"}]},
+    )
+
+    result = provider.probe(
+        "https://github.com/owner/repo/pull/123",
+        previous_observation={"head_revision": "previous-head"},
+    )
+
+    assert result.response is not None
+    assert result.canonical["mergeability"] == "blocked"
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.TRANSIENT
+    assert result.observation.reason_code == "review_threads_incomplete"
+
+
 @pytest.mark.asyncio
-async def test_shadow_graphql_error_without_data_preserves_last_observation() -> None:
-    """The error-only GraphQL path cannot overwrite durable readiness facts."""
+async def test_shadow_graphql_error_without_data_persists_new_primary_facts() -> None:
+    """Readable primary facts remain durable while supplemental evidence retries."""
     provider, _ = _provider(
         _primary(),
         {"data": None, "errors": [{"message": "provider-controlled detail"}]},
@@ -852,8 +999,9 @@ async def test_shadow_graphql_error_without_data_preserves_last_observation() ->
     decision = await run_shadow_probe(state, provider, persist, now=1_100.0)
 
     assert decision is MonitorDecision.RETRY_PROVIDER
-    assert state.last_observation == previous
-    assert state.last_fingerprint == "safe-fingerprint"
+    assert state.last_observation["head_revision"] == _HEAD
+    assert state.last_observation["review_threads_complete"] is False
+    assert state.last_fingerprint != "safe-fingerprint"
     assert state.provider_error_count == 1
     assert state.consecutive_provider_errors == 1
     assert "provider-controlled detail" not in repr(snapshots)
@@ -864,6 +1012,201 @@ def test_review_thread_graphql_errors_preserve_observed_unresolved_nodes() -> No
     partial = _threads([{"isResolved": False}])
     partial["errors"] = [{"message": "partial review evidence"}]
     provider, _ = _provider(_primary(), partial)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["review_threads_complete"] is False
+    assert result.canonical["unresolved_review_threads"] == 1
+    assert result.canonical["blocking_review"] == "unresolved_threads"
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.reason_code == "unresolved_review_threads"
+
+
+def test_review_thread_request_failure_preserves_primary_failed_check() -> None:
+    """A secondary request failure cannot discard a blocker from the primary read."""
+    failed_check = {
+        "__typename": "CheckRun",
+        "name": "test",
+        "workflowName": "CI",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+    }
+    results = iter(
+        (
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(_primary(statusCheckRollup=[failed_check])),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps({"headRefOid": _HEAD, "statusCheckRollup": [failed_check]}),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="provider failure"),
+        )
+    )
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=lambda *_args, **_kwargs: next(results),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["review_threads_complete"] is False
+    assert result.canonical["checks"]["failed"] == ["CI / test"]
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.reason_code == "checks_failed"
+
+
+def test_raised_check_timeout_preserves_primary_review_blocker() -> None:
+    """A raised supplemental timeout cannot replace readable primary review facts."""
+    steps = iter(
+        (
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(_primary(reviewDecision="CHANGES_REQUESTED")),
+                stderr="",
+            ),
+            subprocess.TimeoutExpired(["gh"], 30),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(_threads()),
+                stderr="",
+            ),
+        )
+    )
+
+    def runner(argv: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        step = next(steps)
+        if isinstance(step, BaseException):
+            raise step
+        assert isinstance(step, subprocess.CompletedProcess)
+        return step
+
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=runner,
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.response is not None
+    assert result.canonical["checks_complete"] is False
+    assert result.canonical["review_threads_complete"] is True
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.reason_code == "changes_requested"
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.TRANSIENT
+
+
+def test_raised_review_setup_error_preserves_primary_review_blocker() -> None:
+    """A raised supplemental setup failure remains typed without erasing primary facts."""
+    primary = _primary(reviewDecision="CHANGES_REQUESTED")
+    steps = iter(
+        (
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(primary),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(
+                    {
+                        "headRefOid": primary["headRefOid"],
+                        "statusCheckRollup": primary["statusCheckRollup"],
+                    }
+                ),
+                stderr="",
+            ),
+            SetupError("supplemental audit unavailable"),
+        )
+    )
+
+    def runner(argv: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        step = next(steps)
+        if isinstance(step, BaseException):
+            raise step
+        assert isinstance(step, subprocess.CompletedProcess)
+        return step
+
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=runner,
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.response is not None
+    assert result.canonical["checks_complete"] is True
+    assert result.canonical["review_threads_complete"] is False
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.reason_code == "changes_requested"
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.SETUP
+
+
+def test_later_review_thread_request_failure_preserves_observed_blocker() -> None:
+    """A failed later page cannot erase an unresolved thread already returned."""
+    results = iter(
+        (
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(_primary()),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(
+                    {
+                        "headRefOid": _HEAD,
+                        "statusCheckRollup": _primary()["statusCheckRollup"],
+                    }
+                ),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                ["gh"],
+                0,
+                stdout=json.dumps(
+                    _threads(
+                        [{"isResolved": False}],
+                        has_next=True,
+                        cursor="cursor-1",
+                    )
+                ),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="provider failure"),
+        )
+    )
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=lambda *_args, **_kwargs: next(results),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["review_threads_complete"] is False
+    assert result.canonical["unresolved_review_threads"] == 1
+    assert result.canonical["blocking_review"] == "unresolved_threads"
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.reason_code == "unresolved_review_threads"
+
+
+def test_malformed_review_thread_node_cannot_hide_a_later_blocker() -> None:
+    """Malformed evidence makes the page incomplete without discarding valid blockers."""
+    provider, _ = _provider(
+        _primary(),
+        _threads([None, {"isResolved": False}]),
+    )
 
     result = provider.probe("https://github.com/owner/repo/pull/123")
 
@@ -1180,7 +1523,6 @@ def test_provider_setup_and_transport_exceptions_have_typed_categories(
     "payloads",
     [
         ({"number": 123},),
-        (_primary(), {"data": {"repository": None}}),
     ],
 )
 def test_malformed_provider_payload_is_a_retryable_nonleaking_error(
@@ -1352,3 +1694,415 @@ async def test_shadow_mode_refuses_wake_delivery_before_probe_or_persistence() -
     assert state.probe_count == 0
     assert state.last_wake_fingerprint == ""
     assert state.wake_in_flight is False
+
+
+class _CompletedRunner:
+    def __init__(self, results: Sequence[subprocess.CompletedProcess[str]]) -> None:
+        self._results = list(results)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        return self._results.pop(0)
+
+
+def _completed(
+    payload: dict[str, object] | None = None,
+    *,
+    returncode: int = 0,
+    stderr: str = "",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["gh"],
+        returncode,
+        stdout=json.dumps(payload) if payload is not None else "",
+        stderr=stderr,
+    )
+
+
+def _core_and_rollup(**changes: object) -> tuple[dict[str, object], dict[str, object]]:
+    core = _primary(**changes)
+    rollup = {
+        "headRefOid": core["headRefOid"],
+        "statusCheckRollup": core.pop("statusCheckRollup"),
+    }
+    return core, rollup
+
+
+def test_probe_isolates_checks_from_the_primary_field_set() -> None:
+    """Missing Checks scope must not erase readable lifecycle and review facts."""
+    core, rollup = _core_and_rollup()
+    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert "statusCheckRollup" not in runner.calls[0][-1]
+    assert runner.calls[1][-1] == "statusCheckRollup,headRefOid"
+    assert result.canonical["checks_complete"] is True
+
+
+def test_null_check_rollup_is_an_empty_complete_check_set() -> None:
+    core, rollup = _core_and_rollup()
+    rollup["statusCheckRollup"] = None
+    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["checks"] == {
+        "failed": [],
+        "passed": [],
+        "pending": [],
+        "unknown": [],
+    }
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+
+
+def test_supplemental_check_permission_failure_preserves_primary_facts() -> None:
+    core, _rollup = _core_and_rollup()
+    runner = _CompletedRunner(
+        [
+            _completed(core),
+            _completed(returncode=1, stderr="HTTP 403: Resource not accessible"),
+            _completed(_threads()),
+        ]
+    )
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.response is not None
+    assert result.canonical["review_decision"] == "approved"
+    assert result.canonical["checks_complete"] is False
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "checks_incomplete"
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.AUTHORIZATION
+
+
+def test_nonzero_graphql_with_usable_nodes_preserves_the_blocker_and_error() -> None:
+    core, rollup = _core_and_rollup()
+    partial = _threads(nodes=[{"isResolved": False, "isOutdated": False}])
+    partial["errors"] = [{"message": "partial"}]
+    runner = _CompletedRunner(
+        [
+            _completed(core),
+            _completed(rollup),
+            _completed(partial, returncode=1, stderr="GraphQL: partial response"),
+        ]
+    )
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["unresolved_review_threads"] == 1
+    assert result.canonical["review_threads_complete"] is False
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.supplemental_provider_error is ProviderErrorKind.TRANSIENT
+
+
+def test_outdated_unresolved_review_thread_is_not_a_current_blocker() -> None:
+    core, rollup = _core_and_rollup()
+    runner = _CompletedRunner(
+        [
+            _completed(core),
+            _completed(rollup),
+            _completed(_threads(nodes=[{"isResolved": False, "isOutdated": True}])),
+        ]
+    )
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["unresolved_review_threads"] == 0
+    assert result.observation.status is MonitorObservationStatus.SUCCESS
+    assert "isOutdated" in runner.calls[2][runner.calls[2].index("-f") + 1]
+
+
+def test_repeated_review_thread_cursor_is_incomplete_instead_of_looping() -> None:
+    core, rollup = _core_and_rollup()
+    repeated = _threads(has_next=True, cursor="same-cursor")
+    runner = _CompletedRunner(
+        [
+            _completed(core),
+            _completed(rollup),
+            _completed(repeated),
+            _completed(repeated),
+        ]
+    )
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["review_threads_complete"] is False
+    assert result.observation.reason_code == "review_threads_incomplete"
+    assert len(runner.calls) == 4
+
+
+def test_check_identity_and_bucket_sizes_are_bounded_before_persistence() -> None:
+    core, rollup = _core_and_rollup(
+        statusCheckRollup=[
+            {
+                **_check_run(conclusion="FAILURE"),
+                "name": f"failure-{index}-\n\u202e\u200b" + "x" * 400,
+            }
+            for index in range(101)
+        ]
+    )
+    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    failed = result.canonical["checks"]["failed"]
+    assert len(failed) == 100
+    assert all(
+        len(identity) <= 200
+        and "\n" not in identity
+        and "\u202e" not in identity
+        and "\u200b" not in identity
+        for identity in failed
+    )
+    assert result.canonical["checks_complete"] is False
+    assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+    assert result.observation.supplemental_provider_error is None
+
+
+def test_status_context_failure_outranks_duplicate_success_and_stale_is_nonblocking() -> None:
+    core, rollup = _core_and_rollup(
+        statusCheckRollup=[
+            {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "ci", "state": "FAILURE"},
+            _check_run(conclusion="STALE"),
+        ]
+    )
+    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.canonical["checks"]["failed"] == ["ci"]
+    assert result.canonical["checks"]["passed"] == ["CI / test"]
+    assert result.observation.reason_code == "checks_failed"
+
+
+def test_actionable_fingerprint_changes_when_unresolved_thread_count_changes() -> None:
+    first_core, first_rollup = _core_and_rollup()
+    second_core, second_rollup = _core_and_rollup()
+    first = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=_CompletedRunner(
+            [
+                _completed(first_core),
+                _completed(first_rollup),
+                _completed(_threads(nodes=[{"isResolved": False, "isOutdated": False}])),
+            ]
+        ),
+    ).probe("https://github.com/owner/repo/pull/123")
+    second = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=_CompletedRunner(
+            [
+                _completed(second_core),
+                _completed(second_rollup),
+                _completed(
+                    _threads(
+                        nodes=[
+                            {"isResolved": False, "isOutdated": False},
+                            {"isResolved": False, "isOutdated": False},
+                        ]
+                    )
+                ),
+            ]
+        ),
+    ).probe("https://github.com/owner/repo/pull/123")
+
+    assert first.observation.fingerprint != second.observation.fingerprint
+
+
+def test_draft_state_prevents_failed_checks_from_requesting_a_turn() -> None:
+    core, rollup = _core_and_rollup(
+        isDraft=True,
+        statusCheckRollup=[_check_run(conclusion="FAILURE")],
+    )
+    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "pull_request_draft"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(errno.EMFILE, "too many open files"),
+        BlockingIOError(errno.EAGAIN, "temporarily unavailable"),
+        ConnectionResetError(errno.ECONNRESET, "connection reset"),
+    ],
+)
+def test_transient_spawn_os_errors_remain_retryable(error: OSError) -> None:
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=_FailureRunner(error=error),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.observation.provider_error is ProviderErrorKind.TRANSIENT
+    assert result.observation.reason_code == "provider_transient"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        ("HTTP 503: unavailable for owner/authentication", ProviderErrorKind.TRANSIENT),
+        ("HTTP 502 bad gateway for acme/permission", ProviderErrorKind.TRANSIENT),
+        (
+            "GraphQL: Could not resolve to a PullRequest with the number of 999999.",
+            ProviderErrorKind.NOT_FOUND,
+        ),
+        ("Resource protected by SAML enforcement", ProviderErrorKind.AUTHORIZATION),
+    ],
+)
+def test_cli_error_classification_uses_structured_status_before_provider_text(
+    stderr: str,
+    kind: ProviderErrorKind,
+) -> None:
+    provider = GitHubPullRequestProvider(
+        resolver=lambda: "/trusted/bin/gh",
+        runner=_FailureRunner(stderr=stderr),
+    )
+
+    result = provider.probe("https://github.com/owner/repo/pull/123")
+
+    assert result.observation.provider_error is kind
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://github.com/owner/repo/pull/12\r\n3",
+        "https://github.com/owner/repo/pull/1\n23",
+        "https://github.com/owner/repo/pull/123;touch",
+        "https://github.com/owner/repo/pull/0123",
+        "https://github.com/owner/repo/pull/" + "9" * 400,
+    ],
+)
+def test_target_rejects_noncanonical_aliases_before_url_parsing(raw: str) -> None:
+    with pytest.raises(ValueError, match="GitHub pull request"):
+        parse_github_pull_request_target(raw)
+
+
+@pytest.mark.asyncio
+async def test_shadow_budget_gate_stops_before_provider_execution() -> None:
+    probes = 0
+    snapshots: list[MonitorState] = []
+
+    class Provider:
+        def probe(self, raw_target: str, **kwargs: object) -> object:
+            nonlocal probes
+            probes += 1
+            raise AssertionError("budget gate must precede provider execution")
+
+    async def persist(updated: MonitorState) -> None:
+        snapshots.append(deepcopy(updated))
+
+    state = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/owner/repo/pull/123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        budgets=MonitorBudgets(max_runtime_secs=100),
+    )
+
+    decision = await run_shadow_probe(state, Provider(), persist, now=1_100.0)
+
+    assert decision is MonitorDecision.STOP_BUDGET
+    assert probes == 0
+    assert len(snapshots) == 1
+    assert state.outcome is MonitorOutcome.BUDGET
+    assert state.stopped_reason == "runtime_budget"
+    assert state.stopped_at == 1_100.0
+    assert state.next_probe_at == 0.0
+
+
+@pytest.mark.asyncio
+async def test_shadow_rejects_unrepresentable_time_as_a_validation_error() -> None:
+    async def persist(_updated: MonitorState) -> None:
+        raise AssertionError("invalid time must fail before persistence")
+
+    state = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/owner/repo/pull/123",
+        objective="review_ready",
+        created_ts=1_000.0,
+    )
+
+    with pytest.raises(ValueError, match="finite non-negative"):
+        await run_shadow_probe(
+            state,
+            object(),
+            persist,
+            now=10**400,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shadow_terminal_probe_persists_terminal_outcome_without_rearming() -> None:
+    provider, _ = _provider(_primary(state="MERGED"))
+    snapshots: list[MonitorState] = []
+
+    async def persist(updated: MonitorState) -> None:
+        snapshots.append(deepcopy(updated))
+
+    state = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/owner/repo/pull/123",
+        objective="review_ready",
+        created_ts=1_000.0,
+    )
+
+    decision = await run_shadow_probe(state, provider, persist, now=1_100.0)
+
+    assert decision is MonitorDecision.STOP_SUCCESS
+    assert state.outcome is MonitorOutcome.SUCCESS
+    assert state.stopped_reason == "pull_request_merged"
+    assert state.stopped_at == 1_100.0
+    assert state.next_probe_at == 0.0
+    assert len(snapshots) == 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_terminal_state_never_probes_again_or_changes_outcome() -> None:
+    probes = 0
+    persists = 0
+
+    class Provider:
+        def probe(self, raw_target: str, **kwargs: object) -> object:
+            nonlocal probes
+            probes += 1
+            raise AssertionError("terminal monitor must not probe")
+
+    async def persist(updated: MonitorState) -> None:
+        nonlocal persists
+        persists += 1
+
+    state = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/owner/repo/pull/123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        outcome=MonitorOutcome.SUCCESS,
+        stopped_reason="review_ready",
+        stopped_at=1_050.0,
+    )
+
+    decision = await run_shadow_probe(state, Provider(), persist, now=10_000.0)
+
+    assert decision is MonitorDecision.STOP_SUCCESS
+    assert probes == 0
+    assert persists == 0
+    assert state.outcome is MonitorOutcome.SUCCESS

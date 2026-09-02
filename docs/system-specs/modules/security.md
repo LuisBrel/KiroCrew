@@ -1185,7 +1185,8 @@ separate monitor-owned consumer of the shared synchronous `github_runner`, not o
 dashboard handler. The target gate accepts only exact public `github.com` HTTPS
 pull-request identities and normalizes `www.github.com`; it refuses arbitrary and
 enterprise hosts, credentials/ports, repository-only paths, suffixes, queries,
-fragments, and invalid owner/repository/number segments before resolving `gh`. Every
+fragments, raw control characters, URL parameters, non-canonical numeric aliases,
+oversized pull-request numbers, and invalid owner/repository segments before resolving `gh`. Every
 provider call uses the runner's validated absolute executable, minimal GitHub-only
 environment, audit-or-deny invocation record, strict UTF-8 decoding, and
 `pin_host="github.com"`; no monitor-specific token source or credential storage
@@ -1194,14 +1195,22 @@ exists.
 Raw stdout, stderr, response envelopes, URLs, timestamps, cursor/request ids, bodies,
 comments, and logs never cross the adapter boundary into monitor state, exceptions,
 or logging. Canonical state is an explicit small allowlist; check labels are stripped
-of URLs and passed through `security.redact()` before persistence. Provider failures
+of controls and URLs, passed through `security.redact()`, and bounded in length and
+count before persistence. Provider failures
 are reduced in memory to fixed error kinds and reason codes, including a non-retryable
 setup kind for missing, untrusted, or unexecutable `gh`; raw diagnostic text is then
-discarded. Open-PR review-thread pagination is bounded to ten 100-node pages, and
-incomplete or capped evidence fails closed as pending; a terminal merged/closed
-primary state does not issue that secondary request. Shadow execution has no dispatcher
+discarded. The load-bearing primary read excludes `statusCheckRollup`; checks are read
+separately with the head revision, so a missing Checks permission or a push between
+requests produces typed incomplete supplemental evidence without erasing authorized
+primary facts. Open-PR review-thread pagination is bounded to ten 100-node pages,
+ignores outdated threads, and preserves usable nodes from partial GraphQL errors;
+incomplete or capped evidence fails closed as pending. A terminal merged/closed
+primary state does not issue either supplemental request. Shadow execution has no dispatcher
 dependency and refuses an enabled wake request before either provider or persistence
 work, so it cannot turn ambient GitHub authority into a model wake in this slice.
+Locally imposed check and review-thread caps remain durable incomplete evidence and do
+not consume the provider-error budget; transport failures and malformed provider
+pagination remain typed supplemental errors.
 
 The provider adapter's redaction is classified as inbound canonicalization rather
 than an egress surface.

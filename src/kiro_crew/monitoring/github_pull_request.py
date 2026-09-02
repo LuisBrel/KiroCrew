@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import re
 import subprocess
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
@@ -14,6 +16,8 @@ from urllib.parse import urlparse
 
 from kiro_crew.github_runner import SetupError, resolve_gh, run_gh
 from kiro_crew.monitoring.models import (
+    MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET,
+    MAX_MONITOR_CHECK_IDENTITY_CHARS,
     MonitorObservation,
     MonitorObservationStatus,
     ProviderErrorKind,
@@ -23,23 +27,24 @@ from kiro_crew.security import redact
 _GITHUB_HOST = "github.com"
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _URL_IN_CHECK_IDENTITY_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_ACTIONS_JOB_PATH_RE = re.compile(
-    r"^/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*$"
-)
+_RAW_URL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_HTTP_STATUS_RE = re.compile(r"\bhttp\s+(\d{3})\b", re.IGNORECASE)
+_HEAD_REVISION_RE = re.compile(r"^[0-9a-fA-F]{1,128}$")
 _PROBE_TIMEOUT_SECS = 30.0
 _REVIEW_THREAD_PAGE_SIZE = 100
 _REVIEW_THREAD_MAX_PAGES = 10
 _MERGEABLE_SETTLED_STATES = frozenset({"CLEAN", "HAS_HOOKS", "UNSTABLE"})
-_PR_FIELDS = (
-    "number,state,isDraft,headRefOid,mergeable,mergeStateStatus," "reviewDecision,statusCheckRollup"
-)
+_PR_FIELDS = "number,state,isDraft,headRefOid,mergeable,mergeStateStatus,reviewDecision"
+_CHECK_FIELDS = "statusCheckRollup,headRefOid"
+_MAX_PULL_REQUEST_NUMBER = 2_147_483_647
+_MAX_CHECK_ROWS = MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET * 4
 _REVIEW_THREADS_QUERY = """
 query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
   repository(owner:$owner,name:$repo){
     pullRequest(number:$number){
       reviewThreads(first:PAGE_SIZE,after:$cursor){
         pageInfo{hasNextPage endCursor}
-        nodes{isResolved}
+        nodes{isResolved isOutdated}
       }
     }
   }
@@ -86,6 +91,12 @@ class GitHubCheck:
     identity: str
     state: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, str) or not self.identity:
+            raise ValueError("GitHub check identity must be non-empty")
+        if self.state not in {"failed", "passed", "pending", "unknown"}:
+            raise ValueError("GitHub check state is malformed")
+
 
 @dataclass(frozen=True)
 class GitHubPullRequestResponse:
@@ -98,6 +109,7 @@ class GitHubPullRequestResponse:
     mergeability: str
     review_decision: str
     checks: tuple[GitHubCheck, ...]
+    checks_complete: bool
     unresolved_review_threads: int
     review_threads_complete: bool
 
@@ -130,8 +142,8 @@ class GitHubPullRequestProvider:
         previous_observation: Mapping[str, object] | None = None,
     ) -> GitHubPullRequestProbeResult:
         """Return one canonical review-ready observation."""
-        target = parse_github_pull_request_target(raw_target)
         try:
+            target = parse_github_pull_request_target(raw_target)
             gh = self._resolver()
             primary = self._runner(
                 [gh, "pr", "view", target.url, "--json", _PR_FIELDS],
@@ -143,23 +155,41 @@ class GitHubPullRequestProvider:
             if failure is not None:
                 return failure
             raw_primary = _json_object(primary.stdout)
-            response = _normalize_response(target, raw_primary, 0, False)
+            response = _normalize_response(
+                target,
+                raw_primary,
+                checks=(),
+                checks_complete=True,
+                unresolved_review_threads=0,
+                review_threads_complete=True,
+            )
+            supplemental_error: ProviderErrorKind | None = None
             if response.state not in {"merged", "closed"}:
-                unresolved, complete = self._review_threads(gh, target)
-                if isinstance(unresolved, GitHubPullRequestProbeResult):
-                    return unresolved
+                checks, checks_complete, checks_error = self._checks(
+                    gh,
+                    target,
+                    response.head_revision,
+                )
+                unresolved, complete, review_error = self._review_threads(gh, target)
+                supplemental_error = _combine_provider_errors(checks_error, review_error)
                 response = replace(
                     response,
+                    checks=checks,
+                    checks_complete=checks_complete,
                     unresolved_review_threads=unresolved,
                     review_threads_complete=complete,
                 )
-        except SetupError:
+        except SetupError as exc:
+            if _transient_os_error(exc.__cause__):
+                return _provider_error(ProviderErrorKind.TRANSIENT, "provider_transient")
             return _provider_error(ProviderErrorKind.SETUP, "provider_setup")
         except FileNotFoundError:
             return _provider_error(ProviderErrorKind.SETUP, "provider_setup")
         except subprocess.TimeoutExpired:
             return _provider_error(ProviderErrorKind.TRANSIENT, "provider_transient")
-        except OSError:
+        except OSError as exc:
+            if _transient_os_error(exc):
+                return _provider_error(ProviderErrorKind.TRANSIENT, "provider_transient")
             return _provider_error(ProviderErrorKind.SETUP, "provider_setup")
         except (TypeError, ValueError, KeyError):
             return _provider_error(
@@ -192,18 +222,55 @@ class GitHubPullRequestProvider:
             observation=MonitorObservation(
                 fingerprint,
                 status,
+                supplemental_provider_error=supplemental_error,
                 reason_code=reason_code,
                 head_changed=head_changed,
             ),
         )
 
+    def _checks(
+        self,
+        gh: str,
+        target: GitHubPullRequestTarget,
+        expected_head: str,
+    ) -> tuple[tuple[GitHubCheck, ...], bool, ProviderErrorKind | None]:
+        try:
+            proc = self._runner(
+                [gh, "pr", "view", target.url, "--json", _CHECK_FIELDS],
+                timeout=_PROBE_TIMEOUT_SECS,
+                audit_caller="core:monitor",
+                pin_host=_GITHUB_HOST,
+            )
+        except (SetupError, FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return (), False, _provider_exception_kind(exc)
+        failure = _process_failure(proc)
+        if failure is not None:
+            return (), False, failure.observation.provider_error
+        try:
+            raw = _json_object(proc.stdout)
+            head = raw.get("headRefOid")
+            if not isinstance(head, str) or head != expected_head:
+                return (), False, ProviderErrorKind.TRANSIENT
+            rollup = raw.get("statusCheckRollup")
+            if rollup is None:
+                return (), True, None
+            if not isinstance(rollup, list):
+                raise ValueError("GitHub check rollup is malformed")
+            checks = _normalize_checks(rollup[:_MAX_CHECK_ROWS])
+            checks, buckets_complete = _bounded_checks(checks)
+            complete = len(rollup) <= _MAX_CHECK_ROWS and buckets_complete
+            return checks, complete, None
+        except (KeyError, TypeError, ValueError):
+            return (), False, ProviderErrorKind.TRANSIENT
+
     def _review_threads(
         self,
         gh: str,
         target: GitHubPullRequestTarget,
-    ) -> tuple[int | GitHubPullRequestProbeResult, bool]:
+    ) -> tuple[int, bool, ProviderErrorKind | None]:
         unresolved = 0
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         for page in range(_REVIEW_THREAD_MAX_PAGES):
             argv = [
                 gh,
@@ -220,56 +287,64 @@ class GitHubPullRequestProvider:
             ]
             if cursor is not None:
                 argv.extend(("-f", f"cursor={cursor}"))
-            proc = self._runner(
-                argv,
-                timeout=_PROBE_TIMEOUT_SECS,
-                audit_caller="core:monitor",
-                pin_host=_GITHUB_HOST,
-            )
+            try:
+                proc = self._runner(
+                    argv,
+                    timeout=_PROBE_TIMEOUT_SECS,
+                    audit_caller="core:monitor",
+                    pin_host=_GITHUB_HOST,
+                )
+            except (SetupError, FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                return unresolved, False, _provider_exception_kind(exc)
             failure = _process_failure(proc)
-            if failure is not None:
-                return failure, False
-            raw = _json_object(proc.stdout)
+            failure_kind = failure.observation.provider_error if failure is not None else None
+            try:
+                raw = _json_object(proc.stdout)
+            except ValueError:
+                if failure_kind is not None:
+                    return unresolved, False, failure_kind
+                raise
             has_errors = bool(raw.get("errors"))
             try:
                 threads = raw["data"]["repository"]["pullRequest"]["reviewThreads"]
                 nodes = threads["nodes"]
                 page_info = threads["pageInfo"]
-            except (KeyError, TypeError) as exc:
-                if has_errors:
-                    return (
-                        _provider_error(
-                            ProviderErrorKind.TRANSIENT,
-                            "provider_malformed_response",
-                        ),
-                        False,
-                    )
-                raise ValueError("GitHub review-thread response is malformed") from exc
+            except (KeyError, TypeError):
+                return unresolved, False, failure_kind or ProviderErrorKind.TRANSIENT
             if not isinstance(nodes, list) or not isinstance(page_info, Mapping):
-                raise ValueError("GitHub review-thread response is malformed")
+                return unresolved, False, failure_kind or ProviderErrorKind.TRANSIENT
+            nodes_complete = True
             for node in nodes:
-                if not isinstance(node, Mapping) or not isinstance(node.get("isResolved"), bool):
-                    return unresolved, False
-                unresolved += int(not node["isResolved"])
-            if has_errors:
-                return unresolved, False
+                if (
+                    not isinstance(node, Mapping)
+                    or not isinstance(node.get("isResolved"), bool)
+                    or not isinstance(node.get("isOutdated"), bool)
+                ):
+                    nodes_complete = False
+                    continue
+                unresolved += int(not node["isResolved"] and not node["isOutdated"])
+            if failure_kind is not None or has_errors or not nodes_complete:
+                return unresolved, False, failure_kind or ProviderErrorKind.TRANSIENT
             has_next = page_info.get("hasNextPage")
             if has_next is False:
-                return unresolved, True
+                return unresolved, True, None
             if has_next is not True:
-                return unresolved, False
+                return unresolved, False, ProviderErrorKind.TRANSIENT
             next_cursor = page_info.get("endCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
-                return unresolved, False
+                return unresolved, False, ProviderErrorKind.TRANSIENT
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                return unresolved, False, ProviderErrorKind.TRANSIENT
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
             if page + 1 == _REVIEW_THREAD_MAX_PAGES:
-                return unresolved, False
-        return unresolved, False
+                return unresolved, False, None
+        return unresolved, False, None
 
 
 def parse_github_pull_request_target(raw: str) -> GitHubPullRequestTarget:
     """Parse one exact public GitHub pull-request URL into a typed identity."""
-    if not isinstance(raw, str) or not raw:
+    if not isinstance(raw, str) or not raw or _RAW_URL_CONTROL_RE.search(raw):
         raise ValueError("target must be a GitHub pull request URL")
     parsed = urlparse(raw)
     try:
@@ -283,6 +358,7 @@ def parse_github_pull_request_target(raw: str) -> GitHubPullRequestTarget:
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
+        or parsed.params
         or parsed.query
         or parsed.fragment
     ):
@@ -293,7 +369,12 @@ def parse_github_pull_request_target(raw: str) -> GitHubPullRequestTarget:
     owner, repo, raw_number = parts[1], parts[2], parts[4]
     if parsed.path != f"/{owner}/{repo}/pull/{raw_number}":
         raise ValueError("target must be a canonical GitHub pull request URL")
-    if not raw_number.isascii() or not raw_number.isdecimal():
+    if (
+        not raw_number.isascii()
+        or not raw_number.isdecimal()
+        or raw_number.startswith("0")
+        or int(raw_number, 10) > _MAX_PULL_REQUEST_NUMBER
+    ):
         raise ValueError("target must be a GitHub pull request with a positive number")
     try:
         return GitHubPullRequestTarget(_GITHUB_HOST, owner, repo, int(raw_number, 10))
@@ -316,6 +397,8 @@ def _json_object(raw: str | None) -> dict[str, Any]:
 def _normalize_response(
     target: GitHubPullRequestTarget,
     raw: Mapping[str, Any],
+    checks: tuple[GitHubCheck, ...],
+    checks_complete: bool,
     unresolved_review_threads: int,
     review_threads_complete: bool,
 ) -> GitHubPullRequestResponse:
@@ -327,7 +410,6 @@ def _normalize_response(
         "mergeable",
         "mergeStateStatus",
         "reviewDecision",
-        "statusCheckRollup",
     }
     if not required.issubset(raw):
         raise ValueError("GitHub pull request response is malformed")
@@ -339,21 +421,26 @@ def _normalize_response(
         or not isinstance(raw["isDraft"], bool)
     ):
         raise ValueError("GitHub pull request response is malformed")
-    for name in ("state", "headRefOid", "mergeable", "mergeStateStatus"):
+    for name in ("state", "mergeable", "mergeStateStatus"):
         if not isinstance(raw[name], str):
             raise ValueError("GitHub pull request response is malformed")
+    head_revision = raw["headRefOid"]
+    if not isinstance(head_revision, str) or (
+        head_revision and _HEAD_REVISION_RE.fullmatch(head_revision) is None
+    ):
+        raise ValueError("GitHub pull request response is malformed")
     review_decision = raw["reviewDecision"]
     if review_decision is not None and not isinstance(review_decision, str):
         raise ValueError("GitHub pull request response is malformed")
-    checks = _normalize_checks(raw["statusCheckRollup"])
     return GitHubPullRequestResponse(
         target=target,
         state=_normalize_pr_state(raw["state"]),
         draft=raw["isDraft"],
-        head_revision=raw["headRefOid"],
+        head_revision=head_revision,
         mergeability=_normalize_mergeability(raw["mergeable"], raw["mergeStateStatus"]),
         review_decision=_normalize_review_decision(review_decision),
         checks=checks,
+        checks_complete=checks_complete,
         unresolved_review_threads=unresolved_review_threads,
         review_threads_complete=review_threads_complete,
     )
@@ -362,28 +449,37 @@ def _normalize_response(
 def _normalize_checks(raw: object) -> tuple[GitHubCheck, ...]:
     if not isinstance(raw, list):
         raise ValueError("GitHub check rollup is malformed")
-    grouped: dict[tuple[str, ...], tuple[str, list[tuple[str, str]]]] = {}
+    grouped: dict[tuple[str, ...], tuple[str, list[str]]] = {}
     for row_index, item in enumerate(raw):
         if not isinstance(item, Mapping):
             raise ValueError("GitHub check rollup is malformed")
-        identity, state, recency, group_key = _normalize_check(item)
+        identity, state, group_key = _normalize_check(item)
         if group_key is None:
-            group_key = ("workflowless_check_run", str(row_index))
+            group_key = ("independent_check_run", str(row_index))
         _, candidates = grouped.setdefault(group_key, (identity, []))
-        candidates.append((recency, state))
+        candidates.append(state)
     normalized: list[GitHubCheck] = []
     for identity, candidates in grouped.values():
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        latest_recency = candidates[0][0]
-        latest_states = {state for recency, state in candidates if recency == latest_recency}
-        state = next(iter(latest_states)) if len(latest_states) == 1 else "unknown"
+        state = min(candidates, key=("failed", "pending", "unknown", "passed").index)
         normalized.append(GitHubCheck(_sanitize_check_identity(identity), state))
     return tuple(sorted(normalized, key=lambda item: item.identity))
 
 
+def _bounded_checks(checks: tuple[GitHubCheck, ...]) -> tuple[tuple[GitHubCheck, ...], bool]:
+    """Bound each durable state bucket without letting one state consume the others."""
+    bounded: list[GitHubCheck] = []
+    complete = True
+    for state in ("failed", "passed", "pending", "unknown"):
+        matching = [check for check in checks if check.state == state]
+        if len(matching) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET:
+            complete = False
+        bounded.extend(matching[:MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET])
+    return tuple(sorted(bounded, key=lambda item: (item.identity, item.state))), complete
+
+
 def _normalize_check(
     raw: Mapping[str, object],
-) -> tuple[str, str, str, tuple[str, ...] | None]:
+) -> tuple[str, str, tuple[str, ...] | None]:
     typename = raw.get("__typename")
     if typename == "CheckRun":
         name = raw.get("name")
@@ -395,7 +491,7 @@ def _normalize_check(
         conclusion = raw.get("conclusion")
         if status != "COMPLETED":
             state = "pending" if isinstance(status, str) else "unknown"
-        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED", "STALE"}:
             state = "passed"
         elif conclusion in {
             "FAILURE",
@@ -407,15 +503,7 @@ def _normalize_check(
             state = "failed"
         else:
             state = "unknown"
-        recency = raw.get("startedAt")
-        if not workflow:
-            normalized_recency = ""
-        elif isinstance(recency, str) and recency:
-            normalized_recency = recency
-        else:
-            normalized_recency = "\uffff" if state == "pending" else ""
-        group_key = _check_run_group_key(raw, name) if workflow else None
-        return identity, state, normalized_recency, group_key
+        return identity, state, None
     if typename == "StatusContext":
         context = raw.get("context")
         if not isinstance(context, str) or not context:
@@ -431,39 +519,8 @@ def _normalize_check(
             }.get(raw_state, "unknown")
         else:
             state = "unknown"
-        return context, state, "", ("status_context", context)
+        return context, state, ("status_context", context)
     raise ValueError("GitHub check rollup is malformed")
-
-
-def _check_run_group_key(
-    raw: Mapping[str, object],
-    name: str,
-) -> tuple[str, ...] | None:
-    """Return the GitHub Actions run identity shared by rerun attempts."""
-    details_url = raw.get("detailsUrl")
-    if not isinstance(details_url, str):
-        return None
-    parsed = urlparse(details_url)
-    try:
-        host = (parsed.hostname or "").lower()
-        port = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or host != _GITHUB_HOST
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        return None
-    match = _ACTIONS_JOB_PATH_RE.fullmatch(parsed.path)
-    if match is None:
-        return None
-    owner, repo, run_id = match.groups()
-    return ("check_run", owner.casefold(), repo.casefold(), run_id, name)
 
 
 def _normalize_pr_state(raw: str) -> str:
@@ -471,8 +528,24 @@ def _normalize_pr_state(raw: str) -> str:
 
 
 def _sanitize_check_identity(identity: str) -> str:
-    without_urls = _URL_IN_CHECK_IDENTITY_RE.sub("[provider-url]", identity)
-    return redact(without_urls)
+    normalized = "".join(
+        (
+            " "
+            if unicodedata.category(character).startswith("C")
+            or unicodedata.category(character) in {"Zl", "Zp"}
+            else character
+        )
+        for character in identity
+    ).strip()
+    redacted = redact(_URL_IN_CHECK_IDENTITY_RE.sub("[provider-url]", normalized)).strip()
+    if not redacted:
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return f"github_check:{digest}"
+    if len(redacted) <= MAX_MONITOR_CHECK_IDENTITY_CHARS:
+        return redacted
+    digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()[:16]
+    prefix_length = MAX_MONITOR_CHECK_IDENTITY_CHARS - len(digest) - 1
+    return f"{redacted[:prefix_length]}#{digest}"
 
 
 def _normalize_review_decision(raw: str | None) -> str:
@@ -501,7 +574,7 @@ def _normalize_mergeability(mergeable: str, merge_state: str) -> str:
 
 def _canonical_response(response: GitHubPullRequestResponse) -> dict[str, object]:
     checks = {
-        state: sorted({check.identity for check in response.checks if check.state == state})
+        state: sorted(check.identity for check in response.checks if check.state == state)
         for state in ("failed", "passed", "pending", "unknown")
     }
     if response.review_decision == "changes_requested":
@@ -515,6 +588,7 @@ def _canonical_response(response: GitHubPullRequestResponse) -> dict[str, object
     return {
         "blocking_review": blocking_review,
         "checks": checks,
+        "checks_complete": response.checks_complete,
         "draft": response.draft,
         "head_revision": response.head_revision,
         "kind": "github_pull_request",
@@ -550,14 +624,15 @@ def _actionable_fingerprint_facts(canonical: Mapping[str, object]) -> dict[str, 
             if blocking_review in {"changes_requested", "unresolved_threads"}
             else "none"
         ),
+        "checks_complete": canonical["checks_complete"],
         "failed_checks": checks["failed"],
         "head_revision": canonical["head_revision"],
         "kind": canonical["kind"],
-        "mergeability": (
-            mergeability if mergeability in {"conflicting", "behind", "blocked"} else "none"
-        ),
+        "mergeability": (mergeability if mergeability in {"conflicting", "behind"} else "none"),
+        "review_threads_complete": canonical["review_threads_complete"],
         "state": canonical["state"],
         "target": canonical["target"],
+        "unresolved_review_threads": canonical["unresolved_review_threads"],
     }
 
 
@@ -570,6 +645,8 @@ def _classify_response(
         return MonitorObservationStatus.BLOCKED, "pull_request_closed"
     if response.state != "open" or not response.head_revision:
         return MonitorObservationStatus.PENDING, "pull_request_state_unknown"
+    if response.draft:
+        return MonitorObservationStatus.PENDING, "pull_request_draft"
     check_states = {check.state for check in response.checks}
     if "failed" in check_states:
         return MonitorObservationStatus.ACTIONABLE, "checks_failed"
@@ -581,10 +658,8 @@ def _classify_response(
         return MonitorObservationStatus.ACTIONABLE, "merge_conflict"
     if response.mergeability == "behind":
         return MonitorObservationStatus.ACTIONABLE, "branch_behind"
-    if response.mergeability == "blocked":
-        return MonitorObservationStatus.ACTIONABLE, "merge_blocked"
-    if response.draft:
-        return MonitorObservationStatus.PENDING, "pull_request_draft"
+    if not response.checks_complete:
+        return MonitorObservationStatus.PENDING, "checks_incomplete"
     if "pending" in check_states:
         return MonitorObservationStatus.PENDING, "checks_pending"
     if "unknown" in check_states:
@@ -595,7 +670,7 @@ def _classify_response(
         return MonitorObservationStatus.PENDING, "review_state_unknown"
     if response.review_decision == "review_required":
         return MonitorObservationStatus.PENDING, "review_required"
-    if response.mergeability == "pending":
+    if response.mergeability in {"pending", "blocked"}:
         return MonitorObservationStatus.PENDING, "mergeability_pending"
     return MonitorObservationStatus.SUCCESS, "review_ready"
 
@@ -618,6 +693,21 @@ def _process_failure(
 
 def _classify_cli_error(raw: str) -> ProviderErrorKind:
     lowered = raw.lower()
+    if any(marker in lowered for marker in ("rate limit", "abuse detection", "too many requests")):
+        return ProviderErrorKind.RATE_LIMITED
+    status_match = _HTTP_STATUS_RE.search(raw)
+    if status_match is not None:
+        status = int(status_match.group(1), 10)
+        if status == 429:
+            return ProviderErrorKind.RATE_LIMITED
+        if status == 401:
+            return ProviderErrorKind.AUTHENTICATION
+        if status == 403:
+            return ProviderErrorKind.AUTHORIZATION
+        if status == 404:
+            return ProviderErrorKind.NOT_FOUND
+        if status >= 500:
+            return ProviderErrorKind.TRANSIENT
     if "could not resolve host" in lowered:
         return ProviderErrorKind.TRANSIENT
     if any(
@@ -628,7 +718,6 @@ def _classify_cli_error(raw: str) -> ProviderErrorKind:
     if any(
         marker in lowered
         for marker in (
-            "http 401",
             "bad credentials",
             "authentication",
             "not logged into",
@@ -638,15 +727,70 @@ def _classify_cli_error(raw: str) -> ProviderErrorKind:
         return ProviderErrorKind.AUTHENTICATION
     if any(
         marker in lowered
-        for marker in ("http 404", "not found", "could not resolve to a repository")
+        for marker in (
+            "not found",
+            "could not resolve to a repository",
+            "could not resolve to a pullrequest",
+        )
     ):
         return ProviderErrorKind.NOT_FOUND
     if any(
         marker in lowered
-        for marker in ("http 403", "forbidden", "permission", "resource not accessible")
+        for marker in (
+            "forbidden",
+            "permission",
+            "resource not accessible",
+            "saml",
+        )
     ):
         return ProviderErrorKind.AUTHORIZATION
     return ProviderErrorKind.TRANSIENT
+
+
+def _combine_provider_errors(
+    first: ProviderErrorKind | None,
+    second: ProviderErrorKind | None,
+) -> ProviderErrorKind | None:
+    """Keep the most specific supplemental failure when both evidence calls fail."""
+    priority = {
+        ProviderErrorKind.AUTHENTICATION: 0,
+        ProviderErrorKind.AUTHORIZATION: 1,
+        ProviderErrorKind.NOT_FOUND: 2,
+        ProviderErrorKind.RATE_LIMITED: 3,
+        ProviderErrorKind.TRANSIENT: 4,
+        ProviderErrorKind.SETUP: 5,
+    }
+    present = [error for error in (first, second) if error is not None]
+    return min(present, key=priority.__getitem__) if present else None
+
+
+def _transient_os_error(error: BaseException | None) -> bool:
+    """Classify bounded host-pressure and connection failures as retryable."""
+    return isinstance(error, OSError) and error.errno in {
+        errno.EAGAIN,
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOMEM,
+        errno.ECONNRESET,
+        errno.ETIMEDOUT,
+    }
+
+
+def _provider_exception_kind(error: BaseException) -> ProviderErrorKind:
+    """Map runner exceptions without letting supplemental reads erase primary facts."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return ProviderErrorKind.TRANSIENT
+    if isinstance(error, FileNotFoundError):
+        return ProviderErrorKind.SETUP
+    if isinstance(error, SetupError):
+        return (
+            ProviderErrorKind.TRANSIENT
+            if _transient_os_error(error.__cause__)
+            else ProviderErrorKind.SETUP
+        )
+    if isinstance(error, OSError) and _transient_os_error(error):
+        return ProviderErrorKind.TRANSIENT
+    return ProviderErrorKind.SETUP
 
 
 def _provider_error(kind: ProviderErrorKind, reason_code: str) -> GitHubPullRequestProbeResult:

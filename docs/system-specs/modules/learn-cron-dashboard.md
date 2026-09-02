@@ -1049,50 +1049,76 @@ pull-request URLs on public `github.com` (normalizing `www.github.com`); arbitra
 hosts, enterprise instances, repository URLs, path suffixes, query/fragment identity,
 and non-positive pull-request numbers are refused before provider execution. The
 adapter resolves and invokes the shared hardened `github_runner` boundary with
-`GH_HOST` pinned to `github.com`. It reads the fixed `gh pr view` readiness fields and,
-for an open pull request, walks GraphQL review threads in pages of 100, stopping after
-at most ten pages. Merged and closed primary lifecycle states are terminal without a
-secondary GraphQL dependency. An incomplete, malformed-node, missing-cursor, or capped
-thread traversal is a pending fact and can never produce review-ready success.
+`GH_HOST` pinned to `github.com`. It reads lifecycle, review, and mergeability fields
+first. For an open pull request it reads `statusCheckRollup` in a separate request
+paired with `headRefOid`, then walks GraphQL review threads in pages of 100, stopping
+after at most ten pages. A missing Checks permission therefore cannot erase readable
+primary facts, and a rollup for a different head is incomplete instead of being
+combined with the primary response. A null rollup is a complete empty check set.
+Merged and closed primary lifecycle states are terminal without either supplemental
+request. An incomplete, malformed-node, repeated/missing-cursor, or capped thread
+traversal is a pending fact and can never produce review-ready success. Outdated
+unresolved threads are ignored because they no longer block the current diff.
 When GraphQL returns errors alongside usable thread nodes, the traversal remains
 incomplete but folds those nodes first, so an observed unresolved thread still wins
-as actionable evidence. An error response without a usable thread payload is a typed
-provider error instead of a pending observation, preserving the last valid facts and
-provider-error accounting in shadow persistence.
+as actionable evidence. If the supplemental review-thread request itself fails, the
+adapter retains primary lifecycle, check, review, and mergeability facts and unresolved
+threads observed on earlier pages while marking thread evidence incomplete. A known
+blocker therefore remains actionable. Without a known blocker, incomplete checks or
+threads remain pending. The supplemental failure is carried separately as a typed
+provider error, counted against the bounded provider-error streak, and retried without
+discarding the readable primary facts.
 
 The durable observation is stable canonical JSON containing only normalized target
 identity, head revision, lifecycle/draft state, sorted check identities by outcome,
 normalized review/blocking state, unresolved-thread count/completeness, and
-mergeability. Provider ordering, timestamps, URLs, request/cursor ids, titles,
+mergeability. Repeated check identities retain their multiplicity because display
+labels cannot prove that provider rows describe the same logical job. Provider
+ordering, timestamps, URLs, request/cursor ids, titles,
 bodies, comments, and logs do not enter it. Provider-controlled check labels pass
-through credential redaction and unconditional URL removal before persistence. The
-GitHub check-run and legacy status-context namespaces remain distinct during rerun
-collapse. Check-run attempts collapse only when their canonical GitHub Actions
-details URLs prove the same workflow-run id and check name; separate runs with the
-same display labels remain independent, as do rows without that provider-stable
-identity, so a same-label success cannot hide a failure. GraphQL owner, repository,
+through credential redaction, control-character removal, unconditional URL removal,
+and fixed identity/count bounds before persistence. Overflow marks check evidence
+incomplete rather than producing success. The
+GitHub check-run and legacy status-context namespaces remain distinct. A workflow
+name plus display name is not a stable logical job identity: independent jobs may
+share both, and the rollup does not expose a stable workflow-file identity. Check runs
+therefore remain independent so a newer success cannot hide a known failure from a
+different workflow definition. Workflowless rows remain independent. Duplicate legacy
+status contexts are folded by blocker severity, so a same-named success cannot hide a
+failure. `STALE` check-run conclusions are terminal non-blockers. GraphQL owner,
 and cursor variables use raw string fields; only the pull-request number uses typed
 conversion.
 SHA-256 fingerprint covers the compact sorted serialization; a collection reorder or
 volatile provider value keeps it stable, while a new head changes it. Only a non-empty
-current head may set the changed-head fact. A changed head is also a typed decision
-fact with precedence over an otherwise-green success, so it records `wake_actionable`
-instead of stopping as ready.
+current head may set the changed-head fact. A changed head does not wake while the
+observation is pending. An otherwise-green changed head records one
+`wake_actionable`; after that head is persisted and observed unchanged, the same green
+state reaches terminal success rather than being suppressed as a duplicate.
 
 Classification is conservative: merged is terminal success
-(`pull_request_merged`), closed-unmerged is terminal blocked, draft/pending or
+(`pull_request_merged`), closed-unmerged is terminal blocked, draft (which takes
+precedence over check failures), incomplete/pending or
 unknown checks, incomplete review-thread evidence, and unknown mergeability remain
 pending. Mergeability succeeds only for the explicit settled `CLEAN`, `HAS_HOOKS`,
 and `UNSTABLE` states, so empty or future provider values fail closed as pending;
 failed checks, requested changes, unresolved threads, conflicts, a behind head, and
-branch-protection blocks are actionable. A requested-changes decision or an unresolved
+concrete branch-protection failures are actionable. GitHub's generic `BLOCKED`
+merge-state is pending because it also represents an otherwise healthy pull request
+waiting for required checks or reviews; the specific check and review facts determine
+whether the observation is actionable. A requested-changes decision or an unresolved
 thread already observed remains actionable even when the unseen review-thread tail is
 incomplete; incomplete evidence can prevent success but cannot erase a known blocker.
 Rate limits and transport/provider
 failures are retryable, while authentication, authorization, not-found, and local
-`gh` setup/trust failures are terminal categories. The shadow runner persists only
+`gh` setup/trust failures on the load-bearing primary request are terminal categories.
+HTTP status is classified before repository text, while GitHub's 403 rate-limit forms
+remain retryable. Resource-pressure spawn errors are retryable rather than
+misclassified as setup. Supplemental errors of any category use the bounded retry
+streak because the primary target remains readable. The shadow runner persists only
 the canonical observation, decision, next-probe time, and aggregate probe/error
-metrics. Persistence is the commit point: a failed write leaves the live state
+metrics. It checks hard budgets before provider execution, and terminal decisions
+persist outcome, reason, stop time, and a cleared next-probe deadline. Persistence is
+the commit point: a failed write leaves the live state
 unchanged so the same observation remains eligible for retry. It has no action
 dispatcher, never sets a wake fingerprint or in-flight claim, and raises before
 probing or persisting when `wake_delivery` is requested.

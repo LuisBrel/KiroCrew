@@ -77,6 +77,37 @@ def test_observation_changes_control_when_a_model_turn_is_allowed(
     assert decide_monitor(state, observation, now=1_100.0) is expected
 
 
+def test_changed_head_does_not_wake_while_readiness_is_pending() -> None:
+    """A push with incomplete evidence must not spend a model turn."""
+    observation = MonitorObservation(
+        "pending-new-head",
+        MonitorObservationStatus.PENDING,
+        head_changed=True,
+    )
+
+    assert decide_monitor(_state(), observation, now=1_100.0) is MonitorDecision.RECORD_ONLY
+
+
+def test_success_after_a_changed_head_can_reach_terminal_success() -> None:
+    """The changed-head wake must not make a later identical green probe immortal."""
+    changed = MonitorObservation(
+        "green-new-head",
+        MonitorObservationStatus.SUCCESS,
+        head_changed=True,
+    )
+    settled = MonitorObservation("green-new-head", MonitorObservationStatus.SUCCESS)
+
+    assert decide_monitor(_state(), changed, now=1_100.0) is MonitorDecision.WAKE_ACTIONABLE
+    assert (
+        decide_monitor(
+            _state(last_fingerprint="green-new-head"),
+            settled,
+            now=1_101.0,
+        )
+        is MonitorDecision.STOP_SUCCESS
+    )
+
+
 @pytest.mark.parametrize(
     ("error", "consecutive_errors", "expected"),
     [

@@ -20,6 +20,8 @@ DEFAULT_MONITOR_AGENT_TURNS = 8
 DEFAULT_MONITOR_TOKENS = 250_000
 DEFAULT_MONITOR_PROVIDER_ERRORS = 3
 DEFAULT_MONITOR_CADENCE_SECS = 300
+MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET = 100
+MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 MONITOR_STOP_RUNTIME_BUDGET = "runtime_budget"
 MONITOR_STOP_AGENT_TURN_BUDGET = "agent_turn_budget"
@@ -157,6 +159,7 @@ class MonitorObservation:
     fingerprint: str
     status: MonitorObservationStatus
     provider_error: ProviderErrorKind | None = None
+    supplemental_provider_error: ProviderErrorKind | None = None
     reason_code: str = ""
     summary: str = ""
     head_changed: bool = False
@@ -175,6 +178,8 @@ class MonitorObservation:
         if self.status is MonitorObservationStatus.PROVIDER_ERROR:
             if not isinstance(self.provider_error, ProviderErrorKind):
                 raise ValueError("provider_error must be a ProviderErrorKind for a provider error")
+            if self.supplemental_provider_error is not None:
+                raise ValueError("supplemental_provider_error is not valid for a provider error")
             if self.head_changed:
                 raise ValueError("head_changed is not valid for a provider error observation")
             return
@@ -182,6 +187,10 @@ class MonitorObservation:
             raise ValueError("fingerprint is required for a comparable observation")
         if self.provider_error is not None:
             raise ValueError("provider_error is only valid for a provider error observation")
+        if self.supplemental_provider_error is not None and not isinstance(
+            self.supplemental_provider_error, ProviderErrorKind
+        ):
+            raise ValueError("supplemental_provider_error must be a ProviderErrorKind")
 
 
 @dataclass
