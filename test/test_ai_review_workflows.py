@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -57,6 +58,28 @@ def _prompt(name: str) -> str:
 
 def _workflow(name: str) -> str:
     return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+
+def _stub_path(tmp_path: Path) -> str:
+    """PATH for executing a workflow read block with stubbed commands.
+
+    ``tmp_path`` comes first so the ``gh``/``sleep`` stubs win. The read
+    blocks pipe through a standalone ``jq``, which on the Windows runners'
+    Git Bash does not live under the Unix defaults -- resolve the host's real
+    ``jq`` and append its directory, skipping when the host has none.
+    """
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("the read block pipes through jq; skip where jq is absent")
+    return os.pathsep.join(
+        [
+            str(tmp_path),
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            str(Path(jq).parent),
+        ]
+    )
 
 
 def _review_prompt(stage: str) -> str:
@@ -2507,3 +2530,250 @@ class TestDeploymentNeutralFramingParity:
             assert "a team deployment stays per-user" not in flat, name
             assert "Keep the review proportional to that shape" not in flat, name
             assert "Judge reachability against that shape" not in flat, name
+
+
+OVERRIDE_READ_LANES = (
+    "ux-review.yml",
+    "design-review.yml",
+    "claude-review.yml",
+    "codex-review.yml",
+    "first-principles-review.yml",
+)
+
+
+class TestOverrideReadFailureFailsClosed:
+    """Execute the ACTUAL override-record read from each lane with ``gh`` stubbed.
+
+    ``2>/dev/null || true`` used to collapse a failed comments read onto the
+    same empty string as "no override recorded", so a transient API failure
+    re-gated a verdict a human had already cleared with ``/ai-review
+    override``. These cases pin the three outcomes apart: a read that succeeds
+    resolves the recorded override, a transient failure is absorbed by the
+    bounded retry, and a read that never succeeds fails the step closed while
+    naming the read as the cause.
+    """
+
+    HEAD = "0" * 40
+
+    def _read_block(self, lane: str) -> str:
+        script = _step_script(_workflow(lane), "Resolve human override")
+        start = script.index('exact="')
+        end = script.index('actor="')
+        return script[start:end]
+
+    def _run_read(
+        self, tmp_path: Path, lane: str, gh_status: int = 0, fail_first: int = 0
+    ):
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the read block is Bash; skip where Bash is absent")
+        body = (
+            f"<!-- ai-review-human-override target=all head={self.HEAD} "
+            "actor=alice source=42 -->"
+        )
+        reply = tmp_path / "api-reply.json"
+        reply.write_text(
+            '[{"user":{"login":"github-actions[bot]"},"body":'
+            + f'"{body}"' + "}]",
+            encoding="utf-8",
+        )
+        attempts = tmp_path / "gh-attempts"
+        gh = tmp_path / "gh"
+        stub = f'#!/bin/sh\nprintf x >> "{attempts}"\n'
+        if gh_status:
+            # Stand in for an API failure on every attempt (5xx, rate limit).
+            stub += f'echo "gh: could not reach the API" >&2\nexit {gh_status}\n'
+        elif fail_first:
+            stub += (
+                f'if [ "$(wc -c < "{attempts}")" -le {fail_first} ]; then\n'
+                '  echo "gh: HTTP 502" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                f'cat "{reply}"\n'
+            )
+        else:
+            stub += f'cat "{reply}"\n'
+        gh.write_text(stub, encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        # The retry backoff is real in CI but pure latency in a test; stub it
+        # to a no-op so the failure cases do not sleep through the suite.
+        sleep_stub = tmp_path / "sleep"
+        sleep_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+        sleep_stub.chmod(0o755)
+        out_file = tmp_path / "record-out.txt"
+        # Reproduce the runner's own prologue (`bash -e`, no pipefail -- these
+        # steps declare no `set` line), then persist `$record` so the assertion
+        # reads what the rest of the step would have been handed.
+        script = (
+            self._read_block(lane)
+            + f'\nprintf \'%s\' "$record" > "{out_file}"\n'
+        )
+        result = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                # tmp_path first so the `gh` stub wins; starve any real gh of
+                # credentials so a stub-resolution failure can never turn into
+                # a live API call. GH_CONFIG_DIR keeps a fallback gh from
+                # loading the user's persisted authentication.
+                "PATH": _stub_path(tmp_path),
+                "GH_TOKEN": "",
+                "GITHUB_TOKEN": "",
+                "GH_CONFIG_DIR": str(tmp_path),
+                "LC_ALL": "C",
+                "REPO": "example/repo",
+                "PR": "1",
+                "HEAD": self.HEAD,
+                "TMPDIR": str(tmp_path),
+            },
+            cwd=tmp_path,
+        )
+        return result, attempts, out_file, body
+
+    @pytest.mark.parametrize("lane", OVERRIDE_READ_LANES)
+    def test_successful_read_resolves_the_recorded_override(
+        self, lane: str, tmp_path: Path
+    ):
+        result, attempts, out_file, body = self._run_read(tmp_path, lane)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert out_file.read_text(encoding="utf-8") == body
+        assert attempts.read_text(encoding="utf-8") == "x", "retry fired on a good read"
+
+    @pytest.mark.parametrize("lane", OVERRIDE_READ_LANES)
+    def test_transient_read_failure_is_absorbed(self, lane: str, tmp_path: Path):
+        result, attempts, out_file, body = self._run_read(
+            tmp_path, lane, fail_first=1
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert out_file.read_text(encoding="utf-8") == body
+        assert attempts.read_text(encoding="utf-8") == "xx"
+
+    @pytest.mark.parametrize("lane", OVERRIDE_READ_LANES)
+    def test_persistent_read_failure_fails_closed(self, lane: str, tmp_path: Path):
+        result, attempts, out_file, _ = self._run_read(tmp_path, lane, gh_status=1)
+        assert result.returncode != 0, "a read that never succeeded passed the step"
+        assert "::error::" in result.stdout
+        assert "re-run this job" in result.stdout
+        assert attempts.read_text(encoding="utf-8") == "xxx"
+        assert not out_file.exists(), "a record was emitted from a failed read"
+
+    @pytest.mark.parametrize("lane", OVERRIDE_READ_LANES)
+    def test_no_lane_still_swallows_the_override_read(self, lane: str):
+        # The defect shape itself must not return: within the resolve block the
+        # comments read carries no stderr/exit-status suppression. Judge only
+        # code lines -- the block's own comment QUOTES the banned shape while
+        # explaining why it is gone.
+        block = "\n".join(
+            line
+            for line in self._read_block(lane).splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert 'issues/$PR/comments" --paginate 2>/dev/null' not in block
+        assert "|| true" not in block
+
+
+class TestLedgerReadFailureFailsClosed:
+    """Execute the ACTUAL round-convergence ledger read with ``gh`` stubbed.
+
+    The old fail-soft (``|| printf '[]'``) collapsed a failed comments read
+    onto "no prior rulings", so a transient API failure re-litigated findings
+    a writer had already disposed.
+    """
+
+    def _read_block(self) -> str:
+        script = _step_script(_workflow("codex-review.yml"), "Write review prompt")
+        start = script.index('ledger_comments=""')
+        end = script.index('disp_authors="')
+        return script[start:end]
+
+    def _run_read(self, tmp_path: Path, gh_status: int = 0, fail_first: int = 0):
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the read block is Bash; skip where Bash is absent")
+        attempts = tmp_path / "gh-attempts"
+        gh = tmp_path / "gh"
+        stub = f'#!/bin/sh\nprintf x >> "{attempts}"\n'
+        if gh_status:
+            stub += f'echo "gh: could not reach the API" >&2\nexit {gh_status}\n'
+        elif fail_first:
+            stub += (
+                f'if [ "$(wc -c < "{attempts}")" -le {fail_first} ]; then\n'
+                '  echo "gh: HTTP 502" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                "printf '%s' '[{\"a\":1}][{\"b\":2}]'\n"
+            )
+        else:
+            # --paginate concatenates one JSON array per page; emit two pages
+            # so the assertion proves the pages are merged, not just echoed.
+            stub += "printf '%s' '[{\"a\":1}][{\"b\":2}]'\n"
+        gh.write_text(stub, encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        sleep_stub = tmp_path / "sleep"
+        sleep_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+        sleep_stub.chmod(0o755)
+        out_file = tmp_path / "ledger-out.json"
+        script = (
+            self._read_block()
+            + f'\nprintf \'%s\' "$comments_json" > "{out_file}"\n'
+        )
+        result = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                "PATH": _stub_path(tmp_path),
+                "GH_TOKEN": "",
+                "GITHUB_TOKEN": "",
+                "GH_CONFIG_DIR": str(tmp_path),
+                "LC_ALL": "C",
+                "REPO": "example/repo",
+                "PR": "1",
+                "TMPDIR": str(tmp_path),
+            },
+            cwd=tmp_path,
+        )
+        return result, attempts, out_file
+
+    def test_successful_read_merges_the_pages(self, tmp_path: Path):
+        result, attempts, out_file = self._run_read(tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(out_file.read_text(encoding="utf-8")) == [
+            {"a": 1},
+            {"b": 2},
+        ]
+        assert attempts.read_text(encoding="utf-8") == "x"
+
+    def test_transient_read_failure_is_absorbed(self, tmp_path: Path):
+        result, attempts, out_file = self._run_read(tmp_path, fail_first=1)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(out_file.read_text(encoding="utf-8")) == [
+            {"a": 1},
+            {"b": 2},
+        ]
+        assert attempts.read_text(encoding="utf-8") == "xx"
+
+    def test_persistent_read_failure_fails_closed(self, tmp_path: Path):
+        result, attempts, out_file = self._run_read(tmp_path, gh_status=1)
+        assert result.returncode != 0, "a read that never succeeded passed the step"
+        assert "::error::" in result.stdout
+        assert attempts.read_text(encoding="utf-8") == "xxx"
+        assert not out_file.exists(), "a ledger was emitted from a failed read"
+
+    def test_ledger_read_no_longer_swallows_its_status(self):
+        # The defect shape itself must not return. Judge only code lines --
+        # the block's own comment QUOTES the banned shape while explaining
+        # why it is gone.
+        block = "\n".join(
+            line
+            for line in self._read_block().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert 'issues/$PR/comments" --paginate 2>/dev/null' not in block
+        assert "|| true" not in block
+        assert "|| printf" not in block
