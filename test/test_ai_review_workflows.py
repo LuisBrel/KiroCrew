@@ -1308,6 +1308,115 @@ class TestFirstPrinciplesIntentCapSurvivesALongBody:
         assert raw.decode("utf-8").split("\n", 1)[0] == "x" * 7999
 
 
+class TestIntentReadFailureFailsClosed:
+    """Execute the ACTUAL PR-intent read from both lanes with ``gh`` stubbed.
+
+    `2>/dev/null || true` used to collapse a failed API read onto the same
+    empty string as a PR with no description, so the reviewer judged a PR that
+    appeared to state no intent and the author was blamed for a description
+    the workflow never read. These cases pin the three outcomes apart: a read
+    that succeeds is judged as written, a transient failure is absorbed by the
+    bounded retry, and a read that never succeeds fails the step closed while
+    naming the read as the cause.
+    """
+
+    def _read_block(self, lane: str) -> str:
+        workflow = _workflow(lane)
+        step = (
+            "Fetch PR intent (untrusted data file)"
+            if lane.startswith("fork-")
+            else "Prefetch the change as data files"
+        )
+        script = _step_script(workflow, step)
+        start = script.index('raw=""')
+        end = script.index("# Strip embedded media")
+        return script[start:end]
+
+    def _run_read(
+        self, tmp_path: Path, lane: str, gh_status: int = 0, fail_first: int = 0
+    ):
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the read block is Bash; skip where Bash is absent")
+        body_file = tmp_path / "api-reply.txt"
+        body_file.write_text("Title: t\n\nDescription:\nprose\n", encoding="utf-8")
+        attempts = tmp_path / "gh-attempts"
+        gh = tmp_path / "gh"
+        stub = f'#!/bin/sh\nprintf x >> "{attempts}"\n'
+        if gh_status:
+            # Stand in for an API failure on every attempt (5xx, rate limit).
+            stub += f'echo "gh: could not reach the API" >&2\nexit {gh_status}\n'
+        elif fail_first:
+            stub += (
+                f'if [ "$(wc -c < "{attempts}")" -le {fail_first} ]; then\n'
+                '  echo "gh: HTTP 502" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                f'cat "{body_file}"\n'
+            )
+        else:
+            stub += f'cat "{body_file}"\n'
+        gh.write_text(stub, encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        out_file = tmp_path / "raw-out.txt"
+        # Reproduce the step's own prologue (`pipefail` plus the runner's
+        # `bash -e`), then persist `$raw` so the assertion reads what the rest
+        # of the step would have been handed.
+        script = (
+            "set -uo pipefail\n"
+            + self._read_block(lane)
+            + f'\nprintf \'%s\' "$raw" > "{out_file}"\n'
+        )
+        result = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                # tmp_path first so the `gh` stub wins; starve any real gh of
+                # credentials so a stub-resolution failure can never turn into
+                # a live API call.
+                "PATH": f"{tmp_path}{os.pathsep}/usr/local/bin{os.pathsep}/usr/bin{os.pathsep}/bin",
+                "GH_TOKEN": "",
+                "GITHUB_TOKEN": "",
+                "LC_ALL": "C",
+                "REPO": "example/repo",
+                "PR": "1",
+                "TMPDIR": str(tmp_path),
+            },
+            cwd=tmp_path,
+        )
+        return result, attempts, out_file
+
+    @pytest.mark.parametrize("lane", FP_LANES)
+    def test_successful_read_is_judged_as_written(self, lane: str, tmp_path: Path):
+        result, attempts, out_file = self._run_read(tmp_path, lane)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert out_file.read_text(encoding="utf-8").startswith("Title: t"), (
+            out_file.read_text(encoding="utf-8")
+        )
+        assert attempts.read_text(encoding="utf-8") == "x", "retry fired on a good read"
+
+    @pytest.mark.parametrize("lane", FP_LANES)
+    def test_transient_read_failure_is_absorbed(self, lane: str, tmp_path: Path):
+        result, attempts, out_file = self._run_read(tmp_path, lane, fail_first=1)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert out_file.read_text(encoding="utf-8").startswith("Title: t")
+        assert attempts.read_text(encoding="utf-8") == "xx", "expected exactly one retry"
+
+    @pytest.mark.parametrize("lane", FP_LANES)
+    def test_unreadable_intent_fails_closed_not_silent(self, lane: str, tmp_path: Path):
+        # The failure this pins: a read that never succeeds must fail the step
+        # (re-runnable) instead of handing the reviewer an empty intent file.
+        result, attempts, _ = self._run_read(tmp_path, lane, gh_status=1)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "This is a read failure, not a missing description" in result.stdout, (
+            result.stdout
+        )
+        assert attempts.read_text(encoding="utf-8") == "xxx", "expected three attempts"
+
+
 class TestForkFirstPrinciplesContractStateIsThreeValued:
     """`steps.contract.outputs.available` has three states and two of them are
     opposite facts.

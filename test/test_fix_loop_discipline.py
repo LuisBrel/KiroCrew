@@ -17,10 +17,14 @@ still there and still pointed at the same names.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Iterator
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -449,3 +453,155 @@ class TestDeferralDiscipline:
         assert LABEL in text
         assert "Due: YYYY-MM-DD" in text
         assert "never deferrable" in text
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="the deferral step runs under bash on ubuntu-latest",
+)
+class TestDeferralCheckIssueReadFailure:
+    """Execute the ACTUAL deferral-validation step with ``gh`` stubbed.
+
+    `2>/dev/null || true` used to collapse a transient API failure onto the
+    same empty string as "this number is not an issue here", so a network blip
+    made every referenced follow-up look unresolvable and the checker posted a
+    refusal blaming the author for an untracked deferral they had in fact
+    tracked. These cases pin the outcomes apart: HTTP 404 keeps its meaning
+    (the reference does not resolve), a transient failure is absorbed by the
+    bounded retry, and a read that never succeeds fails the check closed
+    without posting the false refusal.
+    """
+
+    def _run_check(self, tmp_path: Path, mode: str):
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("the step is Bash; skip where Bash is absent")
+        jq = shutil.which("jq")
+        if jq is None:
+            pytest.skip("the step shells out to jq; skip where jq is absent")
+        wf = yaml.safe_load(DEFERRAL_CHECK.read_text(encoding="utf-8"))
+        steps = wf["jobs"]["validate-deferral"]["steps"]
+        step = next(
+            (
+                s
+                for s in steps
+                if s.get("name") == "Check the deferral names a tracked follow-up issue"
+            ),
+            None,
+        )
+        assert step is not None, "deferral validation step not found"
+        issue_file = tmp_path / "issue.json"
+        issue_file.write_text(
+            '{"state":"open","labels":[{"name":"deferred-finding"}],'
+            '"assignees":[{"login":"owner"}],"body":"Due: 2031-01-01","milestone":null}',
+            encoding="utf-8",
+        )
+        attempts = tmp_path / "gh-attempts"
+        posts = tmp_path / "gh-posts"
+        gh = tmp_path / "gh"
+        # The stub serves two shapes: the comment POST at the refusal tail
+        # (recorded, never failed) and the issue read (mode-dependent).
+        stub = (
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            "  *comments*)\n"
+            f'    printf \'%s\\n\' "$*" >> "{posts}"\n'
+            "    exit 0\n"
+            "    ;;\n"
+            "esac\n"
+            f'printf x >> "{attempts}"\n'
+        )
+        if mode == "persistent-failure":
+            stub += 'echo "gh: HTTP 500 Internal Server Error" >&2\nexit 1\n'
+        elif mode == "not-found":
+            stub += 'echo "gh: Not Found (HTTP 404)" >&2\nexit 1\n'
+        elif mode == "transient-then-good":
+            stub += (
+                f'if [ "$(wc -c < "{attempts}")" -le 1 ]; then\n'
+                '  echo "gh: HTTP 502 Bad Gateway" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                f'cat "{issue_file}"\n'
+            )
+        else:
+            stub += f'cat "{issue_file}"\n'
+        gh.write_text(stub, encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        env = {
+            # tmp_path first so the `gh` stub wins; jq's own directory follows
+            # so the hermetic PATH still finds it on hosts where it does not
+            # live in a standard system dir. Starve any real gh of credentials
+            # so a stub-resolution failure can never turn into a live API call.
+            "PATH": (
+                f"{tmp_path}{os.pathsep}{Path(jq).parent}{os.pathsep}"
+                f"/usr/local/bin{os.pathsep}/usr/bin{os.pathsep}/bin"
+            ),
+            "GH_TOKEN": "",
+            "GITHUB_TOKEN": "",
+            "LC_ALL": "C",
+            "COMMENT_BODY": (
+                "<!-- ai-review-disposition target=gpt head=abc -->\n"
+                "- **finding**: accepted-and-deferred -- tracked in #123"
+            ),
+            "REPO": "example/repo",
+            "PR_NUMBER": "999",
+            "COMMENT_URL": "https://example.com/pr/999#comment-1",
+            "TMPDIR": str(tmp_path),
+        }
+        result = subprocess.run(
+            [bash, "-c", step["run"]],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        return result, attempts, posts
+
+    def test_tracked_deferral_passes_on_one_read(self, tmp_path: Path) -> None:
+        result, attempts, posts = self._run_check(tmp_path, "good")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "tracked by issue #123" in result.stdout, result.stdout
+        assert not posts.exists(), "a refusal was posted for a tracked deferral"
+        assert attempts.read_text(encoding="utf-8") == "x", "retry fired on a good read"
+
+    def test_transient_issue_read_is_absorbed(self, tmp_path: Path) -> None:
+        result, attempts, posts = self._run_check(tmp_path, "transient-then-good")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "tracked by issue #123" in result.stdout, result.stdout
+        assert not posts.exists(), "a refusal was posted despite the retry succeeding"
+        assert attempts.read_text(encoding="utf-8") == "xx", "expected exactly one retry"
+
+    def test_persistent_read_failure_fails_closed_without_blaming_the_author(
+        self, tmp_path: Path
+    ) -> None:
+        # The failure this pins: a read that never succeeds must fail the
+        # check (re-runnable) instead of posting a refusal that blames the
+        # author for an untracked deferral the checker never actually read.
+        # What IS posted is the unverified-state notice -- this lane has no
+        # PR-visible check row, so a silent red run would be a signal nobody
+        # sees.
+        result, attempts, posts = self._run_check(tmp_path, "persistent-failure")
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "This is a read failure, not an untracked deferral" in result.stdout, result.stdout
+        posted = posts.read_text(encoding="utf-8") if posts.exists() else ""
+        assert posted, "the unverified-state notice was never posted"
+        assert "Could not verify this deferral" in posted, posted
+        assert "not yet tracked" not in posted, "the false refusal was still posted"
+        assert attempts.read_text(encoding="utf-8") == "xxx", "expected three attempts"
+
+    def test_missing_issue_keeps_meaning_an_untracked_deferral(self, tmp_path: Path) -> None:
+        # HTTP 404 is the one failure that legitimately means "this reference
+        # does not resolve": the refusal path must still fire, on the first
+        # attempt, with no retry spent on it.
+        result, attempts, posts = self._run_check(tmp_path, "not-found")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Deferral promise is incomplete" in result.stdout, result.stdout
+        posted = posts.read_text(encoding="utf-8") if posts.exists() else ""
+        assert "not yet tracked" in posted, "the refusal reply was never posted"
+        assert attempts.read_text(encoding="utf-8") == "x", "a 404 must not be retried"
+        # The reply is staged under the step's temp dir, so this test's TMPDIR
+        # containment binds -- executing the real step must not leave an
+        # artifact at a hardcoded host path that outlives the run.
+        assert (tmp_path / "reply.md").exists(), "reply was not staged under TMPDIR"
