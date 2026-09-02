@@ -992,8 +992,8 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # (chat_runner) supplies the binding key and arms the loop.
     if mcp_core._autonudge_binding_key(sk) is None and sk:
         return (
-            "monitor_start only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r}). For other "
+            "monitor_start only works from within a dashboard, Slack, Discord, "
+            f"or Webex session (current session_key={sk!r}). For other "
             "contexts use cron_add or a HEARTBEAT.md task."
         )
     message = args["message"].strip()
@@ -1035,7 +1035,7 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             )
             + ". End your turn now; once the loop is armed it wakes you on "
             "that interval — but arming happens when this turn's result is "
-            "processed, and only a live dashboard/Slack/Discord session can "
+            "processed, and only a live dashboard/Slack/Discord/Webex session can "
             "host a loop, so do NOT assume it armed. Call autonudge_stop when "
             "the exit condition is met; hitting the cap is a runaway backstop, "
             "not a finish. Use monitor_update if the instruction goes stale."

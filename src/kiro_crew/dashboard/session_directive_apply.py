@@ -569,7 +569,8 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
     # shape, while the slot's persisted app provenance cannot be user-selected.
     # Ordinary dashboard/channel monitors have no tombstone consumer, so retain
     # their historical removal behavior instead of leaving a paused loop.
-    if getattr(loop, "monitor", None) is not None:
+    structured = getattr(loop, "monitor", None) is not None
+    if structured:
         from kiro_crew.autonudge_authz import authorize_and_stop_monitor
 
         _loop, error, _status = await authorize_and_stop_monitor(
@@ -585,6 +586,12 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
         await svc.remove(loop_id)
+    if structured:
+        return (
+            f"Structured monitor {loop_id} stopped and retained for inspection"
+            + (f" (reason: {reason})" if reason else "")
+            + ". No further monitor wakes will fire."
+        )
     return (
         f"Auto-nudge loop {loop_id} stopped on this session"
         + (f" (reason: {reason})" if reason else "")

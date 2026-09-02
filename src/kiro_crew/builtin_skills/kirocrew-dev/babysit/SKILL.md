@@ -2,6 +2,7 @@
 name: babysit
 description: Use when a user asks to babysit, monitor, keep checking, keep an eye on, or report when a pull request, CI run, ticket, deployment, or other changing target reaches an outcome.
 inject_on_trigger: false
+triggers: babysit, keep checking, keep an eye on, let me know when, monitor pull request, monitor pr, watch pull request, watch pr
 tags: [skill, kirocrew, monitor, babysit]
 ---
 

@@ -30,6 +30,18 @@ _TARGET = "https://github.com/acme/widgets/pull/7"
 _BABYSIT_SKILL = (
     Path(__file__).parents[1] / "src/kiro_crew/builtin_skills/kirocrew-dev/babysit/SKILL.md"
 )
+_SYSTEM_PROMPT = Path(__file__).parents[1] / "src/kiro_crew/config/prompt.md"
+
+
+def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -> None:
+    skill = _BABYSIT_SKILL.read_text(encoding="utf-8")
+    prompt = _SYSTEM_PROMPT.read_text(encoding="utf-8")
+
+    assert "triggers: babysit" in skill
+    assert "monitor_watch" in prompt
+    assert "Use `monitor_start`" in prompt
+    assert "only for unsupported targets" in prompt
+    assert "HEARTBEAT.md" not in prompt
 
 
 def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> None:

@@ -47,6 +47,7 @@ import pytest
 
 from kiro_crew.autonudge import APPROVAL_STALL_REASON, NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -731,6 +732,37 @@ class TestNotifyNudgeExpired:
         body = ds.notify.call_args.args[2]
         assert title == "Monitoring loop spent its time budget"
         assert "60s wall-clock budget" in body
+
+    @pytest.mark.parametrize(
+        ("outcome", "title"),
+        [
+            (MonitorOutcome.SUCCESS, "Pull request monitor reached review readiness"),
+            (MonitorOutcome.BUDGET, "Pull request monitor spent its budget"),
+            (MonitorOutcome.BLOCKED, "Pull request monitor stopped on a terminal blocker"),
+            (
+                MonitorOutcome.TARGET_UNAVAILABLE,
+                "Pull request monitor could not deliver an action",
+            ),
+        ],
+    )
+    def test_structured_terminal_wording(self, outcome: MonitorOutcome, title: str):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(id="monitor-1", slot_key="chat-1", message="")
+        loop.active = False
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            created_ts=1.0,
+            outcome=outcome,
+            stopped_at=2.0,
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        assert ds.notify.call_args.args[1] == title
 
     def test_cycle_cap_wording(self):
         orch = _make_orchestrator()

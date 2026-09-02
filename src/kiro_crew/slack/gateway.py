@@ -217,6 +217,7 @@ from kiro_crew.monitoring.completion import (
 from kiro_crew.monitoring.models import (
     MonitorActionDisposition,
     MonitorDispatchResult,
+    MonitorOutcome,
     monitor_state_public_dict,
 )
 from kiro_crew.platform import boot_platform
@@ -6213,6 +6214,7 @@ class GatewayOrchestrator:
             return result
 
         controller: MonitorController | None = None
+        notified_monitor_terminals: set[tuple[str, MonitorOutcome, float]] = set()
 
         async def _monitor_tick(loop: NudgeLoop) -> None:
             if controller is not None:
@@ -6221,6 +6223,18 @@ class GatewayOrchestrator:
         def _observer(event: str, loop: NudgeLoop | None) -> None:
             if event == "expired" and loop is not None:
                 self._notify_nudge_expired(loop)
+            elif loop is not None and loop.monitor is not None and not loop.active:
+                state = loop.monitor
+                if state.outcome in {
+                    MonitorOutcome.SUCCESS,
+                    MonitorOutcome.BLOCKED,
+                    MonitorOutcome.BUDGET,
+                    MonitorOutcome.TARGET_UNAVAILABLE,
+                }:
+                    terminal_key = (loop.id, state.outcome, state.stopped_at)
+                    if terminal_key not in notified_monitor_terminals:
+                        notified_monitor_terminals.add(terminal_key)
+                        self._notify_nudge_expired(loop)
             if self.dashboard_state and loop is not None:
                 loop_payload: dict[str, Any] = {
                     "id": loop.id,
@@ -6297,6 +6311,34 @@ class GatewayOrchestrator:
             # Dashboard loops bind on the BARE slot key, so re-qualify those to
             # get a working jump-to-source slot link.
             meta = None if is_channel_key(key) else self._notif_meta(f"dashboard:{key}")
+            if loop.monitor is not None:
+                outcome = loop.monitor.outcome
+                if outcome is MonitorOutcome.SUCCESS:
+                    title = "Pull request monitor reached review readiness"
+                    body = (
+                        "The structured monitor reached its review-ready objective "
+                        "without spending another agent turn."
+                    )
+                elif outcome is MonitorOutcome.BUDGET:
+                    title = "Pull request monitor spent its budget"
+                    body = (
+                        "The structured monitor stopped at its configured budget "
+                        "before the pull request became review-ready."
+                    )
+                elif outcome is MonitorOutcome.TARGET_UNAVAILABLE:
+                    title = "Pull request monitor could not deliver an action"
+                    body = (
+                        "The structured monitor stopped because its owning session "
+                        "could not accept an actionable wake."
+                    )
+                else:
+                    title = "Pull request monitor stopped on a terminal blocker"
+                    body = (
+                        "The structured monitor found a terminal provider or pull "
+                        "request condition before review readiness."
+                    )
+                self.dashboard_state.notify("agent", title, body, meta=meta)
+                return
             capped_out = loop.max_cycles and loop.cycle_count >= loop.max_cycles
             if not capped_out and runtime_budget_exceeded(loop):
                 title = "Monitoring loop spent its time budget"

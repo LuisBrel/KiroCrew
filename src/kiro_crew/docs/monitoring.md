@@ -49,9 +49,10 @@ specific logs, comments, or diff needed for the change instead of replaying the
 whole polling history. A restart cannot wake twice for the same accepted
 fingerprint.
 
-Terminal success does not wake the conversation. When an explicit final report
-or notification is required even if no action is needed, ask for a finite legacy
-loop instead.
+Terminal success does not wake the conversation or spend another model turn. A
+dashboard notification reports structured success, blockers, exhausted budgets,
+and unavailable owning sessions. When a conversational final report must be
+generated even if no action is needed, ask for a finite legacy loop instead.
 
 ## Inspect, update, stop, and restart
 

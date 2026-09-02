@@ -1735,9 +1735,11 @@ class AutoNudgeService:
                 reason = monitor_budget_reason(state, now=now)
                 if reason:
                     stopped = deepcopy(loop)
+                    if stopped.monitor is not None:
+                        stopped.monitor.last_decision = MonitorDecision.STOP_BUDGET
                     self._apply_monitor_budget_stop(stopped, reason, stopped_at=now)
                     await self._persist_staged_monitor_locked(loop, stopped)
-                    self._cancel_timer(loop.id)
+                    self._sync_terminal_completion_timer(loop)
                     stopped_loop = loop
         if stopped_loop is not None:
             self._emit("updated", stopped_loop)

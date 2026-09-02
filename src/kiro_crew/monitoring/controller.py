@@ -135,8 +135,6 @@ class MonitorController:
         if state.wake_in_flight:
             deadline = state.completion_evidence_deadline
             if state.wake_delivery is MonitorDispatchResult.BUSY:
-                if await self._service.stop_monitor_if_budget_exhausted(loop.id, now=now):
-                    return MonitorDecision.STOP_BUDGET
                 if now < state.next_probe_at:
                     return MonitorDecision.NO_CHANGE
                 if monitor_budget_reason(state, now=now):

@@ -910,6 +910,11 @@ generation, and holds no runtime-written frontmatter, since a builtin skill is
 re-synced by `rmtree` + `copytree` on upgrade.
 
 The bundled `kirocrew-dev/babysit` skill is an on-demand, pointer-on-trigger recipe.
+Its explicit trigger vocabulary covers babysit/watch/monitor phrasing for pull
+requests, so ordinary requests reach the recipe without placing the whole body in
+every prompt. The base prompt points long-lived pull-request readiness requests to
+this skill and prefers the structured path whenever typed provider facts fully
+determine the objective.
 For a public GitHub pull request with the `review_ready` objective it gives the
 agent one exact bounded `monitor_watch` call and makes retained inspection state
 authoritative; its acknowledgement remains pending until the current turn ends,

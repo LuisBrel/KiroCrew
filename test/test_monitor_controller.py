@@ -909,6 +909,67 @@ async def test_cadence_edits_during_busy_preserve_retry_and_runtime_bound(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_busy_budget_stop_clears_late_acceptance_before_terminating(tmp_path):
+    """A BUSY settlement followed by provider acceptance cannot retain a dead claim."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(max_runtime_secs=20),
+        now=100.0,
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=110.0)
+    await service.record_monitor_dispatch_busy(loop.id, "fp-1", now=110.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    controller = MonitorController(
+        service,
+        AsyncMock(),
+        provider=_Provider(_result(MonitorObservationStatus.PENDING)),
+    )
+
+    assert await controller.tick(loop, now=124.0) is MonitorDecision.NO_CHANGE
+    retry_at = loop.next_due_ts
+    assert await controller.tick(loop, now=retry_at) is MonitorDecision.STOP_BUDGET
+
+    assert loop.monitor is not None
+    assert loop.monitor.outcome is MonitorOutcome.BUDGET
+    assert not loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline == 0.0
+    assert loop.id not in service._accepted_monitor_turns
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_budget_stop_keeps_terminal_completion_timer(tmp_path):
+    """The shared budget helper must preserve an accepted turn's finite expiry."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(max_runtime_secs=20),
+        now=100.0,
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=110.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+
+    assert await service.stop_monitor_if_budget_exhausted(loop.id, now=121.0)
+
+    assert loop.monitor is not None
+    assert loop.monitor.outcome is MonitorOutcome.BUDGET
+    assert loop.monitor.last_decision is MonitorDecision.STOP_BUDGET
+    assert loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline > 121.0
+    assert loop.id in service._timers
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_cadence_edits_during_dispatch_preserve_evidence_deadline(tmp_path):
     """Repeated cadence changes cannot postpone missing-completion recovery."""
     dispatched = AsyncMock(return_value=monitor_models.MonitorDispatchResult.DISPATCHED)
