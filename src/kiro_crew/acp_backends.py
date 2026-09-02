@@ -271,6 +271,21 @@ ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
 ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
+# Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
+# Both members act on the ``/compact`` prompt that ``AcpProvider.compact()``
+# sends: claude-agent-acp performs the compaction natively inside the
+# session/prompt turn, and kiro-cli ACKs the prompt then emits
+# ``_kiro.dev/compaction/status``, which ``wait_for_compaction()`` picks up.
+# KAS is NOT a member: it treats the ``/compact`` prompt as ordinary text and
+# never emits a compaction status in response — its ``summarization_*`` frames
+# (mapped to compaction status by ``acp.kas_wire``) fire only for
+# KAS-initiated auto-summarization. A manual ``/compact`` on KAS therefore
+# strands the status waiter for the full ``COMPACT_WAIT_TIMEOUT_SECS`` (#7800),
+# so the manual entry points refuse it up front instead. This set gates ONLY
+# the manual command: KAS auto-summarization keeps mapping to compaction
+# status unchanged.
+ACP_BACKENDS_COMPACT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
+
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
 # Crew's own layer for them. This is the one membership test that fails OPEN:

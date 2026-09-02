@@ -5446,6 +5446,42 @@ async def _run_chat(
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True
+        # ── Manual /compact capability gate ──
+        # KAS never answers the /compact prompt with a compaction status (its
+        # summarization_* frames fire only for KAS-initiated auto-summarization),
+        # so dispatching the command would strand the deferred
+        # wait_for_compaction() below for the full COMPACT_WAIT_TIMEOUT_SECS
+        # (#7800). Refuse up front with a user-visible error instead. Checked
+        # against the ACQUIRED session's provider, not config: the live session's
+        # backend is authoritative over whatever config says this turn. Sits
+        # after get_or_create because only the client knows its backend; the
+        # session itself stays usable for ordinary turns.
+        if first_word == "/compact":
+            # Declared on the LLMProvider ABC with a None default (H14); the ACP
+            # implementations answer from ACP_BACKENDS_COMPACT membership. The
+            # isinstance guard means only a provider that positively names an
+            # unsupported backend id is refused — a mocked provider's truthy
+            # attribute never reads as one.
+            _compact_unsupported = client.manual_compact_unsupported_backend
+            if isinstance(_compact_unsupported, str) and _compact_unsupported:
+                sel().log_tool_invocation(
+                    session_key=session_key,
+                    agent=slot.agent or "kirocrew",
+                    source="dashboard",
+                    tool_name=first_word,
+                    tool_kind="slash_command",
+                    outcome="unsupported_backend",
+                    metadata={"backend": _compact_unsupported, "slot": slot.key},
+                )
+                slot.append(
+                    "assistant",
+                    f"⚠️ Compaction is not supported by the {_compact_unsupported} "
+                    "backend. It summarizes the conversation automatically when "
+                    "context runs low; use `/new` for a fresh session.",
+                    "msg msg-a",
+                )
+                state.push_slots_update()
+                return
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the

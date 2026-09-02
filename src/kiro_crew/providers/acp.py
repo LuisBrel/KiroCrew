@@ -26,6 +26,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
@@ -495,6 +496,28 @@ class AcpProvider(LLMProvider):
         until someone adds it deliberately.
         """
         return self._client.backend in ACP_BACKENDS_SESSION_SHARING
+
+    @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when a manual ``/compact`` cannot be served, else ``None``.
+
+        Answered from ``ACP_BACKENDS_COMPACT`` membership (harness-parity H6):
+        kiro-cli answers the ``/compact`` prompt with
+        ``_kiro.dev/compaction/status`` and claude-agent-acp compacts natively
+        in-prompt, while KAS treats the prompt as ordinary text and never emits
+        a status — its ``summarization_*`` frames fire only for KAS-initiated
+        auto-summarization — so an ungated dispatch strands
+        ``wait_for_compaction()`` for the full ``COMPACT_WAIT_TIMEOUT_SECS``
+        (#7800). Read off the backend STRING, not the ``is_*_backend``
+        properties, matching ``provider_label``'s MagicMock caution; a
+        non-``str`` value answers ``None`` so a spec'd double never reads as a
+        refusal. The empty string is ``ACP_BACKEND_KIRO`` (a member), so a
+        non-``None`` answer is always a non-empty backend id.
+        """
+        backend = getattr(self._client, "backend", ACP_BACKEND_KIRO)
+        if not isinstance(backend, str) or backend in ACP_BACKENDS_COMPACT:
+            return None
+        return backend
 
     @property
     def uses_kiro_identity_store(self) -> bool:

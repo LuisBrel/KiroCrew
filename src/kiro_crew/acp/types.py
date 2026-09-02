@@ -18,6 +18,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KNOWN,

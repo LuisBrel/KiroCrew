@@ -319,6 +319,23 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when this provider cannot serve a manual ``/compact``,
+        ``None`` when the command is fine to dispatch.
+
+        The manual entry points gate on this so an unsupported backend gets an
+        immediate, user-visible refusal instead of a prompt whose
+        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``
+        (#7800). Default ``None`` — a provider that has not positively named an
+        unsupported backend passes through, because it handles ``/compact`` on
+        its own terms. Declared here with a safe default rather than probed off
+        the instance (harness-parity H14); the ACP implementations answer from
+        ``ACP_BACKENDS_COMPACT`` membership. Consumers must act only on a
+        non-empty ``str`` value, so a mocked provider's attribute never reads
+        as a refusal."""
+        return None
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child authenticates from kiro-cli's own
         identity store, so an external ``kiro-cli logout`` invalidates a process
