@@ -1,0 +1,14 @@
+{
+  "task_id": "task-narrow-exfil-url-redaction",
+  "task_description": "Fix issue #7820: the dashboard chat's 'suspicious URL' redaction (frontend sanitizeExfiltrationUrls in website/src/utils/sanitize.ts) has a high false-positive rate on legitimate long/query-heavy https URLs (prefilled github.com issue links, monitorportal.amazon.com dashboard links). Narrow the heuristic by mirroring the backend's layered structure: keep heavy-percent-encoding and hard-credential-marker checks unconditional for every host, but skip ONLY the base64-blob/aggregate-query-length heuristics for a narrow, code-owned, exact-match host allowlist (github.com, monitorportal.amazon.com). This closes the false positives without reopening the XPIA data-exfiltration hole for arbitrary hosts. Preserve backend/frontend JWT credential-pattern parity (test_redaction_mirror_parity.py) and the Safari-14 no-lookbehind constraint. Add frontend vitest coverage and update the security spec doc.",
+  "status": "completed",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
+  "blocked_reason": null,
+  "verification": {
+    "build": "pass",
+    "tests": "pass",
+    "test_quality": "pass",
+    "docker_build": "skipped",
+    "summary": "Backend: test_diagnostics.py + test_redaction_mirror_parity.py = 52 passed; test_security.py exfil/credential/oauth/slack subset = 262 passed. Frontend: sanitizeExfiltrationUrls.test.ts (12, incl. an accepted-residual pin) + sanitizeCredentials.test.ts (8) + sanitizeXss.jsdom.test.ts (6). `npm run build` succeeds (built in 24s), confirming the Safari-14 no-lookbehind entry-chunk constraint holds. Test quality verified by falsification: reverting website/src/utils/sanitize.ts to the pre-fix baseline (commit a53586a1c) makes exactly the 3 exempt-host tests FAIL (long github.com link, long monitorportal link, case-insensitive GitHub.com) while the unconditional-tier tests keep passing, proving the new tests exercise the exemption code path and would fail if the fix were reverted. Working tree restored to the committed fix; JWT credential parity untouched. Semantic review APPROVED (v1); two non-blocking polish items applied (commit d38d0c488): explicit residual-risk + port-agnostic note in security.md, and a test pinning the sub-200-char base64-blob-at-exempt-host accepted residual. No Docker (frontend/backend host validation sufficient)."
+  }
+}
