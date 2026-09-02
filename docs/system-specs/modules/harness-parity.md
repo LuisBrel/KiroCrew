@@ -139,8 +139,12 @@ source of truth for what blocks.
    harness does not land yet — say so in the PR instead of widening a seam.
 4. A new harness adds rows to `ACP_BACKENDS_KNOWN`, a `PROVIDER_LABEL_*`, and
    an explicit decision for every Group B membership set. "Inherited the
-   default" is not a decision. Note that `ACP_BACKENDS_KNOWN` and
-   `BASELINE_SELECTABLE_BACKENDS` are now equal, so adding an id to the first
-   without adding it to the second is the NARROWING that
-   `test_baseline_ships_every_known_backend` fails on — the id becomes spellable
-   but unreachable, and that state needs a stated reason rather than a default.
+   default" is not a decision. `BASELINE_SELECTABLE_BACKENDS` is otherwise
+   `ACP_BACKENDS_KNOWN`, so leaving a known id out of the baseline is a
+   NARROWING that `test_baseline_ships_every_known_backend` fails on **unless**
+   the id is named in that test's `NOT_SHIPPED_SELECTABLE` allowlist together
+   with the reason it cannot be offered yet: the id becomes spellable but
+   unreachable, and that state needs a stated reason rather than a default.
+   `ACP_BACKEND_CODEX` is the only member today. The full sequence a new
+   harness walks, and which stage decides whether it lands dormant or
+   selectable, is [harness-onboarding.md](harness-onboarding.md).
