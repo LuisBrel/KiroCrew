@@ -8704,7 +8704,24 @@ class TestResolveKiroBinEnvOverride:
         )
         # No inherited snapshot descriptor: the installed binary is exec'd in
         # place, so there is nothing to hand down to the wrapper chain.
-        assert "pass_fds" not in spawn_call.kwargs
+        #
+        # macOS is the exception, and for a different fd. Since #6971
+        # ("fix(macos): enter the bound agent workspace by fchdir, not
+        # /dev/fd") _spawn binds the agent workspace to a directory descriptor
+        # and hands it to create_subprocess_limited as chdir_fd; the gateway
+        # then adds exactly that one descriptor to pass_fds so the spawn shim
+        # can fchdir into it. Off darwin nothing binds, chdir_fd is None, and
+        # pass_fds stays absent as the comment above describes.
+        if sys.platform == "darwin":
+            pass_fds = spawn_call.kwargs["pass_fds"]
+            # Exactly the bound workspace descriptor, nothing else: no snapshot
+            # fd is inherited here, so the only descriptor handed down is the
+            # one the fchdir binding produced.
+            assert isinstance(pass_fds, tuple)
+            assert len(pass_fds) == 1
+            assert isinstance(pass_fds[0], int) and pass_fds[0] >= 0
+        else:
+            assert "pass_fds" not in spawn_call.kwargs
 
     def test_env_override_ignored_when_missing_file(self, tmp_path):
         # A configured-but-nonexistent path must not be returned; resolution
