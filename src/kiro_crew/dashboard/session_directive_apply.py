@@ -389,11 +389,24 @@ def _no_loop_message(svc: Any, binding: str) -> str:
     loop; naming other sessions' loops here would hand the model the
     identifiers that schema withholds. Cross-session enumeration stays on the
     token-authed dashboard API. A count is all this branch needs, because the
-    caller's question is whether ITS OWN stop took effect.
+    caller's question is whether ITS OWN stop took effect. The keys themselves
+    go to the log instead, which no model reads.
     """
     active = [lp for lp in svc.list_all() if getattr(lp, "active", True)]
     if not active:
         return "No active auto-nudge loop on this session — nothing to stop."
+    # SERVER-SIDE ONLY, and the reason this branch logs at all: a miss has two
+    # candidate causes — a slot-key spelling the binding lookup does not model,
+    # or an arming path that registered a key this session later resolves
+    # differently — and they are distinguishable only from the caller's binding
+    # next to the keys the store actually holds. A slot key can carry a channel
+    # or user identifier, so the pair stays out of the return value and out of
+    # every user-facing string.
+    logger.warning(
+        "AutoNudge: stop resolved no loop for binding %r; active loop slot keys: %s",
+        binding,
+        ", ".join(sorted(repr(getattr(lp, "slot_key", "")) for lp in active)),
+    )
     return (
         "NOTHING WAS STOPPED. No auto-nudge loop is bound to this session "
         f"(binding: {binding}), but {len(active)} auto-nudge loop(s) are running on "

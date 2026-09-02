@@ -30,6 +30,7 @@ the tools are stateless and the loop mutation happens in-process in the applier.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -893,6 +894,82 @@ def test_applier_autonudge_stop_ignores_inactive_loops_in_the_miss_diagnostic(mo
     assert "loop-dead" not in result
     assert svc.removed == []
     assert svc.updated == []
+
+
+# The miss message is asserted here as a LITERAL, not rebuilt from the applier's
+# own f-string: the diagnostic below must stay server-side, so a change that
+# leaks a slot key into the model's tool result has to fail this comparison
+# rather than be recomputed into agreement with itself.
+_MISS_MESSAGE = (
+    "NOTHING WAS STOPPED. No auto-nudge loop is bound to this session "
+    "(binding: chat-3-1700000000), but 2 auto-nudge loop(s) are running on "
+    "other sessions. A loop can only be stopped from the session it is bound "
+    "to, so this call could not reach them."
+)
+
+
+def test_applier_autonudge_stop_miss_logs_caller_binding_and_active_slot_keys(monkeypatch, caplog):
+    """The miss branch records the pair that identifies WHICH miss this is.
+
+    A miss has two possible causes — a slot-key spelling the lookup does not
+    model, or an arming path that registered a key the session later resolves
+    differently — and they are told apart only by the caller's resolved binding
+    next to the slot keys the store actually holds. Nothing else captures that
+    pair, so the diagnostic has to be emitted where the miss is detected.
+
+    Server-side ONLY: the log carries the slot keys, the returned message must
+    stay byte-identical and keep reporting a count.
+    """
+    loops = [
+        _FakeLoop("loop-a", slot_key="chat-91-1700009991"),
+        _FakeLoop("loop-b", slot_key="slack:T1/C2/1700009992"),
+    ]
+    svc = _FakeSvc(None, all_loops=loops)
+    _install_svc(monkeypatch, svc)
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.session_directive_apply"):
+        result = asyncio.run(
+            apply_session_directive(
+                _fake_state(), _fake_slot(), _SESSION, "autonudge_stop", {"reason": "done"}
+            )
+        )
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "kiro_crew.dashboard.session_directive_apply"
+    ]
+    assert len(warnings) == 1
+    logged = warnings[0].getMessage()
+    assert binding_key_for(_SESSION) in logged
+    for lp in loops:
+        assert lp.slot_key in logged
+
+    # The model-visible half is unchanged, and the keys stay out of it.
+    assert result == _MISS_MESSAGE
+    for lp in loops:
+        assert lp.slot_key not in result
+    assert svc.removed == []
+    assert svc.updated == []
+
+
+def test_applier_autonudge_stop_logs_nothing_when_no_loop_exists(monkeypatch, caplog):
+    """No loop anywhere is an idempotent success, not a resolution failure.
+
+    Warning on it would fire on every ordinary duplicate stop and bury the miss
+    the log exists to catch.
+    """
+    svc = _FakeSvc(None)
+    _install_svc(monkeypatch, svc)
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.session_directive_apply"):
+        result = asyncio.run(
+            apply_session_directive(
+                _fake_state(), _fake_slot(), _SESSION, "autonudge_stop", {"reason": "done"}
+            )
+        )
+    assert "nothing to stop" in result.lower()
+    assert [
+        r for r in caplog.records if r.name == "kiro_crew.dashboard.session_directive_apply"
+    ] == []
 
 
 def test_autonudge_stop_directive_does_not_read_as_confirmation(default_install):
