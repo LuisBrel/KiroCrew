@@ -2895,8 +2895,17 @@ def _expand_prompt_mention(
     mention = parts[0] if parts else body
     user_text = parts[1].strip() if len(parts) > 1 else ""
 
+    # Resolve local prompts against THIS chat slot's project (per-slot), the
+    # same directory the slot's agent runs in, so an @mention of a local prompt
+    # matches the caller's checkout rather than a gateway-global dir. A slot
+    # with no project resolves to None -> local prompts simply are not matched
+    # (fail-closed), the same as before when there was no gateway project. This
+    # reads slot.project directly (this slot, no cross-slot fallback) — the SAME
+    # question the HTTP prompt surface asks via requesting_slot_project — so the
+    # chat and HTTP surfaces agree on where "local" is for a given chat.
+    project_dir = Path(slot.project) if slot.project else None
     try:
-        match = _find_prompt(mention)
+        match = _find_prompt(mention, project_dir)
     except Exception:
         return message, "not_found"
     if not match:
@@ -2905,8 +2914,21 @@ def _expand_prompt_mention(
     if is_sensitive_path(match["path"]):
         return message, "blocked"
 
+    # Read the path the resolver CANONICALIZED, and re-check it there. The check
+    # above tests the name as addressed, which for a link is not the file a read
+    # by that name would return — so a project shipping
+    # ``.kiro/prompts/creds.md -> ~/.aws/credentials`` would pass a check on the
+    # link and have its target injected into the turn. Every local/global entry
+    # reaching here was minted by the listing gate, which refuses a link outright,
+    # so this closes a swap landing between that gate and this read rather than a
+    # standing hole; package SOP paths arrive already resolved, so it is a no-op
+    # for them.
+    resolved = validate_file_path(match["path"])
+    if resolved is None:
+        return message, "blocked"
+
     try:
-        raw = Path(match["path"]).read_bytes()
+        raw = Path(resolved).read_bytes()
     except OSError:
         return message, "not_found"
     if len(raw) > MAX_PROMPT_BYTES:
@@ -5221,7 +5243,10 @@ async def _run_chat(
             # _list_aim_prompts walks the (possibly large or edition-supplied)
             # prompt_source_roots() with rglob + file reads; keep it off the
             # event loop so a slow/network-backed root can't stall the gateway.
-            prompts = await asyncio.to_thread(_list_aim_prompts)
+            # Pass THIS slot's project so its local prompts are listed per-slot
+            # (fail-closed to global-only when the slot has no project).
+            project_dir = Path(slot.project) if slot.project else None
+            prompts = await asyncio.to_thread(_list_aim_prompts, project_dir)
         except Exception:
             prompts = []
         if not prompts:
