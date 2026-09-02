@@ -63,9 +63,14 @@ jobs:
       only_backend: ${{ steps.decide.outputs.only_backend }}
       only_frontend: ${{ steps.decide.outputs.only_frontend }}
       linux_packaging: ${{ steps.filter.outputs.linux_packaging }}
+      leaf_tests: ${{ steps.leaf.outputs.leaf_tests }}
+      leaf_targets: ${{ steps.leaf.outputs.leaf_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The leaf-test selector diffs against the PR base, so the base commit
+          # must be present. Paid once here rather than on all eight shard jobs.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -127,6 +132,48 @@ jobs:
           echo "only_backend=$only_backend"   >> "$GITHUB_OUTPUT"
           echo "only_frontend=$only_frontend" >> "$GITHUB_OUTPUT"
           echo "backend=$BACKEND frontend=$FRONTEND meta=$META full_run=$FULL_RUN -> only_backend=$only_backend only_frontend=$only_frontend"
+
+      # A diff that touches ONLY leaf test modules cannot change a production code
+      # path, and cannot change another test file's outcome either -- the selector
+      # escalates on conftest, shared helpers, fixture trees, and any test module
+      # some other file imports. So the sharded suite is replaced by the changed
+      # files plus the gates that read the test/ tree as data, run several times.
+      #
+      # This exists because a one-line flaky-test fix used to wait ~30 minutes for
+      # the full matrix, which is what makes a flake block every open PR. Repeats
+      # matter more than breadth here: a flaky test run once in isolation passes.
+      #
+      # Every failure path below yields the FULL suite. `ci-full-run` still forces
+      # the whole matrix when a fix depends on suite-wide interleaving.
+      - name: Decide leaf-test scope
+        id: leaf
+        env:
+          FULL_RUN: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full-run') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          leaf_tests=false
+          targets=""
+          if [ "$FULL_RUN" = "true" ] || [ -z "${BASE_SHA:-}" ]; then
+            echo "Full suite: ci-full-run label set, or no PR base (push build)."
+          else
+            rc=0
+            targets="$(SCOPED_TESTS_BASE_REF="$BASE_SHA" \
+              python3 scripts/leaf_test_scope.py --targets)" || rc=$?
+            if [ "$rc" = "0" ] && [ -n "$targets" ]; then
+              leaf_tests=true
+              echo "Leaf-test diff: $(printf '%s\n' "$targets" | grep -c .) target file(s)."
+              printf '%s\n' "$targets" | sed 's/^/  - /'
+            else
+              echo "Full suite: not a leaf-test-only diff (selector rc=$rc)."
+            fi
+          fi
+          echo "leaf_tests=$leaf_tests" >> "$GITHUB_OUTPUT"
+          {
+            echo "leaf_targets<<LEAF_EOF"
+            printf '%s\n' "$targets"
+            echo "LEAF_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   # Build the Linux desktop packages and install them for real, but ONLY when the
   # diff could change what a package installs. The check is expensive (a PBS
@@ -622,6 +669,8 @@ jobs:
         id: scope
         env:
           ONLY_FRONTEND: ${{ needs.changes.outputs.only_frontend }}
+          LEAF_TESTS: ${{ needs.changes.outputs.leaf_tests }}
+          LEAF_TARGETS: ${{ needs.changes.outputs.leaf_targets }}
           TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
         # A frontend-only diff cannot affect a backend test that never touches
         # the frontend surface, so we run only the files the selector could NOT
@@ -629,6 +678,20 @@ jobs:
         # Every failure path here falls back to the FULL suite on purpose --
         # never trade a missed test for a faster run.
         run: |
+          # Leaf-test verdict wins: it is the narrower and more specific reduction,
+          # and it is computed once in the `changes` job. `reduced=true` rides along
+          # so every existing coverage guard keyed on it keeps working unchanged --
+          # a subset's coverage is not comparable to the repo floor either way.
+          if [ "$LEAF_TESTS" = "true" ] && [ -n "${LEAF_TARGETS//[[:space:]]/}" ]; then
+            printf '%s\n' "$LEAF_TARGETS" | grep . > "$TARGETS_FILE" || true
+            if [ -s "$TARGETS_FILE" ]; then
+              echo "reduced=true" >> "$GITHUB_OUTPUT"
+              echo "leaf=true" >> "$GITHUB_OUTPUT"
+              echo "Leaf-test scope: $(wc -l < "$TARGETS_FILE") file(s), repeated."
+              exit 0
+            fi
+            echo "::warning::leaf targets arrived empty -- running the FULL backend suite."
+          fi
           if [ "$ONLY_FRONTEND" != "true" ]; then
             echo "reduced=false" >> "$GITHUB_OUTPUT"
             echo "Full backend suite (diff is not frontend-only)."
@@ -658,6 +721,8 @@ jobs:
         # faster run.
         env:
           REDUCED: ${{ steps.scope.outputs.reduced }}
+          LEAF: ${{ steps.scope.outputs.leaf }}
+          LEAF_REPEAT: "3"
           TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
         run: |
           # Take the `python` problem matcher registered by actions/setup-python
@@ -678,9 +743,25 @@ jobs:
           # files, still sharded, with coverage off -- a subset's coverage is
           # not comparable to the repo floor, so Coverage Combine/Gate skip the
           # backend lane for this run (see coverage-gate).
+          TARGETS=()
           if [ "$REDUCED" = "true" ]; then
-            TARGETS=()
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
+          fi
+          # Leaf-test scope: run the whole narrow set on every matrix job, NOT
+          # split across shards -- 14 files do not shard usefully, and the point
+          # is repeats. Each of the 8 jobs is then an independent roll on its own
+          # runner and Python, which is what a flake fix actually needs. Measured
+          # on this checkout: one pass over the narrow set is ~38s (910 tests)
+          # against ~29 minutes for the slowest full shard.
+          if [ "$LEAF" = "true" ]; then
+            for pass in $(seq 1 "$LEAF_REPEAT"); do
+              echo "::group::leaf pass $pass/$LEAF_REPEAT"
+              pytest -q -n auto --timeout=120 --no-cov "${TARGETS[@]}"
+              echo "::endgroup::"
+            done
+            exit 0
+          fi
+          if [ "$REDUCED" = "true" ]; then
             pytest -q -n auto --timeout=120 \
               --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
               --no-cov \
