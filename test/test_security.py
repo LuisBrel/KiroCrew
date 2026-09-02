@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
@@ -1923,6 +1924,86 @@ class TestOAuthAuthorizationUrlRedaction:
         cleaned, warnings = redact_exfiltration_urls(self.NOTION_URL)
         assert cleaned != self.NOTION_URL
         assert warnings
+
+    def test_diagnostic_identifies_long_query_parameter_shape(self) -> None:
+        opaque_state = "Ab9_" * 64
+        url = "https://id.example-idp.com/authorize?state=" + opaque_state
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "exfil_query_length"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter == "state"
+        assert diagnostic.shape.length == len(opaque_state)
+        assert diagnostic.shape.ascii_uppercase == 64
+        assert diagnostic.shape.ascii_lowercase == 64
+        assert diagnostic.shape.digits == 64
+        assert diagnostic.shape.symbols == 64
+
+    def test_diagnostic_identifies_standard_param_bare_secret_rule(self) -> None:
+        url = self.NOTION_URL.replace(self.STATE, self.BARE_AWS_SECRET_ALNUM, 1)
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "credential_scan_bare_secret_raw"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter == "state"
+        assert diagnostic.shape.length == len(self.BARE_AWS_SECRET_ALNUM)
+
+    def test_credential_shaped_parameter_name_is_omitted(self) -> None:
+        raw_name = self.GITHUB_TOKEN
+        url = f"https://api.notion.com/v1/oauth/authorize?{raw_name}=x"
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.parameter is None
+        assert raw_name not in json.dumps(diagnostic.as_dict(), sort_keys=True)
+
+    def test_unrecognized_parameter_name_is_omitted_from_diagnostic_and_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw_name = "opaqueCredentialLikeKey"
+        opaque_value = "Ab9_" * 64
+        url = f"https://id.example-idp.com/authorize?{raw_name}={opaque_value}"
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "exfil_query_length"
+        assert diagnostic.parameter is None
+        with caplog.at_level("WARNING", logger="kiro_crew.security"):
+            assert oauth_url_contains_credential(url) is True
+        output = json.dumps(diagnostic.as_dict(), sort_keys=True) + "\n" + caplog.text
+        assert raw_name not in output
+        assert opaque_value not in output
+
+    def test_diagnostic_and_log_never_disclose_parameter_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw_value = self.GITHUB_TOKEN
+        url = self.NOTION_URL.replace(self.STATE, raw_value, 1)
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+        assert diagnostic is not None
+        assert diagnostic.rule == "fixed_credential_raw"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter == "state"
+
+        with caplog.at_level("WARNING", logger="kiro_crew.security"):
+            assert oauth_url_contains_credential(url) is True
+
+        serialized = json.dumps(diagnostic.as_dict(), sort_keys=True)
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        digest = hashlib.sha256(raw_value.encode()).hexdigest()
+        for output in (serialized, repr(diagnostic), logged):
+            assert url not in output
+            assert raw_value not in output
+            assert raw_value[:16] not in output
+            assert raw_value[-16:] not in output
+            assert digest not in output
 
     @pytest.mark.parametrize(
         "url",

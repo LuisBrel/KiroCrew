@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 try:
     import resource as _resource
@@ -9856,6 +9856,153 @@ _EXFIL_PERCENT_RE = re.compile(
 # making the scan loop indefinitely.
 _MAX_URL_DECODE_PASSES = 3
 
+_OAUTH_DIAGNOSTIC_PARAMETER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_OAUTH_URL_SYMBOLS = frozenset("-._~:/?#[]@!$&'()*+,;=")
+
+
+@dataclass(frozen=True)
+class OAuthUrlShapeProfile:
+    """Non-sensitive character-class profile for one rejected URL component."""
+
+    length: int
+    ascii_uppercase: int
+    ascii_lowercase: int
+    digits: int
+    percent_signs: int
+    symbols: int
+    other: int
+
+
+@dataclass(frozen=True)
+class OAuthUrlCredentialDiagnostic:
+    """Privacy-safe explanation of the first OAuth URL rejection rule."""
+
+    rule: str
+    component: str
+    parameter: str | None
+    shape: OAuthUrlShapeProfile
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _oauth_char_class(char: str) -> str:
+    if char in string.ascii_uppercase:
+        return "ascii_uppercase"
+    if char in string.ascii_lowercase:
+        return "ascii_lowercase"
+    if char in string.digits:
+        return "digits"
+    if char == "%":
+        return "percent_signs"
+    if char in _OAUTH_URL_SYMBOLS:
+        return "symbols"
+    return "other"
+
+
+def _oauth_shape_profile(value: str) -> OAuthUrlShapeProfile:
+    counts = Counter(_oauth_char_class(char) for char in value)
+    return OAuthUrlShapeProfile(
+        length=len(value),
+        ascii_uppercase=counts["ascii_uppercase"],
+        ascii_lowercase=counts["ascii_lowercase"],
+        digits=counts["digits"],
+        percent_signs=counts["percent_signs"],
+        symbols=counts["symbols"],
+        other=counts["other"],
+    )
+
+
+def _safe_oauth_parameter_name(name: str | None) -> str | None:
+    if (
+        name is None
+        or name not in _OAUTH_QUERY_PARAMS
+        or not _OAUTH_DIAGNOSTIC_PARAMETER_RE.fullmatch(name)
+    ):
+        return None
+    if _contains_fixed_credential(name) or _text_contains_bare_secret(name):
+        return None
+    return name
+
+
+def _oauth_diagnostic(
+    rule: str,
+    component: str,
+    value: str,
+    *,
+    parameter: str | None = None,
+) -> OAuthUrlCredentialDiagnostic:
+    return OAuthUrlCredentialDiagnostic(
+        rule=rule,
+        component=component,
+        parameter=_safe_oauth_parameter_name(parameter),
+        shape=_oauth_shape_profile(value),
+    )
+
+
+def _oauth_query_diagnostic(
+    rule: str,
+    query: str,
+    *,
+    predicate: Callable[[str], bool] | None = None,
+    decoder: Callable[[str], str] | None = None,
+    fallback: bool = True,
+) -> OAuthUrlCredentialDiagnostic | None:
+    segments = query.split("&")
+    for segment in segments:
+        key, separator, value = segment.partition("=")
+        if not separator:
+            continue
+        candidate = decoder(value) if decoder is not None else value
+        if predicate is not None and predicate(candidate):
+            return _oauth_diagnostic(
+                rule, "query_parameter", candidate, parameter=key
+            )
+        if predicate is None and len(segments) == 1:
+            return _oauth_diagnostic(
+                rule, "query_parameter", candidate, parameter=key
+            )
+    if not fallback:
+        return None
+    target = decoder(query) if decoder is not None else query
+    return _oauth_diagnostic(rule, "query", target)
+
+
+def _oauth_url_payload_diagnostic(
+    rule: str,
+    url: str,
+    target: str,
+    predicate: Callable[[str], bool],
+    *,
+    decoder: Callable[[str], str] | None = None,
+) -> OAuthUrlCredentialDiagnostic:
+    try:
+        parsed = urlparse(url)
+        if parsed.query:
+            query_diagnostic = _oauth_query_diagnostic(
+                rule,
+                parsed.query,
+                predicate=predicate,
+                decoder=decoder,
+                fallback=False,
+            )
+            if query_diagnostic is not None:
+                return query_diagnostic
+        for component, value in (
+            ("scheme", parsed.scheme),
+            ("authority", parsed.netloc),
+            ("path", parsed.path),
+            ("path_params", parsed.params),
+            ("fragment", parsed.fragment),
+        ):
+            candidate = decoder(value) if decoder is not None else value
+            if candidate and predicate(candidate):
+                return _oauth_diagnostic(rule, component, candidate)
+    except Exception:
+        pass
+    return _oauth_diagnostic(rule, "url", target)
+
+
 # Exact, code-owned OAuth authorization endpoints whose standard front-channel
 # parameters may legitimately contain high-entropy state/PKCE values on the ACP
 # banner-safety path. This is deliberately NOT configurable and never uses
@@ -10446,13 +10593,20 @@ def _exfil_url_warning(
     is_https: bool = True,
     allow_safe_presigned: bool = True,
     allow_oauth_entropy: bool = False,
+    _rule_out: list[str] | None = None,
 ) -> str | None:
     """Classify one matched URL — the single per-URL exfil verdict.
 
     Shared by scan_exfiltration_urls (which collects the warnings) and
     redact_exfiltration_urls (which redacts every URL that returns non-None), so
     the two paths can never drift. Returns the warning string, or None if clean.
+    ``_rule_out`` receives only a stable rule id, never URL-derived text.
     """
+
+    def trace(rule: str) -> None:
+        if _rule_out is not None:
+            _rule_out.append(rule)
+
     qmark = path_and_query.find("?")
     query = path_and_query[qmark + 1 :] if qmark != -1 else ""
 
@@ -10463,6 +10617,7 @@ def _exfil_url_warning(
 
     # Hard credential markers are unconditional across the full path/query.
     if _HARD_CREDENTIAL_RE.search(path_and_query):
+        trace("exfil_hard_credential")
         return f"Suspicious URL with credential in path/query: {domain}"
 
     # Fixed credential signatures ANYWHERE in the full authority/path/query are
@@ -10471,6 +10626,7 @@ def _exfil_url_warning(
     # the bare-secret entropy classifier that false-positives on OAuth state.
     full_payload = f"{domain}{port}{path_and_query}"
     if _contains_fixed_credential(full_payload):
+        trace("exfil_fixed_credential")
         return f"Suspicious URL with credential in path/query: {domain}"
 
     # Decode the whole authority/path/query payload as one invariant. Component-
@@ -10487,6 +10643,7 @@ def _exfil_url_warning(
         if _HARD_CREDENTIAL_RE.search(
             decoded_payload
         ) or _contains_fixed_credential(decoded_payload):
+            trace("exfil_encoded_credential")
             return f"Suspicious URL with encoded credential in path/query: {domain}"
 
     # Fail closed when the budget above ran out with layers still to go. A
@@ -10501,12 +10658,14 @@ def _exfil_url_warning(
     # soundness. Benign traffic reaches a stable payload in one or two passes
     # and never gets here.
     if unquote_plus(decoded_payload) != decoded_payload:
+        trace("exfil_decode_saturated")
         return f"Suspicious URL with encoded credential in path/query: {domain}"
 
     # Heavy percent-encoding is always suspicious, including inside a standard
     # OAuth parameter at an approved endpoint. It runs before either
     # host-sensitive heuristic exemption below.
     if _EXFIL_PERCENT_RE.search(path_and_query):
+        trace("exfil_percent_encoding")
         return f"Suspicious URL with credential-like query data: {domain}"
 
     if qmark == -1:
@@ -10553,6 +10712,7 @@ def _exfil_url_warning(
 
     if heuristic_query:
         if len(heuristic_query) >= _EXFIL_QUERY_MIN_LEN:
+            trace("exfil_query_length")
             return (
                 f"Suspicious URL with long query params ({len(heuristic_query)} chars): "
                 f"{domain}{path_and_query[:60]}..."
@@ -10560,6 +10720,7 @@ def _exfil_url_warning(
         if _EXFIL_PATTERNS.search(heuristic_query) or _EXFIL_PATTERNS.search(
             unquote_plus(heuristic_query)
         ):
+            trace("exfil_query_pattern")
             return f"Suspicious URL with credential-like query data: {domain}"
     return None
 
@@ -11431,37 +11592,67 @@ def _oauth_credential_scan_target(
     return url[: query_start + 1] + sanitized_query + suffix
 
 
-def oauth_url_contains_credential(url: str) -> bool:
-    """Return True when an ACP-provided OAuth banner URL is unsafe.
-
-    This is the sole path allowed to exempt standard OAuth entropy from the
-    generic URL heuristics. After subtracting only a structurally valid PKCE
-    challenge at an approved endpoint, credential checks scan every remaining
-    byte of the URL in raw and once-percent-decoded form.
-    """
+def diagnose_oauth_url_credential(url: str) -> OAuthUrlCredentialDiagnostic | None:
+    """Return a safe rejection signature, never URL/value bytes or derivatives."""
     if not url:
-        return False
+        return None
 
     decoded_url = unquote(url)
-    if (
-        "\\" in url
-        or "\\" in decoded_url
-        or _contains_fixed_credential(url)
-        or _contains_fixed_credential(decoded_url)
-    ):
-        return True
+    if "\\" in url:
+        return _oauth_url_payload_diagnostic(
+            "backslash_raw",
+            url,
+            url,
+            lambda value: "\\" in value,
+        )
+    if "\\" in decoded_url:
+        return _oauth_url_payload_diagnostic(
+            "backslash_decoded",
+            url,
+            decoded_url,
+            lambda value: "\\" in value,
+            decoder=unquote,
+        )
+    if _contains_fixed_credential(url):
+        return _oauth_url_payload_diagnostic(
+            "fixed_credential_raw",
+            url,
+            url,
+            _contains_fixed_credential,
+        )
+    if _contains_fixed_credential(decoded_url):
+        return _oauth_url_payload_diagnostic(
+            "fixed_credential_decoded",
+            url,
+            decoded_url,
+            _contains_fixed_credential,
+            decoder=unquote,
+        )
 
     try:
         parsed = urlparse(url)
         port = f":{parsed.port}" if parsed.port is not None else ""
     except ValueError:
-        return True
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        return True
+        return _oauth_diagnostic("parse_error", "url", url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return _oauth_diagnostic("invalid_endpoint", "scheme", parsed.scheme)
+    if not parsed.hostname:
+        return _oauth_diagnostic("invalid_endpoint", "authority", parsed.netloc)
 
     # Browsers and RFC-style parsers disagree on userinfo handling.
-    if "@" in parsed.netloc or "@" in unquote(parsed.netloc):
-        return True
+    if "@" in parsed.netloc:
+        return _oauth_diagnostic(
+            "userinfo",
+            "userinfo",
+            parsed.netloc.rpartition("@")[0],
+        )
+    decoded_netloc = unquote(parsed.netloc)
+    if "@" in decoded_netloc:
+        return _oauth_diagnostic(
+            "userinfo",
+            "userinfo",
+            decoded_netloc.rpartition("@")[0],
+        )
 
     approved_endpoint = (
         parsed.scheme.lower() == "https"
@@ -11473,31 +11664,137 @@ def oauth_url_contains_credential(url: str) -> bool:
         parsed.query,
         approved_endpoint=approved_endpoint,
     )
-    for candidate in (scan_target, unquote(scan_target)):
-        if _contains_fixed_credential(candidate) or _text_contains_bare_secret(
-            candidate
-        ):
-            return True
+    for candidate, suffix, decoder in (
+        (scan_target, "raw", None),
+        (unquote(scan_target), "decoded", unquote),
+    ):
+        if _contains_fixed_credential(candidate):
+            return _oauth_url_payload_diagnostic(
+                f"credential_scan_fixed_{suffix}",
+                url,
+                candidate,
+                _contains_fixed_credential,
+                decoder=decoder,
+            )
+        if _text_contains_bare_secret(candidate):
+            return _oauth_url_payload_diagnostic(
+                f"credential_scan_bare_secret_{suffix}",
+                url,
+                candidate,
+                _text_contains_bare_secret,
+                decoder=decoder,
+            )
 
     # Provider consent URLs need neither path params nor fragments. Keep these
     # parser-differential forms fail-closed after the whole URL has been scanned.
-    if parsed.params or ";" in parsed.path or parsed.fragment:
-        return True
+    if parsed.params:
+        return _oauth_diagnostic("path_params", "path_params", parsed.params)
+    if ";" in parsed.path:
+        return _oauth_diagnostic("path_semicolon", "path", parsed.path)
+    if parsed.fragment:
+        return _oauth_diagnostic("fragment", "fragment", parsed.fragment)
 
     path_and_query = parsed.path
     if parsed.query:
         path_and_query += f"?{parsed.query}"
-    return bool(
-        _exfil_url_warning(
-            parsed.hostname,
-            path_and_query,
-            frozenset(),
-            port=port,
-            is_https=parsed.scheme.lower() == "https",
-            allow_safe_presigned=False,
-            allow_oauth_entropy=True,
-        )
+    rules: list[str] = []
+    warning = _exfil_url_warning(
+        parsed.hostname,
+        path_and_query,
+        frozenset(),
+        port=port,
+        is_https=parsed.scheme.lower() == "https",
+        allow_safe_presigned=False,
+        allow_oauth_entropy=True,
+        _rule_out=rules,
     )
+    if warning is None:
+        return None
+    rule = rules[0] if rules else "exfil_unknown"
+
+    heuristic_query = parsed.query
+    if approved_endpoint:
+        heuristic_query = "&".join(
+            segment
+            for segment in parsed.query.split("&")
+            if segment.partition("=")[0] not in _OAUTH_QUERY_PARAMS
+        )
+    else:
+        slack_alias = _kirocrew_slack_app_link_alias(
+            parsed.hostname.lower(),
+            parsed.path,
+            parsed.query,
+            is_https=parsed.scheme.lower() == "https",
+            port=port,
+        )
+        if slack_alias is not None:
+            heuristic_query = slack_alias
+
+    if rule == "exfil_query_length":
+        return _oauth_query_diagnostic(rule, heuristic_query)
+    if rule == "exfil_query_pattern":
+        query_decoder: Callable[[str], str] | None = (
+            None if _EXFIL_PATTERNS.search(heuristic_query) else unquote_plus
+        )
+        return _oauth_query_diagnostic(
+            rule,
+            heuristic_query,
+            predicate=lambda value: bool(_EXFIL_PATTERNS.search(value)),
+            decoder=query_decoder,
+        )
+    if rule == "exfil_hard_credential":
+        return _oauth_url_payload_diagnostic(
+            rule,
+            url,
+            url,
+            lambda value: bool(_HARD_CREDENTIAL_RE.search(value)),
+        )
+    if rule == "exfil_fixed_credential":
+        return _oauth_url_payload_diagnostic(
+            rule,
+            url,
+            url,
+            _contains_fixed_credential,
+        )
+    if rule == "exfil_percent_encoding":
+        return _oauth_url_payload_diagnostic(
+            rule,
+            url,
+            url,
+            lambda value: bool(_EXFIL_PERCENT_RE.search(value)),
+        )
+
+    target = url
+    if rule in {"exfil_encoded_credential", "exfil_decode_saturated"}:
+        for _ in range(_MAX_URL_DECODE_PASSES):
+            decoded = unquote_plus(target)
+            if decoded == target:
+                break
+            target = decoded
+    return _oauth_diagnostic(rule, "url", target)
+
+
+def oauth_url_contains_credential(url: str) -> bool:
+    """Return True when an ACP-provided OAuth banner URL is unsafe."""
+    diagnostic = diagnose_oauth_url_credential(url)
+    if diagnostic is None:
+        return False
+    shape = diagnostic.shape
+    logger.warning(
+        "OAuth URL rejected rule=%s component=%s parameter=%s "
+        "length=%d upper=%d lower=%d digits=%d percent=%d symbols=%d other=%d",
+        diagnostic.rule,
+        diagnostic.component,
+        diagnostic.parameter or "-",
+        shape.length,
+        shape.ascii_uppercase,
+        shape.ascii_lowercase,
+        shape.digits,
+        shape.percent_signs,
+        shape.symbols,
+        shape.other,
+    )
+    return True
 
 
 # Standard replacement tag for a redacted credential. Shared between the batch
