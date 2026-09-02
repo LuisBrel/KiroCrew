@@ -3935,8 +3935,12 @@ export default function App() {
             <Route path="/deploy" element={<ArtifactDeployPage />} />
             {/* Builtin app routes — auto-discovered from registry. React Router v6
                 ranks static paths higher than parameterized ones, so /settings, /agents
-                etc. still match first. Unrecognized paths fall through to /chat. */}
-            <Route path="/:builtinApp" element={<BuiltinAppRoute />} />
+                etc. still match first. Unrecognized paths fall through to /chat.
+                The trailing splat also matches the BARE app path (empty splat),
+                so this one arm serves /aws-control and /aws-control/usage alike —
+                an app carries sub-segments for its own path navigation, same
+                shape as /settings/<tab>. */}
+            <Route path="/:builtinApp/*" element={<BuiltinAppRoute />} />
             <Route path="*" element={<ChatRedirect />} />
           </Routes>
         </main>

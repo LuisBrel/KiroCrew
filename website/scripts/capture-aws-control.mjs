@@ -13,7 +13,7 @@
  *   shares.png          the share-links pane
  *   accounts.png        the Accounts & credentials pane
  *   usage.png           the Usage & costs pane
- *   files-narrow.png    the Files pane at 320px (rail flattened to a strip)
+ *   files-narrow.png    the Files detail at 320px (pushed level, one back bar)\n *   root-list-narrow.png the 320px grouped root list (the bare path on a phone)
  *
  * Usage: node scripts/capture-aws-control.mjs <outDir>
  */
@@ -285,19 +285,20 @@ await expectCount('costs-consent-gate', 0)
 await page.screenshot({ path: `${OUT}/usage.png`, fullPage: false })
 console.log('shot usage')
 
-// Narrow viewport: the rail flattens to a horizontal strip and the Files
-// toolbar controls must WRAP, not run off-screen. Measured rather than
-// eyeballed — a class change that fails to wrap still produces a plausible
-// screenshot at 1280px.
+// Narrow viewport: iOS push-stack navigation, same shape as settings. The
+// pane path deep-links straight to the detail (one back bar); popping lands on
+// the grouped root list. The Files toolbar controls must WRAP, not run
+// off-screen — measured rather than eyeballed.
 await openPane('files')
 await page.setViewportSize({ width: 320, height: 900 })
 await page.waitForTimeout(400)
-await expectCount('aws-rail', 1)
+await expectCount('aws-pane-detail', 1)
+await expectCount('aws-rail', 0)
 await page.locator('[data-testid="drive-folder-toggle"]').click()
 await page.waitForTimeout(300)
 const overflow = await page.evaluate(() => {
   const bad = []
-  for (const t of ['drive-folder-name', 'drive-folder-create', 'drive-folder-cancel', 'account-switcher']) {
+  for (const t of ['drive-folder-name', 'drive-folder-create', 'drive-folder-cancel']) {
     const el = document.querySelector(`[data-testid="${t}"]`)
     if (!el) { bad.push(`${t}: missing`); continue }
     const r = el.getBoundingClientRect()
@@ -309,23 +310,22 @@ const overflow = await page.evaluate(() => {
 })
 await page.locator('[data-testid="drive-folder-cancel"]').click()
 await page.waitForTimeout(300)
-const overflowCollapsed = await page.evaluate(() => {
-  const bad = []
-  for (const t of ['drive-folder-toggle', 'drive-upload-btn']) {
-    const el = document.querySelector(`[data-testid="${t}"]`)
-    if (!el) { bad.push(`${t}: missing`); continue }
-    const r = el.getBoundingClientRect()
-    if (r.right > window.innerWidth + 1 || r.left < -1) {
-      bad.push(`${t}: ${Math.round(r.left)}..${Math.round(r.right)} outside 0..${window.innerWidth}`)
-    }
-  }
-  return bad
-})
-overflow.bad.push(...overflowCollapsed)
 console.log(`ASSERT narrow-viewport controls-onscreen ${overflow.bad.length === 0 ? 'ok' : 'MISMATCH ' + overflow.bad.join('; ')}`)
 if (overflow.bad.length) failures.push(`narrow viewport: ${overflow.bad.join('; ')}`)
 await page.screenshot({ path: `${OUT}/files-narrow.png`, fullPage: false })
 console.log('shot files-narrow')
+
+// Pop back to the root list: grouped rows, account card, no rail, no detail.
+await page.locator('[data-testid="aws-pane-detail"] button').first().click()
+await page.waitForTimeout(500)
+await expectCount('aws-root-list', 1)
+await expectCount('aws-pane-detail', 0)
+await expectCount('account-switcher', 1)
+for (const pane of ['files', 'library', 'backup', 'shares', 'accounts', 'usage']) {
+  await expectCount(`root-${pane}`, 1)
+}
+await page.screenshot({ path: `${OUT}/root-list-narrow.png`, fullPage: false })
+console.log('shot root-list-narrow')
 
 if (unmatched.size) console.log('unmatched /api paths:', [...unmatched].join(', '))
 await browser.close()

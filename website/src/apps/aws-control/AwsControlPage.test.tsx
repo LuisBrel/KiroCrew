@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
+
+// Controllable viewport switch: the shell branches on useIsNarrowViewport.
+// Mock BOTH exports — a partial mock leaves the sibling undefined (module's
+// own warning) and useIsMobile is consumed by nested library components.
+let narrowViewport = false
+vi.mock('../../hooks/useIsMobile', () => ({
+  useIsNarrowViewport: () => narrowViewport,
+  useIsMobile: () => narrowViewport,
+}))
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
 import type {
@@ -163,6 +172,7 @@ function share(id: string): SharesResponse['shares'][number] {
 
 /** Everything a drive-backed pane needs to mount for real. */
 function stubDrivePresent() {
+  narrowViewport = false
   vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
   vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
   vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
@@ -705,5 +715,103 @@ describe('add accounts', () => {
     fireEvent.click(screen.getByTestId('add-accounts-register'))
 
     expect(await screen.findByTestId('add-accounts-error')).toBeTruthy()
+  })
+})
+
+describe('AwsControlPage — path-based navigation', () => {
+  it('deep link with a pane segment lands straight on that pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/usage' })
+    expect(await screen.findByTestId('usage-pane')).toBeTruthy()
+    // The rail marks the routed pane current, not the default one.
+    expect(screen.getByTestId('rail-usage').getAttribute('aria-current')).toBe('page')
+    expect(screen.getByTestId('rail-files').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('a trailing slash reads as the bare path, not a drilled-in level', async () => {
+    // The settings path-nav shipped a misfire where /settings/channels/ made a
+    // length>=2 check treat the level as drilled-in. Pin the same class here:
+    // /aws-control/ must render exactly what /aws-control renders.
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/' })
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+    expect(screen.getByTestId('rail-files').getAttribute('aria-current')).toBe('page')
+  })
+
+  it('an unknown segment falls back to Files rather than a blank pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/nonsense' })
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+  })
+
+  it('a rail click writes the pane path (deep-linkable)', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('drive-section')
+    fireEvent.click(screen.getByTestId('rail-backup'))
+    expect(await screen.findByTestId('backup-section')).toBeTruthy()
+    expect(screen.getByTestId('rail-backup').getAttribute('aria-current')).toBe('page')
+  })
+})
+
+describe('AwsControlPage — narrow viewport (iOS push stack)', () => {
+  beforeEach(() => { narrowViewport = true })
+
+  it('the bare path is the grouped root list, with no rail', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+    expect(screen.queryByTestId('aws-rail')).toBeNull()
+    // Account card on top, then every pane as a tappable row.
+    expect(screen.getByTestId('account-switcher')).toBeTruthy()
+    for (const pane of ['files', 'library', 'backup', 'shares', 'accounts', 'usage']) {
+      expect(screen.getByTestId(`root-${pane}`)).toBeTruthy()
+    }
+  })
+
+  it('tapping a row pushes the detail with exactly one back bar, and back pops to the list', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('aws-root-list')
+
+    fireEvent.click(screen.getByTestId('root-usage'))
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(screen.getByTestId('usage-pane')).toBeTruthy()
+    // Exactly ONE back affordance per level — never two stacked bars.
+    const backs = screen.getAllByText('AWS Control')
+    expect(backs.length).toBe(1)
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
+
+    fireEvent.click(backs[0])
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+    expect(screen.queryByTestId('aws-pane-detail')).toBeNull()
+  })
+
+  it('an unknown segment reads as Files on a phone too — one meaning per URL', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/bogus' })
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
+  })
+
+  it('a pane->pane move keeps the push marker, so back still pops to the list', async () => {
+    // Drill in from the root list (a PUSH), then move pane->pane via the
+    // accounts pane's row (a REPLACE). The replace must carry the entry's
+    // push marker forward — dropping it would stack a duplicate root entry
+    // on back and leave the next platform back visibly inert.
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control' })
+    await screen.findByTestId('aws-root-list')
+
+    fireEvent.click(screen.getByTestId('root-accounts'))
+    expect(await screen.findByTestId('accounts-pane')).toBeTruthy()
+
+    // Selecting an account jumps to Files (pane->pane replace).
+    fireEvent.click(screen.getAllByTestId('account-card')[0])
+    expect(await screen.findByTestId('drive-section')).toBeTruthy()
+
+    // Back must POP to the root list (marker preserved), not replace-write.
+    fireEvent.click(screen.getByText('AWS Control'))
+    expect(await screen.findByTestId('aws-root-list')).toBeTruthy()
+  })
+
+  it('a deep link goes straight to the detail pane', async () => {
+    renderWithProviders(<AwsControlPage />, { route: '/aws-control/backup' })
+    expect(await screen.findByTestId('aws-pane-detail')).toBeTruthy()
+    expect(await screen.findByTestId('backup-section')).toBeTruthy()
+    expect(screen.queryByTestId('aws-root-list')).toBeNull()
   })
 })
