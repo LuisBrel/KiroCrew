@@ -118,11 +118,33 @@ export function sanitizeCredentials(text: string): string {
 // ── Exfiltration URL detection (matches redact_exfiltration_urls in security.py) ──
 const URL_RE = /https?:\/\/([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(:\d+)?(\/[^\s)"'>]*)?/g
 const EXFIL_QUERY_MIN_LEN = 200
-const EXFIL_PATTERNS = new RegExp(
+
+// Code-owned exact-host allowlist that skips ONLY the base64-blob and
+// aggregate-query-length heuristics — NEVER the heavy-percent-encoding detector
+// or the hard credential markers below, which stay unconditional for every host
+// (including these). This mirrors the SHAPE of the backend's _exfil_url_warning
+// layering (security.py ~10440), where an exempt host sets heuristic_query='' but
+// still runs _EXFIL_PERCENT_RE + _HARD_CREDENTIAL_RE first.
+//
+// Matched EXACTLY and case-insensitively (RFC 4343 host case-folding), never by
+// suffix — a look-alike like `github.com.evil.example` is NOT exempt. The list
+// is intentionally tiny and code-owned (not config-driven / not agent-writable)
+// so the agent cannot widen its own trust. It contains exactly the two
+// confirmed-benign false-positive hosts from issue #7820: `github.com`
+// (issues/new?title=...&body=...&labels=...) and `monitorportal.amazon.com`.
+const EXFIL_EXEMPT_HOSTS = new Set(['github.com', 'monitorportal.amazon.com'])
+
+// UNCONDITIONAL tier — heavy URL-encoding: 20+ CONSECUTIVE percent-encoded
+// octets. Mirrors backend _EXFIL_PERCENT_RE. Non-global so .test() has no sticky
+// .lastIndex state.
+const EXFIL_PERCENT_RE = /%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}/i
+
+// UNCONDITIONAL tier — hard credential markers. Mirrors the credential
+// alternatives carved out of the backend _EXFIL_PATTERNS / _HARD_CREDENTIAL_RE.
+// Non-global so .test() is stateless.
+const EXFIL_CREDENTIAL_RE = new RegExp(
   '(?:' +
-    '[A-Za-z0-9+/=]{40,}' +                          // base64-like blob
-    '|%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}' +    // heavy URL-encoding
-    '|(?:AKIA|ASIA)[A-Z0-9]{16}' +                   // AWS access key ID
+    '(?:AKIA|ASIA)[A-Z0-9]{16}' +                    // AWS access key ID
     '|(?:ssh-rsa|ssh-ed25519)[\\s+%]' +               // SSH public key
     '|BEGIN[\\s+%](?:RSA|DSA|EC|OPENSSH)[\\s+%]PRIVATE[\\s+%]KEY' + // private key header
     '|xox[bpas]-[0-9a-zA-Z-]+' +                     // Slack token
@@ -130,16 +152,29 @@ const EXFIL_PATTERNS = new RegExp(
   'i',
 )
 
+// HEURISTIC tier — base64-like blob (40+ chars). Skipped for exempt hosts.
+// Non-global so .test() is stateless.
+const EXFIL_B64_RE = /[A-Za-z0-9+/=]{40,}/i
+
 export function sanitizeExfiltrationUrls(text: string): string {
   let out = text
   URL_RE.lastIndex = 0
   for (const m of text.matchAll(URL_RE)) {
     const domain = m[1]
+    const host = domain.toLowerCase()
     const pathAndQuery = m[3] || ''
     const qmark = pathAndQuery.indexOf('?')
     if (qmark === -1) continue
     const query = pathAndQuery.slice(qmark + 1)
-    if (query.length >= EXFIL_QUERY_MIN_LEN || EXFIL_PATTERNS.test(query)) {
+    // UNCONDITIONAL tier: heavy percent-encoding + hard credential markers run
+    // for every host, exempt or not.
+    let redact = EXFIL_PERCENT_RE.test(query) || EXFIL_CREDENTIAL_RE.test(query)
+    // HEURISTIC tier: base64 blob + aggregate query length, skipped for the
+    // code-owned exact-host allowlist.
+    if (!redact && !EXFIL_EXEMPT_HOSTS.has(host)) {
+      redact = query.length >= EXFIL_QUERY_MIN_LEN || EXFIL_B64_RE.test(query)
+    }
+    if (redact) {
       out = out.replace(m[0], i18nT('utils.sanitize.redacted_suspicious_url', { domain }))
     }
   }
