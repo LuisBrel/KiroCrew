@@ -140,7 +140,12 @@ Two properties are load-bearing at the architecture level:
   directory keeps the ledger at its configured path. When that path traverses a
   link, the gateway records the canonical coordinator directory outside the link
   and gives the same owner-only anchor to SQLite and every sandbox builder. The
-  anchor directory is agent-denied and hidden inside Kiro Crew's OS sandboxes, so
+  Linux launcher creates and owner-tightens the anchor before constructing its
+  existence-guarded bind masks. The macOS Seatbelt profile denies both lexical
+  and canonical ledger and anchor spellings so a symlinked home cannot expose an
+  alias. Existing anchor records win before the ordinary-directory fast path, so
+  replacing a selected link with a directory cannot abandon durable state. The
+  directory is agent-denied and hidden inside Kiro Crew's OS sandboxes, so
   retargeting the link cannot make a later process trust a forged ledger or make a
   child mask a different directory. Internal-sandbox delegation refuses this
   exceptional linked shape rather than dropping the control.

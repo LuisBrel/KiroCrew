@@ -86,10 +86,14 @@ The default path is resolved lazily from
 path directly. If the data-home path traverses a link, the gateway persists its
 canonical coordinator directory in an owner-only record below
 `~/.kirocrew.run-coordinator/`, keyed by the lexical data-home selection. SQLite
-and every OS-sandbox builder consume the same process-cached result. The anchor
+and every OS-sandbox builder consume the same process-cached result. An existing
+record wins before the ordinary-directory fast path, so replacing a selected
+link with a directory cannot abandon the anchored ledger on restart. The anchor
 directory is itself on the agent read/write-denied floor and hidden inside every
-Kiro Crew sandbox. Changing a supported data-home link later — including between
-gateway processes — therefore cannot retarget fresh SQLite connections, split
+Kiro Crew sandbox. The Linux launcher creates and fail-loud owner-tightens it
+before constructing its existence-guarded bind masks, so an agent cannot pre-seed
+a record while the directory is absent. Changing a supported data-home link later —
+including between gateway processes — therefore cannot retarget fresh SQLite connections, split
 durable state, or make a child protect a different ledger. Kiro's internal
 macOS/Windows sandbox delegates for the ordinary default path and fails closed
 for the relocated or linked shape it cannot prove. The directory and database/known sidecars

@@ -84,6 +84,17 @@ def clean_backend(monkeypatch):
     reset_backend()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_run_coordinator_anchor(monkeypatch, _isolation_dirs):
+    """Keep launcher construction away from the operator's persistent anchor."""
+    anchor = _isolation_dirs("run-coordinator-anchor")
+    anchor.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        sandbox_mod, "prepare_run_coordinator_anchor_dir", lambda: anchor
+    )
+    return anchor
+
+
 class TestDetectBackend:
     def test_off_mode(self):
         result = detect_backend(config_mode="off")
@@ -135,6 +146,43 @@ class TestWrapArgv:
         result, cleanup = wrap_argv(argv, mode="off")
         assert result == argv
         assert cleanup is None
+
+    def test_off_mode_refuses_retargeted_run_coordinator_anchor(self, monkeypatch):
+        """Unconfined execution cannot expose a ledger outside the current hook root."""
+        monkeypatch.setattr(
+            sandbox_mod,
+            "run_coordinator_anchor_matches_current_home",
+            lambda: False,
+            raising=False,
+        )
+
+        with pytest.raises(sandbox_mod.SandboxUnavailableError) as caught:
+            wrap_argv(["kiro-cli", "acp"], mode="off")
+
+        assert caught.value.kind == "foreign_sandbox"
+        assert "retargeted" in str(caught.value)
+
+    @patch("kiro_crew.sandbox._allow_unsandboxed_exec", return_value=True)
+    @patch("kiro_crew.sandbox.detect_backend", return_value="none")
+    def test_no_backend_opt_in_refuses_retargeted_run_coordinator_anchor(
+        self,
+        mock_detect,
+        mock_allow,
+        monkeypatch,
+    ):
+        """The broad no-backend opt-in cannot expose a stale canonical ledger."""
+        monkeypatch.setattr(
+            sandbox_mod,
+            "run_coordinator_anchor_matches_current_home",
+            lambda: False,
+        )
+
+        with pytest.raises(sandbox_mod.SandboxUnavailableError) as caught:
+            wrap_argv(["kiro-cli", "acp"], mode="auto")
+
+        assert caught.value.kind == "foreign_sandbox"
+        mock_detect.assert_called_once_with(config_mode="auto")
+        mock_allow.assert_not_called()
 
     @patch("kiro_crew.sandbox.detect_backend", return_value="namespace")
     @patch("kiro_crew.sandbox.namespace_argv")
@@ -300,29 +348,53 @@ class TestBuildSeatbeltProfile:
     def test_run_coordinator_ledger_denies_parent_renames(
         self, monkeypatch, tmp_path
     ):
-        ledger = tmp_path / "custom-home" / "run-coordinator"
+        lexical_ledger = tmp_path / "linked-home" / "run-coordinator"
+        canonical_ledger = tmp_path / "custom-home" / "run-coordinator"
         monkeypatch.setattr(
-            sandbox_mod, "_run_coordinator_hidden_dir", lambda: str(ledger)
+            sandbox_mod,
+            "configured_run_coordinator_dir",
+            lambda: lexical_ledger,
+        )
+        monkeypatch.setattr(
+            sandbox_mod, "_run_coordinator_hidden_dir", lambda: str(canonical_ledger)
         )
 
         profile = _build_seatbelt_profile("standard")
 
-        assert f'(deny file-read* (subpath "{ledger}"))' in profile
-        assert f'(deny file-write* (subpath "{ledger}"))' in profile
-        assert f'(deny file-link (subpath "{ledger}"))' in profile
-        for guard in sandbox_mod._literal_ancestor_guards((str(ledger),)):
+        for ledger in (lexical_ledger, canonical_ledger):
+            assert f'(deny file-read* (subpath "{ledger}"))' in profile
+            assert f'(deny file-write* (subpath "{ledger}"))' in profile
+            assert f'(deny file-link (subpath "{ledger}"))' in profile
+        for guard in sandbox_mod._literal_ancestor_guards(
+            (str(lexical_ledger), str(canonical_ledger))
+        ):
             assert f'(deny file-write* (literal "{guard}"))' in profile
 
     def test_run_coordinator_anchor_is_hidden_in_every_os_sandbox(
         self, monkeypatch, tmp_path
     ):
         anchor = tmp_path / ".kirocrew.run-coordinator"
+        canonical_anchor = tmp_path / "canonical-home" / ".kirocrew.run-coordinator"
         ledger = tmp_path / "canonical-home" / "run-coordinator"
+        prepare_anchor = MagicMock(return_value=anchor)
         monkeypatch.setattr(
             sandbox_mod, "run_coordinator_anchor_dir", lambda: anchor
         )
         monkeypatch.setattr(
+            sandbox_mod, "prepare_run_coordinator_anchor_dir", prepare_anchor
+        )
+        monkeypatch.setattr(
             sandbox_mod, "_run_coordinator_hidden_dir", lambda: str(ledger)
+        )
+        realpath = sandbox_mod.os.path.realpath
+        monkeypatch.setattr(
+            sandbox_mod.os.path,
+            "realpath",
+            lambda path, *args, **kwargs: (
+                str(canonical_anchor)
+                if os.fspath(path) == str(anchor)
+                else realpath(path, *args, **kwargs)
+            ),
         )
 
         for sandbox_level in ("standard", "cc", "strict"):
@@ -332,11 +404,14 @@ class TestBuildSeatbeltProfile:
             )
             assert str(anchor) in files
 
+        assert prepare_anchor.call_count == 3
+
         profile = _build_seatbelt_profile("standard")
-        assert f'(deny file-read* (subpath "{anchor}"))' in profile
-        assert f'(deny file-write* (subpath "{anchor}"))' in profile
-        assert f'(deny file-link (subpath "{anchor}"))' in profile
-        assert f'(deny file-write* (literal "{anchor}"))' in profile
+        for protected_anchor in (anchor, canonical_anchor):
+            assert f'(deny file-read* (subpath "{protected_anchor}"))' in profile
+            assert f'(deny file-write* (subpath "{protected_anchor}"))' in profile
+            assert f'(deny file-link (subpath "{protected_anchor}"))' in profile
+            assert f'(deny file-write* (literal "{protected_anchor}"))' in profile
 
     def test_delegated_macos_agent_workspace_cannot_reach_voice_runtime(
         self, monkeypatch, tmp_path
@@ -884,6 +959,17 @@ class TestBuildSeatbeltProfile:
 
 
 class TestBuildLauncherScript:
+    @_POSIX_ONLY
+    def test_run_coordinator_anchor_uses_the_per_test_directory(
+        self, _isolate_run_coordinator_anchor
+    ):
+        script = _build_launcher_script("standard")
+        files = json.loads(
+            re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1)
+        )
+
+        assert str(_isolate_run_coordinator_anchor) in files
+
     @_POSIX_ONLY
     def test_strict_script_contains_dirs(self):
         script = _build_launcher_script("strict")
