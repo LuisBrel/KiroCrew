@@ -4046,11 +4046,18 @@ class TestWidgetPressBypassesActivation:
     @pytest.mark.asyncio
     async def test_an_options_press_marks_its_synthetic_message(self) -> None:
         # The flag has to be SET where the synthetic message is built, or the
-        # exemption above is unreachable in production.
+        # exemption above is unreachable in production. The same handoff keeps
+        # model-authored labels out of command parsing and carries the posting
+        # session tag into the dispatcher's provenance gates.
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
         d, client, _ = _dispatcher({7}, forum_activation="mention")
         d.bot_username = "kirocrewbot"
-        seen: list[Any] = []
-        d.handle_message = lambda msg, **kw: seen.append(msg) or _done_none()  # type: ignore[assignment]
+        seen: list[tuple[Any, dict[str, Any]]] = []
+        d.handle_message = (  # type: ignore[assignment]
+            lambda msg, **kw: seen.append((msg, kw)) or _done_none()
+        )
+        tag = session_provenance_tag(d._session_key(("direct", "7")))
         await d.on_callback(
             SimpleNamespace(
                 callback_query_id="q",
@@ -4058,13 +4065,16 @@ class TestWidgetPressBypassesActivation:
                 chat_id=7,
                 chat_type="private",
                 message_id=101,
-                data="opt:0",
+                data=f"opt:0:{tag}",
                 label="alpha",
                 message_thread_id=None,
             )
         )
         assert seen, "the press must re-enter the turn path"
-        assert getattr(seen[0], "from_widget", False) is True
+        msg, kwargs = seen[0]
+        assert getattr(msg, "from_widget", False) is True
+        assert kwargs["interpret_commands"] is False
+        assert kwargs["origin_tag"] == tag
 
 
 async def _done_none() -> None:
