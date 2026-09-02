@@ -1,0 +1,26 @@
+{
+  "id": "FEAT-001",
+  "type": "chore",
+  "description": "Establish a green baseline for both the Python backend and the TypeScript frontend so the redaction change can be verified against known-passing tests. pytest is NOT preinstalled in this environment; frontend node_modules may be absent.",
+  "status": "completed",
+  "steps": [
+    "From repo root /projects/sandbox/KiroCrew, install backend dev dependencies into the active Python environment using uv: `uv pip install -e '.[dev]'`. If the editable extras path is slow or fails, fall back to `uv pip install pytest pytest-asyncio hypothesis` (the redaction tests only need pytest + stdlib).",
+    "Confirm the backend redaction baseline is green: `python3 -m pytest test/test_redaction_mirror_parity.py test/test_diagnostics.py -q`. Also run the exfiltration-relevant portion of test_security.py: `python3 -m pytest test/test_security.py -k 'exfil or Exfil or Slack or presigned or oauth or Oauth or credential or Credential' -q`.",
+    "Install frontend dependencies: `cd website && npm ci` (network is OPEN_INTERNET).",
+    "Confirm the frontend sanitize baseline is green: `cd website && npx vitest run src/test/sanitizeCredentials.test.ts src/test/sanitizeXss.jsdom.test.ts`.",
+    "Confirm the frontend builds (this is the guard for the Safari-14 no-lookbehind constraint): `cd website && npm run build`. If the full build is too slow, at minimum run `cd website && npx tsc -b` to typecheck.",
+    "Record the exact commands that worked in the feature findings so later features reuse them."
+  ],
+  "acceptance_criteria": [
+    "`python3 -m pytest test/test_redaction_mirror_parity.py test/test_diagnostics.py -q` runs and reports all tests passing (no collection errors).",
+    "`cd website && npx vitest run src/test/sanitizeCredentials.test.ts` runs and reports passing.",
+    "`cd website && npm run build` completes successfully (or `npx tsc -b` passes if build is deferred), confirming the baseline entry chunk compiles.",
+    "The working set of setup/test commands is recorded in findings."
+  ],
+  "verification": [
+    "python3 -m pytest test/test_redaction_mirror_parity.py test/test_diagnostics.py -q",
+    "cd website && npx vitest run src/test/sanitizeCredentials.test.ts"
+  ],
+  "blocked_reason": null,
+  "findings": "BASELINE GREEN. No application code modified.\n\nCRITICAL ENV NOTE: the default `python3` on PATH is 3.9.25, but pyproject.toml requires-python is >=3.10, so `uv pip install -e '.[dev]'` against the default interpreter fails. pyenv has 3.10.20/3.11.15/3.12.13/3.13.13/3.14.4 available. Fix: create a uv venv on 3.12 and install into it. `.venv`, `.venv-x86`, `.venv311` are already in .gitignore (repo root), and website/node_modules + website/dist are gitignored too, so none pollute git.\n\nEXACT WORKING SETUP (from repo root /projects/sandbox/KiroCrew):\n  uv venv --python /root/.pyenv/versions/3.12.13/bin/python3 .venv\n  source .venv/bin/activate && uv pip install -e '.[dev]'   # ~installs pytest 9.1.1, pytest-asyncio 1.4.0, hypothesis, etc.\n  cd website && npm ci   # network OPEN_INTERNET; succeeds (306 pkgs; 3 npm-audit vulns are pre-existing, unrelated)\n\nEXACT WORKING TEST/BUILD COMMANDS (activate the venv first for backend: `source .venv/bin/activate`):\n  BACKEND: python3 -m pytest test/test_redaction_mirror_parity.py test/test_diagnostics.py -q    => 52 passed\n  BACKEND: python3 -m pytest test/test_security.py -k 'exfil or Exfil or Slack or presigned or oauth or Oauth or credential or Credential' -q    => 262 passed\n  FRONTEND: cd website && npx vitest run src/test/sanitizeCredentials.test.ts src/test/sanitizeXss.jsdom.test.ts    => 14 passed (2 files)\n  FRONTEND BUILD (Safari-14 no-lookbehind guard): cd website && npm run build    => 'built in ~24s', succeeds\n\nNotes for later features: the backend venv must be re-activated in each new shell (`source /projects/sandbox/KiroCrew/.venv/bin/activate`). Deprecation warnings from xdist/asyncio in pytest output are pre-existing and harmless. `npm run build` is slow-ish (~25s) but works; `npx tsc -b` is the faster typecheck-only fallback."
+}
