@@ -4676,7 +4676,9 @@ class SkillsLoader:
         ``frontmatter._COLUMN0_BLOCK_RE`` — the ``column0_fence`` extraction
         that ``frontmatter.SKILL_LOADER`` binds to the skills surface: the
         closer is the first line after the opener that STARTS with ``---`` —
-        trailing text on the closer line is tolerated and consumed (#6182). Anything
+        trailing text on the closer line is tolerated and consumed (#6182), and
+        an optional carriage return before each fence newline is tolerated the
+        way the parser tolerates one. Anything
         the display parser reads as frontmatter must also be stripped here:
         a stricter closer (the old ``---`` must-be-followed-by-newline
         grammar) let a ``---junk`` or ``--- `` closer parse fields in the UI
@@ -4684,7 +4686,7 @@ class SkillsLoader:
         means revisiting the other.
         """
         if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---[^\n]*\n?", content, re.DOTALL)
+            match = re.match(r"^---\r?\n.*?\r?\n---[^\n]*\n?", content, re.DOTALL)
             if match:
                 return content[match.end() :].strip()
         return content

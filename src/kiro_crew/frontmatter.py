@@ -113,33 +113,34 @@ def parse_block_scalar_header(value: str) -> tuple[str, int | None] | None:
 # Fence extraction for the "column0_fence" dialect: the opener must be exactly
 # ``---`` at position 0 followed by a newline; the closer is the next line
 # that *starts with* ``---`` (trailing text after the closer is tolerated).
-_COLUMN0_BLOCK_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+# An optional CR before each fence newline is tolerated. Most SKILL.md reads
+# fold CRLF to LF before parsing (``Path.read_text``'s universal newlines,
+# ``skills._decode_skill_text``), but the grammar must not depend on callers
+# pre-folding: text reaches it VERBATIM too — the Agent SOP description
+# reader decodes raw bytes, so a Windows-authored document showed no
+# description at all — and through :func:`set_frontmatter_fields` a fence
+# this pattern cannot see makes a field edit PREPEND a brand-new block above
+# the existing one instead of rewriting it. Interior lines may still carry a
+# trailing ``\r``; the line parser strips it, so a resolved value is equal to
+# its LF twin's — the same break normalisation a YAML reader applies.
+_COLUMN0_BLOCK_RE = re.compile(r"^---\r?\n(.*?)\r?\n---", re.DOTALL)
 
-# As above, but tolerating CRLF. A steering file authored on Windows has
-# ``---\r\n``, which the LF-only fence above does not match at all — so its
-# declaration was invisible (the tab reported the default mode and the
-# runtime skipped the document entirely) and an edit PREPENDED a second
-# front-matter block instead of rewriting the first.
-#
-# The inner group is OPTIONAL: an opener immediately followed by a closer
-# (``---\n---``, an empty block) has no line between them for ``(.*?)\n`` to
-# consume, so the non-optional form never matched it at all — the extractor
-# reported "no fence", and a mode edit then PREPENDED a brand-new fence in
-# front of the empty one instead of populating it, doubling the block. A
-# match with the group absent (``None``, distinct from the empty string a
-# real-but-blank line would capture) is exactly that zero-line case.
+# As above, and ADDITIONALLY matching the EMPTY block. The inner group is
+# OPTIONAL: an opener immediately followed by a closer (``---\n---``) has no
+# line between them for ``(.*?)\n`` to consume, so the non-optional form
+# never matched it at all — the extractor reported "no fence", and a mode
+# edit then PREPENDED a brand-new fence in front of the empty one instead of
+# populating it, doubling the block. A match with the group absent (``None``,
+# distinct from the empty string a real-but-blank line would capture) is
+# exactly that zero-line case. Whether an empty block counts as a fence is a
+# per-dialect accepted-input decision — steering opts in, the skill dialects
+# keep their non-optional group — which is why this stays a separate pattern.
 _COLUMN0_BLOCK_CRLF_RE = re.compile(r"^---\r?\n(?:(.*?)\r?\n)?---", re.DOTALL)
 
-# DEFERRED, deliberately: ``column0_fence`` (``SKILL_LOADER``) and
-# ``leading_ws_fence`` (``SKILL_UPDATE``) keep the LF-only grammar, so a
-# Windows-authored SKILL.md still has invisible front matter. Widening them
-# changes what the skills catalog and the update merge ACCEPT — a behaviour
-# change with its own review surface and its own snapshot corpus, which is
-# why each dialect is a separate constant. Steering was fixed here because
-# its own feature depends on the declaration being read at all.
-# Fence extraction for the "leading_ws_fence" dialect: identical, except any
-# whitespace (including blank lines) may precede the opening fence.
-_LEADING_WS_BLOCK_RE = re.compile(r"^\s*---\n(.*?)\n---", re.DOTALL)
+# Fence extraction for the "leading_ws_fence" dialect: as "column0_fence"
+# (CR tolerance included), except any whitespace (including blank lines) may
+# precede the opening fence.
+_LEADING_WS_BLOCK_RE = re.compile(r"^\s*---\r?\n(.*?)\r?\n---", re.DOTALL)
 
 # How the frontmatter block is located within the document. Each mode is the
 # fence grammar of the dialects that name it; they are not interchangeable.

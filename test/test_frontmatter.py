@@ -208,7 +208,11 @@ HISTORY_EXPECTED: dict[str, dict[str, str]] = {
     "closer_indented": {},
     "closer_trailing_junk": {"name": "x"},
     "colon_in_value": {"url": "http://example.com:8080"},
-    "crlf": {},
+    # A deliberate accepted-input widening, not drift: the fence tolerates an
+    # optional carriage return before each newline, so a CRLF document reads
+    # exactly like its LF twin instead of as "no frontmatter" (the
+    # pre-consolidation parser returned {} here).
+    "crlf": {"name": "x"},
     "duplicate_keys": {"k": "first"},
     # first_key_wins both ways: the plain value survives a later scalar
     # duplicate (whose lines the shared scanner consumes but the original
@@ -1268,6 +1272,66 @@ def test_crlf_block_scalar_survives_a_mode_edit():
     out = set_frontmatter_fields(doc, {"inclusion": "always"}, STEERING_LOADER)
     assert "\r\r\n" not in out
     assert out.count("\r\n") == out.count("\n")
+
+
+class TestCrlfSkillDocuments:
+    """The skill dialects read a CRLF document without a caller pre-folding.
+
+    Most SKILL.md reads fold CRLF to LF before parsing (``Path.read_text``'s
+    universal newlines, ``skills._decode_skill_text``), so those paths never
+    met the LF-only fence. Text that arrives VERBATIM did: the Agent SOP
+    description reader decodes raw bytes, so a Windows-authored document
+    showed no description at all. And ``set_frontmatter_fields`` is public
+    API reachable with these dialects: a fence the extraction cannot see
+    makes a field edit PREPEND a brand-new block above the existing one — a
+    double-fenced file, with the stale fence left sitting in the body —
+    instead of rewriting it in place.
+    """
+
+    def test_the_declaration_is_visible_to_both_skill_dialects(self) -> None:
+        doc = "---\r\nname: x\r\nalways: true\r\ndescription: hello\r\n---\r\nbody\r\n"
+        expected = {"name": "x", "always": "true", "description": "hello"}
+        assert parse_frontmatter(doc, SKILL_LOADER) == expected
+        assert parse_frontmatter(doc, SKILL_UPDATE) == expected
+
+    def test_a_crlf_document_resolves_exactly_like_its_lf_twin(self) -> None:
+        # The contract is equality with the LF twin because that is what a
+        # YAML reader gives: line breaks are normalised, so a resolved value
+        # carries no stray CR. Same header/body matrix as the steering pin in
+        # TestTheLiteralFoldTheSkillEditorSimulates, extended over every
+        # fence-based dialect.
+        for dialect in (SKILL_LOADER, SKILL_UPDATE, STEERING_LOADER):
+            for header, body in (
+                ("|", ["  one", "", "  two"]),
+                ("|", ["", "  one"]),
+                ("|-", ["  one", "", "  two"]),
+                ("|+", ["  one", ""]),
+                (">", ["  one", "", "  two"]),
+                ("|2", ["  one", "", "  two"]),
+            ):
+                frag = "\n".join(["name: s", f"description: {header}", *body, "mode: always"])
+                lf = f"---\n{frag}\n---\n\nBody\n"
+                crlf = lf.replace("\n", "\r\n")
+                want = parse_frontmatter(lf, dialect)
+                got = parse_frontmatter(crlf, dialect)
+                assert want["name"] == "s", (dialect.extraction, header, body)
+                assert got == want, (dialect.extraction, header, body, got, want)
+                assert not any("\r" in v for v in got.values()), (dialect.extraction, got)
+
+    def test_an_edit_rewrites_rather_than_prepends(self) -> None:
+        # The write-side symptom: with the fence invisible, the writer judged
+        # the document as having no frontmatter yet and created a new block
+        # ABOVE the existing one instead of editing it in place.
+        doc = "---\r\nname: s\r\ndescription: |\r\n  one\r\n---\r\n\r\n# Body\r\n"
+        out = set_frontmatter_fields(doc, {"description": "AFTER"}, SKILL_UPDATE)
+        assert out == "---\r\nname: s\r\ndescription: AFTER\r\n---\r\n\r\n# Body\r\n"
+        assert parse_frontmatter(out, SKILL_UPDATE)["description"] == "AFTER"
+
+    def test_lf_documents_are_unchanged(self) -> None:
+        lf = "---\nname: s\ndescription: before\n---\n\n# Body\n"
+        out = set_frontmatter_fields(lf, {"description": "AFTER"}, SKILL_UPDATE)
+        assert out == "---\nname: s\ndescription: AFTER\n---\n\n# Body\n"
+        assert "\r" not in out
 
 
 class TestInlineComments:
