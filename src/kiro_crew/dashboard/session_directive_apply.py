@@ -50,7 +50,11 @@ from typing import Any
 from kiro_crew.apps.builtins.auto_research.session_keys import (
     is_owned_research_slot,
 )
-from kiro_crew.autonudge import APPROVAL_STALL_REASON, AUTONUDGE_STOP_REASON
+from kiro_crew.autonudge import (
+    APPROVAL_STALL_REASON,
+    AUTONUDGE_STOP_REASON,
+    MONITOR_TERMINAL_REASON,
+)
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.session_surface import has_dashboard_surface
 
@@ -320,16 +324,55 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
         # A budget-raise passed the spent-budget guard above, so any budget in
         # the patch here is beyond the loop's elapsed age (or 0 = unlimited).
         raising_budget = "max_runtime_secs" in patch
-        if stopped_at_cap and raising_cap:
-            patch["active"] = True
-            revived = True
-        elif stopped_at_budget and raising_budget:
+        # A TERMINAL subject outranks every bound, and an OWED terminal turn counts
+        # as one -- the same precedence the expiry notice states, read from the same
+        # two fields, so the agent-facing and user-facing endings cannot disagree.
+        #
+        # A channel-bound loop does not settle on observation: the probe records the
+        # owed final turn in ``monitor.terminal_pending`` and leaves the loop active
+        # with no ``outcome``. If that turn is refused (a busy thread, the ordinary
+        # case) and the retry finds a bound spent, the loop deactivates tagged with
+        # that bound before the settlement that would promote the debt ever runs.
+        # Reading ``stopped_reason`` alone then contradicts a fact already durably on
+        # disk, and here it does more than mis-word a notice: a patch that also
+        # raises the bound REVIVES the loop, re-arming a watch on a subject that has
+        # already merged -- the wasted fresh loop this branch exists to prevent.
+        #
+        # Expressed ONCE, as a term in the revival decision itself, rather than as a
+        # guard per branch: the notice next door lost this same precedence three
+        # times because each new bound was added ahead of it.
+        monitor = getattr(loop, "monitor", None)
+        owed = str(getattr(monitor, "terminal_pending", "") or "") if monitor else ""
+        terminal = reason == MONITOR_TERMINAL_REASON or bool(owed)
+        # A settled outcome wins; the debt is the fallback that keeps the
+        # merged-vs-closed distinction available before the settlement lands. Both
+        # speak the same vocabulary (``success``/``blocked``, matching
+        # ``MonitorOutcome``), so one reading covers either source.
+        settled = getattr(monitor, "outcome", None) if monitor else None
+        decided = str(getattr(settled, "value", settled) or owed or "")
+        revivable = not terminal and (
+            (stopped_at_cap and raising_cap) or (stopped_at_budget and raising_budget)
+        )
+        if revivable:
             patch["active"] = True
             revived = True
         else:
             # Name the bound that actually stopped the loop, so the remedy in
             # the message is the one that will work.
-            if stopped_at_budget:
+            if terminal:
+                if decided == "success":
+                    bound = (
+                        "its subject already merged, so the watch is over and there is "
+                        "nothing left to observe; raising a bound buys cycles with no "
+                        "work in them, so arm monitor_start again only for a NEW subject"
+                    )
+                else:
+                    bound = (
+                        "its subject was closed without merging, so re-arming would only "
+                        "re-observe that; the open question is whether to reopen the "
+                        "subject or abandon the goal, and neither is a bound you can raise"
+                    )
+            elif stopped_at_budget:
                 bound = (
                     f"its {int(getattr(loop, 'max_runtime_secs', 0) or 0)}s wall-clock "
                     "budget ran out; raise max_runtime_secs above the loop's age "

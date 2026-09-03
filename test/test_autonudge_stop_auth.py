@@ -39,6 +39,7 @@ from kiro_crew import autonudge_authz, session_directive
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
+    MONITOR_TERMINAL_REASON,
     AutoNudgeService,
     binding_key_for,
 )
@@ -242,6 +243,7 @@ class _FakeLoop:
         max_runtime_secs=0,
         stopped_reason="",
         slot_key="",
+        monitor=None,
     ):
         self.id = loop_id
         self.cycle_count = cycle_count
@@ -251,6 +253,20 @@ class _FakeLoop:
         self.max_runtime_secs = max_runtime_secs
         self.stopped_reason = stopped_reason
         self.slot_key = slot_key
+        self.monitor = monitor
+
+
+class _FakeMonitor:
+    """The two monitor fields the paused-loop branch reads about a subject.
+
+    ``terminal_pending`` is the owed final turn (``"success"``/``"blocked"``) a
+    channel loop records on observing a terminal subject; ``outcome`` is the
+    settled classification written once that turn lands.
+    """
+
+    def __init__(self, *, terminal_pending="", outcome=None):
+        self.terminal_pending = terminal_pending
+        self.outcome = outcome
 
 
 class _FakeSvc:
@@ -650,6 +666,173 @@ def test_applier_monitor_update_budget_stopped_denial_names_the_budget(monkeypat
     assert not update_calls
     assert "wall-clock" in result and "max_runtime_secs" in result
     assert "max_cycles" not in result
+
+
+def test_applier_owed_terminal_turn_is_not_reported_as_a_spent_cap(monkeypatch):
+    """A channel loop whose subject MERGED must not be told it ran out of cycles.
+
+    A channel-bound loop does not settle on observation: the probe records the owed
+    final turn in ``monitor.terminal_pending`` and leaves the loop active with no
+    ``outcome``. If that turn is refused (a busy thread) and the retry finds the cap
+    spent, the loop deactivates with ``stopped_reason="cycle_cap"`` before the
+    settlement that would promote the debt ever runs. Reading the reason alone then
+    contradicts a fact already durably on disk — and because the cap is also being
+    raised here, the loop would be REVIVED to watch a subject that already merged,
+    which is the wasted fresh loop this costs.
+    """
+    loop = _FakeLoop(
+        "loop-owed-merged",
+        cycle_count=24,
+        max_cycles=24,
+        active=False,
+        stopped_reason="cycle_cap",
+        slot_key="slack:C123:170.5",
+        monitor=_FakeMonitor(terminal_pending="success"),
+    )
+    svc = _FakeSvc(loop)
+    _install_svc(monkeypatch, svc)
+    update_calls = _record_update(monkeypatch)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"max_cycles": 48}},
+        )
+    )
+    assert not update_calls, "a terminal subject must not be re-armed by a cap raise"
+    assert "cycle cap" not in result, result
+    assert "merged" in result
+    assert "monitor_start" in result
+
+
+def test_applier_owed_blocked_turn_is_not_reported_as_a_merge(monkeypatch):
+    """A subject closed WITHOUT merging is terminal but is not good news.
+
+    It stopped on a question the operator has to answer — reopen, or abandon — so it
+    must not be worded as a finish. The debt carries the distinction in the same
+    vocabulary the settled outcome uses (``success``/``blocked``).
+    """
+    loop = _FakeLoop(
+        "loop-owed-closed",
+        cycle_count=24,
+        max_cycles=24,
+        active=False,
+        stopped_reason="cycle_cap",
+        slot_key="slack:C123:170.5",
+        monitor=_FakeMonitor(terminal_pending="blocked"),
+    )
+    svc = _FakeSvc(loop)
+    _install_svc(monkeypatch, svc)
+    update_calls = _record_update(monkeypatch)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"max_cycles": 48}},
+        )
+    )
+    assert not update_calls
+    assert "cycle cap" not in result, result
+    assert "without merging" in result
+    assert "merged" not in result.replace("without merging", "")
+
+
+def test_applier_settled_terminal_loop_is_not_reported_as_a_manual_pause(monkeypatch):
+    """A SETTLED terminal loop had no branch here either, so it fell to the
+    generic wording and was announced as if a human had pressed Stop."""
+    from kiro_crew.monitoring.models import MonitorOutcome
+
+    loop = _FakeLoop(
+        "loop-settled",
+        cycle_count=7,
+        max_cycles=24,
+        active=False,
+        stopped_reason=MONITOR_TERMINAL_REASON,
+        monitor=_FakeMonitor(outcome=MonitorOutcome.SUCCESS),
+    )
+    svc = _FakeSvc(loop)
+    _install_svc(monkeypatch, svc)
+    update_calls = _record_update(monkeypatch)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"message": "revised"}},
+        )
+    )
+    assert not update_calls
+    assert "paused manually" not in result, result
+    assert "merged" in result
+
+
+def test_applier_a_settled_outcome_outranks_a_stale_owed_turn(monkeypatch):
+    """The settled ``outcome`` is authoritative; the debt is only the fallback.
+
+    Both fields can be populated at once — the settlement writes ``outcome`` and
+    clears the debt in the same pass — so a reader that preferred the debt could
+    announce a stale classification.
+    """
+    from kiro_crew.monitoring.models import MonitorOutcome
+
+    loop = _FakeLoop(
+        "loop-both",
+        cycle_count=24,
+        max_cycles=24,
+        active=False,
+        stopped_reason="cycle_cap",
+        monitor=_FakeMonitor(terminal_pending="success", outcome=MonitorOutcome.BLOCKED),
+    )
+    svc = _FakeSvc(loop)
+    _install_svc(monkeypatch, svc)
+    update_calls = _record_update(monkeypatch)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"max_cycles": 48}},
+        )
+    )
+    assert not update_calls
+    assert "without merging" in result
+
+
+def test_applier_a_spent_cap_with_no_terminal_news_still_revives(monkeypatch):
+    """Control: the terminal carve-out must not swallow a genuine cap.
+
+    A cap-stopped loop with a monitor that saw nothing terminal keeps the revival
+    affordance a raised cap is supposed to give it.
+    """
+    loop = _FakeLoop(
+        "loop-plain-cap",
+        cycle_count=24,
+        max_cycles=24,
+        active=False,
+        stopped_reason="cycle_cap",
+        monitor=_FakeMonitor(),
+    )
+    svc = _FakeSvc(loop)
+    _install_svc(monkeypatch, svc)
+    update_calls = _record_update(monkeypatch, loop=loop)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(),
+            _fake_slot(),
+            _SESSION,
+            "monitor_update",
+            {"patch": {"max_cycles": 48}},
+        )
+    )
+    assert len(update_calls) == 1
+    assert update_calls[0]["active"] is True
+    assert "re-armed" in result
 
 
 def test_applier_monitor_update_without_a_loop_is_a_clean_noop(monkeypatch):
