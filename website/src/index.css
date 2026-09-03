@@ -1978,6 +1978,15 @@ file-tree-container{
    src/lib/electron.ts. Applied only when the window is actually frameless
    (runtime decision — see isLinuxFramelessElectron). */
 .linux-electron header.topbar-glass{padding-right:112px}
+
+/* ── Focus mode: the same caption reserve, for the surface at that corner ──
+   The insets above all hang off the DOCKED header, and focus mode takes it out
+   of flow (App.tsx makes it an absolute overlay), so the content row reaches y=0
+   with nothing clearing the caption band. The controls stay painted there on
+   both platforms — only macOS hides its own with the chrome, so only macOS needs
+   no reserve. Keep the widths in sync with the two header rules above. */
+body.mc-focus-mode .win-electron .focus-caption-reserve{padding-right:142px}
+body.mc-focus-mode .linux-electron .focus-caption-reserve{padding-right:112px}
 /* Embedded remote pane (option B): the pane is a separate document loaded in an
    iframe, so its SPA can't see Electron — `isMacElectron` is false inside it and
    the `.mac-electron` rule never applies. The parent relays whether it is a

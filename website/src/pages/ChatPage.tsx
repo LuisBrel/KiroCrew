@@ -7996,7 +7996,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-              <div className="ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none">
+              {/* focus-caption-reserve: this group owns the window's top-trailing
+                  corner — where Windows and frameless Linux paint their caption
+                  controls — whenever the side panel is not holding that edge, i.e.
+                  while it is closed (the state that renders the reopen toggle
+                  below) or docked at the bottom. Right-docked and showing, the
+                  panel is at that edge instead and carries the reserve itself, so
+                  reserving here too would indent these controls for nothing. */}
+              <div className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === 'bottom' ? ' focus-caption-reserve' : ''}`}>
               {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.
