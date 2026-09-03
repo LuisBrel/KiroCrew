@@ -52,6 +52,35 @@ from kiro_crew.validation import (
 # self-correction for a few dozen characters, not a full agent listing.
 _MAX_ROSTER_NAMES = 8
 
+# Owner recorded on an audit record when the resolver named no session. An empty
+# owner is ambiguous by construction: a resolver whose every identity source
+# failed and a spawn with genuinely no owning session both produce ``""``, and
+# nothing downstream can recover which one it was. This marker names the failed
+# resolution where it happens, so the audit trail says "the owner was lost"
+# rather than naming no session at all.
+#
+# Same ``unresolved:<pid>`` wire format the computer-use shim already writes
+# (``mcp_computer.UNRESOLVED_SESSION_PREFIX``), so one audit-reader vocabulary
+# covers both producers. Deliberately NOT trustworthy attribution -- the prefix
+# says it is not, so a reader cannot mistake a pid for a session identity.
+_OWNER_UNRESOLVED_PREFIX = "unresolved:"
+
+
+def _audit_owner(parent_session: str) -> str:
+    """The owner to record on an audit record for *parent_session*.
+
+    A resolved key is recorded verbatim. An empty one becomes the unresolved
+    marker for THIS process, read at call time so a forked child cannot report
+    its parent's pid.
+
+    Audit-only. The spawn REQUEST keeps the empty owner, because
+    ``parent_session_key`` addresses per-slot frame delivery and a synthetic key
+    there would route frames at a slot that does not exist.
+    """
+    if parent_session:
+        return parent_session
+    return f"{_OWNER_UNRESOLVED_PREFIX}{os.getpid()}"
+
 
 def _agent_roster_hint() -> str:
     """Valid agent names, for the ``agent``/``agents`` parameter descriptions.
@@ -963,7 +992,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             entry["agent_or_mode"] = a[:MAX_SHORT_STRING]
 
     mcp_core.sel().log_tool_invocation(
-        session_key=parent_session or "",
+        session_key=_audit_owner(parent_session),
         source="mcp_core",
         tool_name="spawn_sub_agents",
         outcome="attempt",
@@ -1096,7 +1125,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     if sa_errors:
         sa_results.append(json.dumps({"status": "spawn_errors", "errors": sa_errors}))
     mcp_core.sel().log_tool_invocation(
-        session_key=parent_session or "",
+        session_key=_audit_owner(parent_session),
         source="mcp_core",
         tool_name="spawn_sub_agents",
         outcome="completed" if not timed_out and not errored else "partial",
