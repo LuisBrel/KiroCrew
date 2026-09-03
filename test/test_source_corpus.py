@@ -26,6 +26,8 @@ filters on the bare keyword and why that spelling is asserted below.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 import test_no_blocking_call_on_loop as blocking
@@ -41,6 +43,39 @@ _MIN_FILES = 800
 #: The census filter, which lives in ``test_security_posture`` as a literal at
 #: its one call site because that gate has no class to hang it on.
 _CENSUS_REQUIRE_ALL = ("redact",)
+
+#: The nodes CPython attaches ``__doc__`` to, and so the only strings it encodes
+#: on its own account rather than on the program's.
+_DOCSTRING_NODES = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+#: Necessary condition for an unencodable docstring, so the gate below parses 15
+#: files instead of the tree. A surrogate must have been WRITTEN as an escape:
+#: no UTF-8 byte sequence decodes to one, so a literal surrogate would make the
+#: file unreadable (pinned above) rather than parseable. Surrogates are
+#: U+D800-U+DFFF, so every spelling is ``\u`` or ``\U0000`` followed by a ``d``,
+#: and ``\N{...}`` has no name for an unpaired one.
+_SURROGATE_ESCAPES = ("\\ud", "\\uD", "\\U0000d", "\\U0000D")
+
+
+def _unencodable_docstrings(sources: Sequence[tuple[Path, str]]) -> list[tuple[Path, str, str]]:
+    """``(path, owner, reason)`` for every docstring UTF-8 cannot represent.
+
+    ``clean=False`` because de-indenting cannot change whether a character is
+    encodable, and the whole point is to answer that question cheaply.
+    """
+    found: list[tuple[Path, str, str]] = []
+    for path, text in sources:
+        for node in ast.walk(ast.parse(text, filename=str(path))):
+            if not isinstance(node, _DOCSTRING_NODES):
+                continue
+            doc = ast.get_docstring(node, clean=False)
+            if doc is None:
+                continue
+            try:
+                doc.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                found.append((path, getattr(node, "name", "<module>"), str(exc)))
+    return found
 
 
 class TestCorpusHealth:
@@ -64,6 +99,27 @@ class TestCorpusHealth:
         assert unreadable_files() == (), (
             "The corpus could not decode these files, so no ratchet can see them: "
             f"{[str(p) for p in unreadable_files()]}"
+        )
+
+    def test_no_docstring_holds_a_character_utf_8_cannot_encode(self):
+        """An unpaired surrogate in a docstring is an unimportable module.
+
+        The compiler de-indents docstrings and encodes ``__doc__`` as strict
+        UTF-8, so from 3.13 on a docstring carrying an unpaired surrogate raises
+        ``UnicodeEncodeError`` on IMPORT. Nothing else in the suite survives that:
+        it lands during collection, so every gate here reports zero tests rather
+        than one failure, and the corpus never gets read at all.
+
+        Asserted rather than left to the compiler because the property has to
+        hold on every interpreter the project supports -- an older one compiles
+        such a docstring happily, which is exactly how one reaches a tree whose
+        gates all look green.
+        """
+        offenders = _unencodable_docstrings(candidate_sources(require_any=_SURROGATE_ESCAPES))
+        assert offenders == [], (
+            "These docstrings hold a character UTF-8 cannot encode, so their "
+            "modules do not import on 3.13+ -- write the escape as a literal "
+            f"(``\\\\ud800``) instead: {[(str(p), owner) for p, owner, _why in offenders]}"
         )
 
     def test_sources_are_the_real_file_contents(self):
@@ -131,6 +187,12 @@ class TestFilterLiteralsStillMatchWhatTheGatesReject:
             "    logger.error('install failed: %s', redact(stderr.decode()))\n"
         )
         assert self._admits(violating, _CENSUS_REQUIRE_ALL)
+
+    def test_a_lone_surrogate_docstring_survives_the_encodability_filter(self):
+        """The one filter whose literals are prose, so nothing else would notice."""
+        violating = 'def f():\n    """A lone \\ud800 escape, quoted as prose."""\n'
+        assert self._admits(violating, require_any=_SURROGATE_ESCAPES)
+        assert _unencodable_docstrings([(Path("planted.py"), violating)]), "gate must flag this"
 
 
 class TestFiltersStillNarrowTheTree:
