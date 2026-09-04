@@ -77,6 +77,60 @@ describe('isHiddenInvisibleAssistantRow', () => {
   })
 })
 
+describe('isHiddenInvisibleAssistantRow reads the record-time marker', () => {
+  // The backend stamps meta.invisible_only when it persists a turn whose reply
+  // renders as nothing (chat_runner._mark_invisible_only), so this reader keys
+  // off the recorded verdict instead of every consumer re-deriving the Cf rule.
+  it('honours the marker without re-deriving from the content', () => {
+    expect(
+      isHiddenInvisibleAssistantRow({
+        role: 'assistant',
+        content: 'text the Cf test alone would call visible',
+        meta: { invisible_only: true },
+      }),
+    ).toBe(true)
+  })
+
+  it('treats an absent marker as "derive it", not as false', () => {
+    // Every row persisted before the marker existed lacks it; those must keep
+    // being hidden by the derivation, which is what heals existing history.
+    expect(isHiddenInvisibleAssistantRow({ role: 'assistant', content: '\u200b', meta: {} })).toBe(
+      true,
+    )
+  })
+
+  it('never hides a non-assistant row on the strength of a marker', () => {
+    expect(
+      isHiddenInvisibleAssistantRow({
+        role: 'user',
+        content: '\u200b',
+        meta: { invisible_only: true },
+      }),
+    ).toBe(false)
+  })
+
+  it('lets the retention exceptions outrank the marker', () => {
+    // The marker is a fact about the text. Chips are real content, and a
+    // visible variant can be added by a regenerate long after the stamp — so
+    // both still win, or a stale write-time verdict would hide real content.
+    expect(
+      isHiddenInvisibleAssistantRow({
+        role: 'assistant',
+        content: '\u200b',
+        meta: { invisible_only: true, file_changes: [{ path: 'a.ts' }] },
+      }),
+    ).toBe(false)
+    expect(
+      isHiddenInvisibleAssistantRow({
+        role: 'assistant',
+        content: '\u200b',
+        meta: { invisible_only: true },
+        variants: [{ content: 'the earlier visible reply' }, { content: '\u200b' }],
+      }),
+    ).toBe(false)
+  })
+})
+
 describe('ChatPage inline chain consults the skip (source contract)', () => {
   const src = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
 

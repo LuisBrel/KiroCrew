@@ -29,6 +29,15 @@ export function isInvisibleOnly(text: string): boolean {
  * and the row hosts the typing indicator. A hidden row's `turn_stats` are
  * deliberately dropped with it: a say-nothing cycle's footer stats are noise,
  * and cost accounting lives in the usage panels, not the transcript.
+ *
+ * The invisible-only verdict is READ from `meta.invisible_only` when the
+ * backend recorded one at persist time (`chat_runner._mark_invisible_only`),
+ * and only derived from the content otherwise. Absence is not `false`: every
+ * row persisted before the marker existed lacks it, so the derivation stays as
+ * the fallback that keeps that history healing. The marker states a fact about
+ * the content, not the render decision — the exceptions above are still applied
+ * on top of it, because a regenerate can add a visible variant to a row that
+ * was stamped turns ago.
  */
 export function isHiddenInvisibleAssistantRow(
   m: Pick<ChatMessage, 'role' | 'content' | 'meta' | 'variants'>,
@@ -37,5 +46,5 @@ export function isHiddenInvisibleAssistantRow(
   const changes = m.meta?.file_changes
   if (Array.isArray(changes) && changes.length > 0) return false
   if (m.variants?.some(v => !isInvisibleOnly(v.content))) return false
-  return isInvisibleOnly(m.content)
+  return m.meta?.invisible_only === true || isInvisibleOnly(m.content)
 }

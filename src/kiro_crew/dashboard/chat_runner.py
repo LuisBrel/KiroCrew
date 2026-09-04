@@ -225,6 +225,7 @@ from kiro_crew.name_grant import (
     shell_command_for_event,
 )
 from kiro_crew.platform import redact_via_context
+from kiro_crew.preview_text import drop_format_chars
 from kiro_crew.providers.acp import is_claude_backend
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -1542,6 +1543,52 @@ def _attach_turn_stats(
         if m.get("role") == "assistant":
             m.setdefault("meta", {})["turn_stats"] = stats
             break
+
+
+def _mark_invisible_only(slot: "_ChatSlot", turn_boundary: int = 0) -> None:
+    """Stamp ``meta.invisible_only`` on a finalized assistant row that renders as nothing.
+
+    A quiet monitor-loop cycle posts a bare U+200B as its say-nothing reply, so
+    a long-running session accretes assistant rows whose content is only Unicode
+    format characters (category Cf) and whitespace. Every consumer currently
+    re-derives that from the content — the sidebar preview via
+    :func:`kiro_crew.preview_text.drop_format_chars`, the transcript via the
+    frontend's ``isInvisibleOnly`` — which makes the convention an unwritten
+    invariant each new reader has to rediscover. Recording the verdict once, at
+    the point the turn is persisted, gives them one field to read instead.
+
+    Delegates to ``drop_format_chars`` rather than restating the Cf test: that
+    function is the single implementation of the drop (the frontend predicate
+    mirrors it), so a third copy here would be the very duplication this
+    removes.
+
+    The marker states a fact about the CONTENT — "this text renders as nothing" —
+    and deliberately not the render decision "hide this row". The retention
+    exceptions stay with the reader because they are not stable at write time: a
+    regenerate can add a visible variant to an already-stamped row, so a
+    "hidden" verdict frozen here would go stale, while an invisible-content
+    verdict never does.
+
+    Written only when true, matching :func:`_attach_turn_stats`'s omit-empty
+    contract: absence means "nobody recorded a verdict", which is exactly the
+    state of every row persisted before this existed, so a reader can treat
+    absence as "derive it yourself" instead of as ``False``.
+
+    ``turn_boundary`` is ``len(slot.messages)`` captured at turn start, so a turn
+    that appended no assistant message cannot walk back and stamp the previous
+    turn's row. No-op when this turn produced no assistant message.
+    """
+    boundary = max(0, turn_boundary)
+    for m in reversed(slot.messages[boundary:]):
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        if isinstance(content, str) and drop_format_chars(content).strip() == "":
+            m.setdefault("meta", {})["invisible_only"] = True
+            # Mirror _flush_file_changes: this mutates meta in place without
+            # appending, so nothing else flags the slot for the periodic flush.
+            slot._dirty = True
+        break
 
 
 def _mcp_server_name_is_ambiguous(server_name: str, safe_name: str) -> bool:
@@ -5989,6 +6036,11 @@ async def _run_chat(
     _mirror_active_task_title = ""
     _mirror_thread: str | None = ""
     _mirror_task_counter = 0
+    # Bound BEFORE the try because the finally block reads it: everything this
+    # turn appends lands at or after this index, so an exception raised before
+    # the authoritative re-capture below still leaves a boundary that cannot
+    # walk back into a previous turn's rows.
+    _turn_msg_boundary = len(slot.messages)
     try:
         # Resolve agent bindings early so we pass the correct kiro-cli
         # agent name (e.g. "kirocrew") instead of the KiroCrew slot name
@@ -10124,6 +10176,11 @@ async def _run_chat(
             )
             # Attach accumulated file changes to last assistant message before persist
             _flush_file_changes(slot)
+            # Record whether this turn's reply renders as nothing, so consumers
+            # read one field instead of each re-deriving the Cf rule. AFTER
+            # _flush_file_changes: a row that just gained diff chips is still
+            # invisible-only as TEXT, and the reader needs both facts to decide.
+            _mark_invisible_only(slot, turn_boundary=_turn_msg_boundary)
             # Save to history and trigger memory consolidation
             await save_slot_off_loop(state, slot)
         # Reset ALL retry budgets once the cycle completes (success OR the
@@ -11254,6 +11311,13 @@ async def _run_chat(
         # bug this fix prevents.
         try:
             _flush_file_changes(slot)
+            # Same reason, same wrapping: a cancelled or errored turn can still
+            # have appended a finalized invisible-only reply, and a row that is
+            # persisted without the marker leaves absence permanently ambiguous.
+            # Stamping at BOTH flush sites is what makes absence mean "predates
+            # the marker" rather than "the turn ended the other way".
+            # Idempotent on the success path, which already stamped it.
+            _mark_invisible_only(slot, turn_boundary=_turn_msg_boundary)
         except Exception:
             logger.debug("_flush_file_changes failed", exc_info=True)
         # This turn consumed the one-shot post-compaction re-injection flag but
