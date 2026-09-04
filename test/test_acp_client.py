@@ -32,6 +32,7 @@ from kiro_crew.acp.client import (
     parse_slash_command,
 )
 from kiro_crew.acp.liveness import (
+    EVIDENCE_SAMPLING,
     VERDICT_DEAD,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
@@ -2167,6 +2168,171 @@ class TestAcpClientStaleTurnOracleGate:
 
         assert tracked.done()
         assert tracked._log_traceback is False
+
+
+class TestStaleTurnOpenToolCall:
+    """An OPEN tool call defers the stale-turn cutoff (issue #8520).
+
+    Only kiro-cli streams ``tool_call_update`` progress frames while a tool
+    runs; a third-party backend that runs a tool to completion and only then
+    reports the result is silent for the whole tool. Text streamed before the
+    dispatch leaves ``_stale_eligible`` set, and off Linux the liveness oracle
+    can only answer UNKNOWN, so the cutoff declared that turn complete and tore
+    it down MID-TOOL. An open tool call is positive evidence the turn is alive:
+    the silence is handed to the tool-stall watchdog, which owns a much longer
+    budget and RECOVERS the slot instead of reporting a truncated turn as done.
+    """
+
+    def _silent_client(self, tmp_path, *, tool_dispatched: bool):
+        client = AcpClient(work_dir=tmp_path)
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = MagicMock(return_value=True)
+        client._stale_eligible = True
+        client._tool_dispatched = tool_dispatched
+        client._last_activity = time.monotonic()
+        # The verdict every /proc-less host returns — the reporter's own log line.
+        client._consult_liveness_model_wait = AsyncMock(
+            return_value=(VERDICT_UNKNOWN, "no readable counters")
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_open_tool_call_defers_the_cutoff(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 30.0)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+
+        t0 = time.monotonic()
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                actions = []
+                async for action, _msg in client._prompt_loop(req_id=85, timeout=0.4):
+                    actions.append(action)
+        elapsed = time.monotonic() - t0
+
+        assert actions == []
+        assert "Stale turn detected" not in caplog.text
+        assert elapsed >= 0.3, f"loop exited at {elapsed:.2f}s — the cutoff reaped an open tool"
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_tool_re_arms_the_cutoff(self, tmp_path, caplog, monkeypatch):
+        """Deferral is not a disarm: once the tool resolves, the cutoff fires."""
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 30.0)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+
+        async def _resolve_then_stay_silent(*_args, **_kwargs):
+            await asyncio.sleep(0.02)
+            # What _dispatch_events does when the tool's result frame arrives.
+            client._tool_dispatched = False
+            return None
+
+        client._read_message = AsyncMock(side_effect=_resolve_then_stay_silent)
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                actions = []
+                async for action, _msg in client._prompt_loop(req_id=86, timeout=5.0):
+                    actions.append(action)
+
+        assert actions == []
+        assert "Stale turn detected" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_stalled_open_tool_is_still_killed(self, tmp_path, monkeypatch):
+        """The deferral must not swallow the tool-stall watchdog.
+
+        Past ITS budget the wedged child is killed and AcpProcessDied raised, so
+        the slot cold-starts on the next prompt — the recovery the bare stale
+        ``return`` never performed.
+        """
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 0.1)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+        client._kill_process = AsyncMock()
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with pytest.raises(AcpProcessDied, match="tool stalled"):
+                async for _action, _msg in client._prompt_loop(req_id=87, timeout=5.0):
+                    pass
+
+        client._kill_process.assert_awaited_once()
+
+
+class TestStaleTurnProbeAccounting:
+    """The stale cutoff must measure BACKEND silence, not our own probe.
+
+    Two ways the gate used to end a live turn on no evidence at all:
+
+    * the idle clock was read AFTER awaiting the liveness consult, so a cold
+      walk's latency (executor warm-up plus the subtree read) was charged to the
+      backend's silence budget;
+    * the oracle's baseline-priming answer (``EVIDENCE_SAMPLING``) counted as a
+      negative verdict, although it is structurally incapable of reading WORKING
+      -- it means "ask me again", not "idle".
+
+    Together they reaped a turn on its FIRST silent read, which is the
+    truncation the per-silent-read consulting exists to avoid.
+    """
+
+    def _silent_client(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = MagicMock(return_value=True)
+        client._stale_eligible = True
+        client._last_activity = time.monotonic()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_priming_verdict_defers_then_real_evidence_reaps(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path)
+        client._consult_liveness_model_wait = AsyncMock(
+            side_effect=[
+                (VERDICT_UNKNOWN, EVIDENCE_SAMPLING),  # no baseline yet
+                (VERDICT_UNKNOWN, "flat counters"),  # a real answer
+            ]
+        )
+
+        # Cutoff 0 so every silent read is past it: the only thing that can keep
+        # the turn alive on the first read is the priming deferral.
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.0):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                async for _action, _msg in client._prompt_loop(req_id=88, timeout=5.0):
+                    pass
+
+        assert "Stale turn detected" in caplog.text  # recovery still fires
+        assert (
+            client._consult_liveness_model_wait.await_count == 2
+        ), "the turn was ended on the priming answer instead of on real evidence"
+
+    @pytest.mark.asyncio
+    async def test_consult_latency_is_not_charged_to_the_silence_budget(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """A consult slower than the cutoff must not itself end the turn."""
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.01)
+        client = self._silent_client(tmp_path)
+        consults = {"n": 0}
+
+        async def _slow_consult():
+            consults["n"] += 1
+            await asyncio.sleep(0.15)  # 3x the cutoff patched below
+            return VERDICT_UNKNOWN, "flat counters"
+
+        client._consult_liveness_model_wait = _slow_consult
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                async for _action, _msg in client._prompt_loop(req_id=89, timeout=5.0):
+                    pass
+
+        assert "Stale turn detected" in caplog.text
+        assert (
+            consults["n"] >= 2
+        ), "the first consult's own 0.15s runtime was counted as backend silence"
 
 
 class TestAcpClientReadMessage:

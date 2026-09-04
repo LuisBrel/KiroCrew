@@ -62,6 +62,7 @@ from kiro_crew.acp._dispatch import (
     redact_text,
 )
 from kiro_crew.acp.liveness import (
+    EVIDENCE_SAMPLING,
     VERDICT_WORKING,
     LivenessOracle,
     _consume_future_exception,
@@ -1100,6 +1101,12 @@ _STALE_TURN_TIMEOUT = 90.0
 # that silently never returns, burning the whole job timeout.  Long real tools
 # keep resetting the timer via tool_call_update progress frames and tool
 # results, so this only trips on a genuine stall.
+#
+# CONTRACT FOR BACKEND AUTHORS: a backend that emits NO frame at all while a
+# tool runs gets exactly this window for the whole tool, so a >10min build must
+# either stream tool_call_update progress frames or ping the session-keepalive
+# endpoint (both reset the clock).  This window — not the ~90s stale-turn
+# cutoff — is what governs an open tool call's silence (issue #8520).
 _TOOL_STALL_TIMEOUT = 600.0
 # After a compaction `failed` status, kiro-cli can leave the turn it was
 # compacting for unanswered: no session/prompt response and no end_turn ever
@@ -5626,8 +5633,18 @@ class AcpClient:
                         # to a non-WORKING verdict on any error (fail toward
                         # reaping). In production, silent reads recur at the
                         # ~_READ_TIMEOUT cadence, giving well-spaced samples.
+                        #
+                        # Snapshot the idle window BEFORE awaiting the consult.
+                        # The walk is OUR OWN probe and a cold one costs tens of
+                        # milliseconds (executor warm-up, then the subtree walk);
+                        # reading the clock AFTER it charges that latency to the
+                        # BACKEND's silence budget, so on a loaded host the first
+                        # silent read could cross the cutoff carrying the only
+                        # verdict the oracle can give before it has a baseline,
+                        # and reap a turn that was streaming a moment earlier.
+                        _idle_secs = time.monotonic() - last_seen
                         verdict, evidence = await self._consult_liveness_model_wait()
-                        if (time.monotonic() - last_seen) > _STALE_TURN_TIMEOUT:
+                        if _idle_secs > _STALE_TURN_TIMEOUT:
                             # Past the cutoff: a backend still doing work (CPU/IO
                             # movement in its subtree — a long model generation or
                             # a spawned build) reads WORKING and we keep waiting.
@@ -5640,19 +5657,68 @@ class AcpClient:
                                     "Stale-turn deferral for req %d — idle %.0fs but "
                                     "backend WORKING (%s)",
                                     req_id,
-                                    time.monotonic() - last_seen,
+                                    _idle_secs,
                                     evidence,
                                 )
                                 continue
-                            logger.warning(
-                                "Stale turn detected for req %d — no data for %.0fs after text was streamed "
-                                "(liveness=%s: %s). Treating as complete.",
-                                req_id,
-                                time.monotonic() - last_seen,
-                                verdict,
-                                evidence,
-                            )
-                            return
+                            if evidence == EVIDENCE_SAMPLING:
+                                # The oracle stored a BASELINE and has nothing to
+                                # compare it against yet, so this verdict is
+                                # structurally incapable of reading WORKING: it
+                                # means "ask me again", not "idle". Reaping on it
+                                # ends a live turn on no evidence at all — the
+                                # per-silent-read consulting above exists to make
+                                # that unlikely, and deferring here makes it
+                                # impossible rather than merely improbable. The
+                                # next silent read has a baseline and answers for
+                                # real, so recovery is delayed by one read, not
+                                # weakened.
+                                logger.debug(
+                                    "Stale-turn deferral for req %d — idle %.0fs but the "
+                                    "liveness baseline is still priming (%s)",
+                                    req_id,
+                                    _idle_secs,
+                                    evidence,
+                                )
+                                continue
+                            if self._tool_dispatched:
+                                # An OPEN TOOL CALL is positive evidence the turn
+                                # is alive, so it defers this cutoff whatever the
+                                # verdict says. Only kiro-cli streams
+                                # tool_call_update progress frames while a tool
+                                # runs; a backend that runs the tool to completion
+                                # and only then reports the result is silent for
+                                # the whole tool, and with text streamed before
+                                # the dispatch this cutoff tore the turn down
+                                # MID-TOOL — reporting truncated work as complete
+                                # (issue #8520). Deliberately NOT a `continue`:
+                                # falling through hands the silence to the
+                                # tool-stall watchdog below, which governs exactly
+                                # this case on its own much longer budget and
+                                # RECOVERS the slot instead of completing the
+                                # turn. Mirrors the compaction-failed budget's
+                                # suspension above; _tool_dispatched is cleared
+                                # when the tool resolves, so the cutoff re-arms
+                                # for the model-wait silence it is actually for.
+                                logger.debug(
+                                    "Stale-turn deferral for req %d — idle %.0fs with a tool "
+                                    "call still open (liveness=%s: %s); tool-stall watchdog "
+                                    "governs",
+                                    req_id,
+                                    _idle_secs,
+                                    verdict,
+                                    evidence,
+                                )
+                            else:
+                                logger.warning(
+                                    "Stale turn detected for req %d — no data for %.0fs after text was streamed "
+                                    "(liveness=%s: %s). Treating as complete.",
+                                    req_id,
+                                    _idle_secs,
+                                    verdict,
+                                    evidence,
+                                )
+                                return
                     # Tool-stall watchdog: a tool was dispatched but NOTHING has
                     # come back (no result, no progress, no permission) for the
                     # stall window.  This is the silent-hang case where
