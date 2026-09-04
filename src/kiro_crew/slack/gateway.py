@@ -113,6 +113,7 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.cron_inject import (
     context_meter_reading,
+    ensure_cron_slot,
     inject_cron_result_to_dashboard,
     prefetch_cron_history,
 )
@@ -4352,6 +4353,17 @@ class GatewayOrchestrator:
                         # Brackets only the model turn — session acquisition and
                         # the episodic-query embed above are setup, not the turn.
                         _turn_t0 = time.monotonic()
+                        # Give the turn a caller IDENTITY before it can call a
+                        # session-control verb. Those verbs resolve the caller by
+                        # matching its session key against a live slot, so without a
+                        # slot the job's first run is refused `caller_unidentified`
+                        # while every later run succeeds on the slot run 1 left
+                        # behind. Idempotent, and gated on the same condition the
+                        # result-injection path uses — including its
+                        # `self.dashboard_state` test, since a gateway running
+                        # without a dashboard has no slots to mint into.
+                        if self.dashboard_state and job.persistent_session and not job.hide_in_chat:
+                            ensure_cron_slot(self.dashboard_state, job)
                         _prompt_dispatched = True
                         result_text, _carried_credits = await _cron_stream_with_posttoken_resume(
                             client,
@@ -4493,6 +4505,11 @@ class GatewayOrchestrator:
                 # above. acp reports no duration, so this is the row's fallback.
                 _turn_t0 = time.monotonic()
                 _gate = _GateTally()
+                # Same caller-identity mint as the sequential path above — see the
+                # comment there for why it has to happen before dispatch, and why
+                # the `self.dashboard_state` test belongs in the gate.
+                if self.dashboard_state and job.persistent_session and not job.hide_in_chat:
+                    ensure_cron_slot(self.dashboard_state, job)
                 _prompt_dispatched = True
                 result_text, _carried_credits = await _cron_stream_with_posttoken_resume(
                     client,

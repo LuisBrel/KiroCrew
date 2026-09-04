@@ -358,6 +358,55 @@ def _prompt_already_recorded(slot: Any, prompt_body: str, own_marker: str) -> bo
     return False
 
 
+def _safe_job_name(job: Any) -> str:
+    """*job*'s name with both redactors applied, in the order production applies them.
+
+    One definition because two callers need the identical string: the slot title and
+    the transcript headers. The credential pass deliberately runs over the URL pass's
+    output, so reversing them can yield bytes production never writes.
+    """
+    safe, _ = redact_exfiltration_urls(job.name)
+    safe, _ = redact_credentials(safe)
+    return safe
+
+
+def ensure_cron_slot(state: Any, job: Any) -> Any:
+    """Create (or find) *job*'s dashboard slot and bind it to ``cron:<job_id>``.
+
+    Idempotent, and called from TWO places for one reason. Session-control verbs
+    resolve a caller by walking the live slots for one whose history key matches the
+    caller's session key (``caller_slot_key``), so a cron that has no slot yet has no
+    identity and is refused with ``caller_unidentified``. The result-injection path
+    below runs only AFTER the turn, which used to make that the state of every job's
+    FIRST run — it worked from run 2 onward purely because run 1 left the slot behind.
+    The gateway therefore calls this immediately before it dispatches the prompt, and
+    the injection path calls it again to write the result into the same slot.
+
+    Publishing to the dashboard-surface registry is part of the contract, not a
+    detail: every gate that asks "does this session have a tab?" — ``dashboard_slot_key``
+    for sub-agent event routing and completion injection, widget/question/approval
+    delivery — reads that registry, and a created-but-unpublished slot silently fails
+    those gates until some unrelated slot change happens to republish it. (Same
+    invariant as ``channel_slots.reconcile`` — see the comment there.)
+    """
+    slot = state.get_or_create_slot(
+        name=f"cron-{job.id}",
+        agent=job.agent_id or "",
+        # A cron result is the job's output, not something the person typed.
+        # A USER label would expose it to any app holding `slots:user`.
+        origin=SlotOrigin.CRON,
+    )
+    safe_name = _safe_job_name(job)
+    slot.title = f"Cron: {safe_name}"
+    if not slot.linked_session_key:
+        slot.linked_session_key = f"cron:{job.id}"
+
+    from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
+
+    _sync_dashboard_slots(state)
+    return slot
+
+
 def inject_cron_result_to_dashboard(
     state: DashboardState,
     job: "CronJob",
@@ -410,30 +459,15 @@ def inject_cron_result_to_dashboard(
     replay path, or a run that measured nothing) records nothing and keeps
     whatever snapshot an earlier run stored.
     """
-    slot_name = f"cron-{job.id}"
-    slot = state.get_or_create_slot(
-        name=slot_name,
-        agent=job.agent_id or "",
-        # A cron result is the job's output, not something the person typed.
-        # A USER label would expose it to any app holding `slots:user`.
-        origin=SlotOrigin.CRON,
-    )
-    safe_name, _ = redact_exfiltration_urls(job.name)
-    safe_name, _ = redact_credentials(safe_name)
-    slot.title = f"Cron: {safe_name}"
-    if not slot.linked_session_key:
-        slot.linked_session_key = f"cron:{job.id}"
+    slot = ensure_cron_slot(state, job)
+    safe_name = _safe_job_name(job)
+    # First run for this slot, so pull the job's durable transcript in. The test is
+    # "the slot has no messages yet", NOT "it has no linked session key": the key is
+    # now set by ``ensure_cron_slot`` before the turn is dispatched (so the running
+    # turn has a caller identity — see that function), which would make a key-based
+    # test read every run as a repeat and silently stop hydrating after a restart.
+    if not slot.messages:
         hydrate_slot_from_history(slot, history or [])
-    # Publish the (possibly just-created) tab to the dashboard-surface registry
-    # BEFORE anything routes against it. Every gate that asks "does this session
-    # have a tab?" — dashboard_slot_key for sub-agent event routing and
-    # completion injection, widget/question/approval delivery — reads that
-    # registry, and a created-but-unpublished slot silently fails those gates
-    # until some unrelated slot change happens to republish. (Same invariant as
-    # channel_slots.reconcile — see the comment there.)
-    from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
-
-    _sync_dashboard_slots(state)
 
     # Rows this call owes the durable transcript, in the order they happened.
     # Collected rather than written per row: the pair is flushed once, below,

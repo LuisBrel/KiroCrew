@@ -14,6 +14,7 @@ from kiro_crew.dashboard.cron_inject import (
     _UNCHANGED_PROMPT_BODY,
     _parse_prompt_row,
     _prompt_row_body,
+    ensure_cron_slot,
     inject_cron_result_to_dashboard,
     run_marker,
 )
@@ -1257,3 +1258,61 @@ class TestHasSlot:
         state._slots = {}
         state.has_slot = DashboardState.has_slot.__get__(state)
         assert state.has_slot("nonexistent") is False
+
+
+def test_ensure_cron_slot_binds_identity_before_any_result_exists():
+    """A cron's FIRST run had no slot, so it had no caller identity (#8336).
+
+    ``caller_slot_key`` resolves a caller by matching its session key against a live
+    slot's history key, which derives from ``linked_session_key``. The bind therefore
+    has to happen when the slot is created -- before any result exists -- because the
+    gateway calls this before it dispatches the prompt. Previously the only creator
+    was the result-injection path, which runs after the turn, so run 1 was refused
+    ``caller_unidentified`` and run 2 onward succeeded on the slot run 1 left behind.
+    """
+    state = _make_state()
+    job = _make_job(job_id="firstrun1")
+
+    slot = ensure_cron_slot(state, job)
+
+    assert slot.key == "cron-firstrun1"
+    assert slot.linked_session_key == "cron:firstrun1"
+    assert slot.messages == [], "minting a slot must not fabricate transcript rows"
+
+
+def test_ensure_cron_slot_is_idempotent_for_the_injection_path():
+    """Called twice per run -- once before dispatch, once by the injection path --
+    so a second call must return the SAME slot rather than orphan the first."""
+    state = _make_state()
+    job = _make_job(job_id="twice1")
+
+    first = ensure_cron_slot(state, job)
+    second = ensure_cron_slot(state, job)
+
+    assert first is second
+    assert list(state._slots) == ["cron-twice1"]
+
+
+def test_injection_still_hydrates_history_into_a_pre_minted_slot():
+    """The first-run test must be "no messages yet", NOT "no linked session key".
+
+    The gateway now binds ``linked_session_key`` before the turn runs, so a key-based
+    test would read the very first injection as a repeat visit and stop hydrating the
+    job's durable transcript -- after a restart the tab would come back holding only
+    the newest result. This drives the pre-minted ordering the gateway produces.
+    """
+    history = [
+        {"role": "user", "content": "earlier instruction", "cls": "cron-prompt"},
+        {"role": "assistant", "content": "earlier result", "cls": "cron-result"},
+    ]
+    state = _make_state(history_messages=history)
+    job = _make_job(job_id="rehydrate1")
+
+    ensure_cron_slot(state, job)
+    inject_cron_result_to_dashboard(state, job, "fresh result", history=history)
+
+    messages = state._slots["cron-rehydrate1"].messages
+    assert any(
+        "earlier" in (m.get("content") or "") for m in messages
+    ), "history was not hydrated into a slot that already carried its session key"
+    assert any("fresh result" in (m.get("content") or "") for m in messages)
