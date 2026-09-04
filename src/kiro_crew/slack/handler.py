@@ -3117,6 +3117,14 @@ async def handle_message(
         # mapping with it. So the asker becomes the session key outright.
         if asker_key:
             session_key = asker_key
+            # Same reason as the linked-thread reroute below: overrides are keyed
+            # BY SESSION and the hydration at entry ran for the PREVIOUS key, so
+            # without this the agent re-resolution reads a key nobody hydrated and
+            # falls through to the channel or default agent -- discarding a binding
+            # the asker's own metadata records correctly. The pinned path needs it
+            # exactly as much: `asker_key` is a different conversation, which is
+            # the whole reason it is substituted here.
+            _hydrate_thread_overrides(session_key, conversation_log)
     elif thread_owner_key and thread_owner_key != session_key:
         logger.info(
             "🔗 Slack thread %s linked to dashboard session %s — routing there",
@@ -3124,6 +3132,14 @@ async def handle_message(
             thread_owner_key,
         )
         session_key = thread_owner_key
+        # Thread overrides are keyed BY SESSION, and the hydration at entry ran
+        # for the previous key. Re-hydrate for the new owner in the same breath
+        # as the reroute -- otherwise the agent re-resolution below reads a key
+        # that was never hydrated and falls through to the channel or default
+        # agent, discarding a binding the session's own metadata records
+        # correctly. Same shape as transport_dispatch._resolve_thread_owner.
+        # The helper guards repeated I/O per session, so this is cheap.
+        _hydrate_thread_overrides(session_key, conversation_log)
 
     client: LLMProvider | None = None
     try:

@@ -1788,6 +1788,112 @@ class TestPerThreadAgent:
         assert switched
         assert "thread" not in switched[0][1]["text"].lower()
 
+    @pytest.mark.asyncio
+    async def test_reroute_to_a_linked_session_keeps_its_agent(self):
+        """A reroute must carry the new owner's persisted agent, not the default.
+
+        Hydration at entry runs for the ENTRY key. When the thread turns out to
+        be owned by a linked dashboard session, ``session_key`` is reassigned to
+        that owner — and the agent re-resolution immediately after then reads a
+        key that was never hydrated, so a binding the session's own metadata
+        records correctly is silently replaced by the channel or default agent.
+        ``transport_dispatch._resolve_thread_owner`` re-hydrates in the same
+        breath as the reroute; this asserts the inline handler does too.
+        """
+        from unittest.mock import MagicMock
+
+        from kiro_crew.slack.handler import _hydrated_sessions
+
+        owner_key = "dashboard:chat-7-1785861270"
+
+        class LinkedSessions(FakeSessionManager):
+            """The thread index resolves this thread to a dashboard session."""
+
+            def get_session_for_thread(self, thread_ts):
+                return owner_key
+
+        log = MagicMock()
+        log.get_metadata.side_effect = lambda key: (
+            {"agent": "sisyphus"} if key == owner_key else {}
+        )
+
+        slack = MockSlackClient()
+        sessions = LinkedSessions()
+        try:
+            await handle_message(
+                slack,
+                sessions,
+                "C1",
+                "hello",
+                "thread1",
+                "msg1",
+                "U_OWNER",
+                conversation_log=log,
+            )
+
+            assert (
+                owner_key in sessions.keys_seen
+            ), "the turn never rerouted to the session that owns this thread"
+            assert sessions.last_agent == "sisyphus", (
+                f"rerouted turn ran under {sessions.last_agent!r} — the linked "
+                "session's persisted agent binding was discarded"
+            )
+        finally:
+            _hydrated_sessions.discard(owner_key)
+            _hydrated_sessions.discard("slack:thread1")
+            _hydrated_sessions.discard("thread1")
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_reroute_keeps_the_askers_agent(self):
+        """The sibling reassignment, same defect.
+
+        ``route_pinned`` substitutes ``asker_key`` for the entry key on the branch
+        immediately above the linked-thread reroute, and feeds the same agent
+        re-resolution. Hydration at entry ran for the ENTRY key, so without a
+        re-hydration here the pinned answer runs under the channel or default
+        agent instead of the binding the ASKING conversation recorded — and a
+        pinned asker is by construction a different conversation, which is the
+        whole reason its key is substituted.
+        """
+        from unittest.mock import MagicMock
+
+        from kiro_crew.slack.handler import _hydrated_sessions
+
+        asker_key = "cron:9f2c1d40"
+
+        log = MagicMock()
+        log.get_metadata.side_effect = lambda key: (
+            {"agent": "sisyphus"} if key == asker_key else {}
+        )
+
+        slack = MockSlackClient()
+        sessions = FakeSessionManager()
+        try:
+            await handle_message(
+                slack,
+                sessions,
+                "C1",
+                "hello",
+                "thread1",
+                "msg1",
+                "U_OWNER",
+                conversation_log=log,
+                route_pinned=True,
+                asker_key=asker_key,
+            )
+
+            assert (
+                asker_key in sessions.keys_seen
+            ), "the pinned turn never ran under the asking conversation's key"
+            assert sessions.last_agent == "sisyphus", (
+                f"pinned turn ran under {sessions.last_agent!r} — the asking "
+                "conversation's persisted agent binding was discarded"
+            )
+        finally:
+            _hydrated_sessions.discard(asker_key)
+            _hydrated_sessions.discard("slack:thread1")
+            _hydrated_sessions.discard("thread1")
+
 
 class TestStopCommand:
     """Tests for the !stop kill switch."""
