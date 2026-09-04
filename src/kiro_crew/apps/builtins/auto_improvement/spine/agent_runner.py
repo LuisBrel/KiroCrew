@@ -1180,13 +1180,26 @@ class SessionAgentRunner:
     @staticmethod
     def available() -> bool:
         """True iff a Kiro Crew provider factory can be built (a backend is configured).
-        Lets the backend prefer this runner and fall back to the subprocess ``claude -p``
-        runner only when no provider is available."""
+        Lets the backend prefer this runner; there is no subprocess fallback left, so a
+        False here means the backend stays offline."""
         try:
 
             cfg = KiroCrewConfig.load()
             return cfg.create_provider_factory() is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
+            # Do NOT discard this. ``create_provider_factory`` has a single method-level
+            # return and cannot yield None, so False is reachable ONLY from this handler —
+            # i.e. only when something raised. The backend's offline reason already tells
+            # the operator that "the gateway config load or the provider-factory
+            # construction raised", and without this line it can never say WHAT raised.
+            # The realistic cause is the acp → client → session → config.loader circular
+            # import the loader documents, which resolves only when ``acp`` is imported
+            # first, and it was previously invisible in every log.
+            logger.warning(
+                "SessionAgentRunner.available(): provider factory could not be built, "
+                "reporting the agent runner as unavailable",
+                exc_info=True,
+            )
             return False
 
     def ensure_agent_registered(self) -> bool:
