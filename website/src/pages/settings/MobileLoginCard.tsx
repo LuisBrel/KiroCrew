@@ -4,8 +4,9 @@ import { useTranslation } from 'react-i18next'
 import { Copy, Smartphone } from 'lucide-react'
 import { api } from '../../api/client'
 import { Btn, Card, CardTitle, Input } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import { useAppSelector } from '../../store'
-import { parseErrorCode } from '../../utils/errorReport'
+import { findReport, parseErrorCode } from '../../utils/errorReport'
 import { copyToClipboard } from '../../utils/clipboard'
 
 const mobileLinkErrorCode = (error: unknown): string | undefined =>
@@ -132,13 +133,23 @@ export function MobileLoginCard() {
         </div>
       )}
       {createLink.isError && (
-        <p className="mt-3 text-sm text-danger" role="alert">
-          {t(
+        // Hand-off is on: the mint takes no user input, so the only thing this
+        // subtree holds is a read-only generated link that re-minting replaces.
+        // `report` is resolved from the RAW error message, not the copy below:
+        // the journal keys on what `apiFailure` threw, so a lookup by the
+        // translated sentence would miss and the hand-off would carry no
+        // endpoint, status or backend `code`.
+        <ErrorNotice
+          variant="inline"
+          askAgent
+          className="mt-3"
+          report={findReport(createLink.error?.message)}
+          message={t(
             MOBILE_LINK_ERROR_KEYS[
               mobileLinkErrorCode(createLink.error) as keyof typeof MOBILE_LINK_ERROR_KEYS
             ] || 'pages.settings.mobileLoginCard.could_not_create_a_sign_in_link_try_again',
           )}
-        </p>
+        />
       )}
       {copyFailed && (
         <p className="mt-3 text-sm text-danger" role="alert">
