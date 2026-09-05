@@ -442,6 +442,195 @@ class TestFleetProbe:
             assert quiet not in out, quiet
         assert "pid=14" in out  # -n auto is the unbounded case
 
+    def test_a_shell_running_a_command_string_is_not_the_tool_it_names(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash -c 'cd x && pytest -q y.py'`` is a shell, and reporting it as a
+        pytest violation points the conductor at a pid that is not the offender.
+
+        No coverage is lost by dropping the wrapper: the probe walks EVERY entry
+        under /proc, so a wrapped tool that is genuinely running has its own pid
+        and is caught there on its own merits. Every spelling the fleet actually
+        produces is asserted -- a bare program name, an absolute path, a
+        non-bash shell, busybox, and a ``.exe`` suffix -- because the check is a
+        basename comparison and any one of those could fall out of it silently."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("21", b"bash\x00-c\x00cd /x && pytest -q test/y.py\x00"),
+            ("22", b"/bin/bash\x00-c\x00pytest test/y.py\x00"),
+            ("23", b"sh\x00-c\x00vitest run\x00"),
+            ("24", b"/usr/bin/busybox\x00-c\x00pytest\x00"),
+            ("25", b"C:/msys64/usr/bin/bash.exe\x00-c\x00pytest -q\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=21", "pid=22", "pid=23", "pid=24", "pid=25"):
+            assert quiet not in out, quiet
+
+    def test_a_clustered_shell_option_carries_a_command_string_too(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash -lc 'pytest -q'`` is the same misattribution as ``bash -c``.
+
+        A shell takes its flags GROUPED, so an equality test against ``-c`` let the
+        commonest spelling of all straight through -- a login shell -- and the
+        conductor would stop a healthy worker on the strength of it. Every cluster
+        the fleet plausibly produces is asserted, plus ``--noprofile`` ahead of the
+        cluster, because a long option must not end the scan of leading options."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("41", b"bash\x00-lc\x00pytest -q test/y.py\x00"),
+            ("42", b"bash\x00-ic\x00pytest test/y.py\x00"),
+            ("43", b"sh\x00-euxc\x00vitest run\x00"),
+            ("44", b"/bin/bash\x00--noprofile\x00-lc\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=41", "pid=42", "pid=43", "pid=44"):
+            assert quiet not in out, quiet
+
+    def test_a_dash_c_inside_the_carried_command_string_does_not_decide_it(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Only the LEADING option run may suppress, never the shell's payload.
+
+        ``bash /tmp/run.sh -c`` is a shell running a SCRIPT FILE, and the ``-c``
+        belongs to that script, not to bash -- so the arg-shaped rule still applies
+        to it. Scanning the whole cmdline for ``-c`` would quietly exempt it, which
+        is the opposite error to the one the cluster fix repairs."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "51").mkdir(parents=True)
+        (proc / "51" / "cmdline").write_bytes(b"bash\x00/tmp/run.sh\x00-c\x00pytest\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=51" in out
+
+    def test_a_busybox_applet_and_an_option_with_an_operand_still_suppress(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The two spellings a leading-option scan alone gets wrong.
+
+        ``busybox sh -c '...'`` names its APPLET in argv[1], where every other
+        shell would put an option, so a scan that stops at the first non-option
+        entry never reaches the ``-c``. And ``-o`` consumes the next entry as its
+        operand, so ``bash -o pipefail -c '...'`` stopped on ``pipefail``. Both
+        left a healthy worker misattributed to the tool its command string names,
+        which is what makes the conductor stop the wrong pid."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("61", b"busybox\x00sh\x00-c\x00pytest -q test/y.py\x00"),
+            ("62", b"/bin/busybox\x00ash\x00-c\x00vitest run\x00"),
+            ("63", b"bash\x00-o\x00pipefail\x00-c\x00pytest test/y.py\x00"),
+            ("64", b"bash\x00-o\x00pipefail\x00-lc\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=61", "pid=62", "pid=63", "pid=64"):
+            assert quiet not in out, quiet
+
+    def test_a_long_option_with_an_operand_does_not_hide_the_command_string(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash --rcfile /dev/null -c '...'`` is still a wrapper.
+
+        A ``--long`` option is skipped rather than ending the option run, but two
+        of bash's long options take an OPERAND, and skipping only the option left
+        the operand to be read as the command string -- so the scan stopped on the
+        path and never reached the ``-c``. That is the same false ``BANNED``
+        reading the short ``-o pipefail`` case had, and it stops a live session.
+        The ``--opt=value`` spelling is a single entry and must keep working."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("81", b"bash\x00--rcfile\x00/dev/null\x00-c\x00pytest -q test/y.py\x00"),
+            ("82", b"/bin/bash\x00--init-file\x00/tmp/rc\x00-lc\x00vitest run\x00"),
+            ("83", b"bash\x00--rcfile=/dev/null\x00-c\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=81", "pid=82", "pid=83"):
+            assert quiet not in out, quiet
+
+    def test_an_argument_containing_a_space_does_not_forge_an_option(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Why the check reads real argv instead of the joined cmdline.
+
+        A single argv entry may CONTAIN spaces. Joined with spaces it is
+        indistinguishable from several entries, so a command string that happens to
+        start with ``-c`` could pose as the shell's own flag. Here the shell is
+        handed one script-path operand whose text embeds ``-c``, and it must still
+        be judged a non-wrapper: argv keeps them separable, a joined string does
+        not."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "71").mkdir(parents=True)
+        (proc / "71" / "cmdline").write_bytes(b"bash\x00/tmp/a b -c pytest\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=71" in out
+
+    def test_an_unbounded_pytest_run_directly_still_fires(self, tmp_path, capsys, monkeypatch):
+        """Skipping shell wrappers must not quiet the case the rule exists for.
+        A pytest whose worker count nobody chose is reported whether it was
+        spawned as the program itself or through the interpreter."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("31", b"pytest\x00-q\x00test/y.py\x00"),
+            ("32", b"python\x00-m\x00pytest\x00test/y.py\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=31" in out
+        assert "BANNED pid=32" in out
+
+    def test_a_bare_full_suite_vitest_run_still_fires(self, tmp_path, capsys, monkeypatch):
+        """``\\bvitest\\b\\s+run\\s*$`` is a statement about the ARGUMENTS -- what
+        makes the run a full-suite one is the absence of file arguments after
+        ``run``. It stays matched against the whole cmdline, so narrowing the scan
+        to program paths is not an option and the rule keeps working."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "41").mkdir(parents=True)
+        (proc / "41" / "cmdline").write_bytes(b"vitest\x00run\x00")
+        (proc / "42").mkdir(parents=True)
+        (proc / "42" / "cmdline").write_bytes(b"vitest\x00run\x00src/x.test.ts\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=41" in out
+        assert "pid=42" not in out  # a named file is a scoped run
+
     def test_raw_slot_key_matches_surface_prefixed_transcript(self, tmp_path, capsys, monkeypatch):
         """session_create answers slot keys while the store writes
         ``dashboard_<slot>.jsonl``; a raw key must classify, not read GONE --

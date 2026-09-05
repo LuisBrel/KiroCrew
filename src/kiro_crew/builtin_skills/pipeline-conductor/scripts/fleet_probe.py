@@ -752,6 +752,100 @@ def _program_path(cmd: str) -> str:
     return cmd.split(" ", 1)[0] if cmd else ""
 
 
+#: Shells that take the program to run as a command STRING in an argument. A
+#: banned tool named inside that string is text the shell was handed, not the
+#: program this pid is running.
+SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash", "ash", "busybox"})
+
+
+def _basename(program: str) -> str:
+    """Lowercased basename of a program path, minus a ``.exe`` suffix.
+
+    Split on ``/`` explicitly rather than via os.path: the cmdline comes from a
+    Linux /proc even when this script is running somewhere else, so the answer
+    must not depend on the host's separator.
+    """
+    base = program.replace("\\", "/").rpartition("/")[2].lower()
+    return base[:-4] if base.endswith(".exe") else base
+
+
+#: Shell options that consume the NEXT argv entry as their operand. Without this,
+#: the leading-option scan below stops at the operand -- `bash -o pipefail -c ...`
+#: broke on `pipefail`, never reached the `-c`, and the wrapper stayed
+#: misattributed to whatever its command string named. The long forms are here
+#: for the same reason and not with the other `--` options: skipping a `--long`
+#: entry alone leaves its operand behind, so `bash --rcfile /dev/null -c ...`
+#: stopped on the path. The `--opt=value` spelling is one entry and needs no
+#: operand rule.
+_SHELL_OPTS_WITH_OPERAND = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _is_shell_command_wrapper(argv: list[str]) -> bool:
+    """Is *argv* a known shell running a command string rather than the tool it names?
+
+    The banned-operation rules are matched against the whole joined cmdline, which
+    is what makes an arg-shaped rule expressible at all -- ``\\bvitest\\b\\s+run\\s*$``
+    is a statement about the ARGUMENTS, and ``\\bpytest\\b(?!.*-n\\s*\\d)`` reads
+    boundedness out of them. The cost of matching that far is that a wrapper's
+    argument is read as the wrapper's own program: ``bash -c 'cd x && pytest -q'``
+    is reported as an unbounded pytest while the process that exists is a shell.
+
+    Skipping the wrapper removes a misattribution and loses no coverage, because
+    the probe scans EVERY process: a genuinely running wrapped tool has its own
+    pid and is matched there on its own merits. Attributing it to the wrapper as
+    well only makes the conductor stop the wrong pid.
+
+    Takes real ARGV, not a joined string. Once NUL separators become spaces, an
+    argument containing a space is indistinguishable from two arguments, so the
+    option/operand structure this function has to read is no longer recoverable.
+
+    Three spellings of the same flag all have to be recognised, and each one was
+    a live misattribution before it was:
+
+    * alone -- ``bash -c 'pytest'``
+    * grouped into a cluster -- ``bash -lc``, ``bash -ic``, ``sh -euxc``; a login
+      shell is the commonest spelling of all
+    * behind an option that takes an OPERAND -- ``bash -o pipefail -c``, and its
+      long forms ``bash --rcfile /dev/null -c`` and ``bash --init-file f -c``
+
+    BusyBox is a multi-call binary, so ``busybox sh -c '...'`` names its applet in
+    argv[1] where every other shell would put an option. The applet is the
+    effective program and is resolved before the option scan starts.
+    """
+    if not argv:
+        return False
+    base = _basename(argv[0])
+    rest = argv[1:]
+    if base == "busybox" and rest and not rest[0].startswith(("-", "+")):
+        # Multi-call dispatch: `busybox sh -c ...`. The applet decides what this
+        # process IS, so it replaces the program before anything else is judged.
+        base = _basename(rest[0])
+        rest = rest[1:]
+    if base not in SHELL_PROGRAMS:
+        return False
+    # Only the LEADING option run is examined, and the scan stops at the first
+    # entry that is not an option, because that entry is the command string (or a
+    # script path) and everything after it is the shell's payload rather than the
+    # shell's own flags -- `bash -lc 'grep -c foo'` must be decided by the `-lc`,
+    # never by the `-c` inside the string it carries. A ``--long`` option cannot
+    # be a cluster, so it is skipped rather than ending the run.
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if not token.startswith(("-", "+")):
+            break
+        if token in _SHELL_OPTS_WITH_OPERAND:
+            index += 2
+            continue
+        if token.startswith("--"):
+            index += 1
+            continue
+        if "c" in token[1:]:
+            return True
+        index += 1
+    return False
+
+
 def _venv_root(program: str) -> str | None:
     """The virtualenv a program path belongs to, or None if it is not in one.
 
@@ -888,18 +982,33 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
             if not entry.name.isdigit():
                 continue
             try:
-                cmd = (
-                    (entry / "cmdline")
+                # argv is kept as a LIST, not just the space-joined string. The
+                # banned-operation rules are arg-shaped and must still see the
+                # joined form, but deciding whether this pid is a shell wrapper is
+                # a question about ARGUMENTS -- and once the NUL separators are
+                # replaced by spaces, an argument containing a space is
+                # indistinguishable from two arguments, so `-o pipefail -c` cannot
+                # be parsed back out of it.
+                argv = [
+                    arg
+                    for arg in (entry / "cmdline")
                     .read_bytes()
-                    .replace(b"\0", b" ")
                     .decode("utf-8", "replace")
-                    .strip()
-                )
+                    .split("\0")
+                    if arg
+                ]
+                cmd = " ".join(argv).strip()
             except OSError:
                 continue
             if cmd:
                 matched = next((rx.pattern for rx in banned_res if rx.search(cmd)), None)
                 if matched is None:
+                    continue
+                # The rule matched somewhere in the joined cmdline, which for a
+                # shell running a command string is the shell's ARGUMENT and not
+                # the program this pid is running. See ``_is_shell_command_wrapper``
+                # for why dropping the wrapper costs no coverage.
+                if _is_shell_command_wrapper(argv):
                     continue
                 # A banned SHAPE is only a banned OPERATION when the fleet owns
                 # it. The same unbounded pytest run in an unrelated checkout is
