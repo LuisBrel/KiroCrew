@@ -28,6 +28,29 @@ def _wait_for(path, timeout=5.0):
     return False
 
 
+def _wait_for_pid(path, timeout=5.0):
+    """Wait for ``path`` to exist AND hold a parseable pid.
+
+    ``write_text`` opens (creating/truncating to zero bytes) then writes in a
+    separate syscall, so a bare existence check can observe the file between
+    those two steps and hand back an empty read to ``int()``. Callers that
+    parse the pid immediately after waiting use this instead of
+    ``_wait_for``, which only checks existence.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            content = path.read_text().strip()
+            if content:
+                try:
+                    int(content)
+                    return True
+                except ValueError:
+                    pass
+        time.sleep(0.02)
+    return False
+
+
 def test_terminate_reaps_the_whole_group_including_a_grandchild(tmp_path):
     # A launcher plus a forked grandchild -- the two-process shape a real
     # kiro-cli worker has. Draining must take out both.
@@ -44,7 +67,7 @@ def test_terminate_reaps_the_whole_group_including_a_grandchild(tmp_path):
             ttl=30,
         ),
     )
-    assert _wait_for(parent_pidfile) and _wait_for(child_pidfile)
+    assert _wait_for(parent_pidfile) and _wait_for_pid(child_pidfile)
     child_pid = int(child_pidfile.read_text())
 
     pg.terminate(drain_timeout=5.0)
@@ -125,7 +148,7 @@ def test_drain_reaps_a_worker_that_escaped_into_its_own_session(tmp_path):
             ttl=30,
         ),
     )
-    assert _wait_for(ppf) and _wait_for(cpf)
+    assert _wait_for(ppf) and _wait_for_pid(cpf)
     worker = int(cpf.read_text())
     # The worker really is in a different process group than the backend.
     assert os.getpgid(worker) != pg.pgid
@@ -158,7 +181,7 @@ def test_group_kill_alone_cannot_reach_an_escaped_worker(tmp_path):
             ttl=6,
         ),
     )
-    assert _wait_for(ppf) and _wait_for(cpf)
+    assert _wait_for(ppf) and _wait_for_pid(cpf)
     worker = int(cpf.read_text())
     try:
         pg.terminate(drain_timeout=0.5)  # SIGTERM ignored -> SIGKILL the backend group
@@ -205,7 +228,7 @@ def _crashed_leader_with_a_live_worker(tmp_path):
         ),
         cwd=str(tmp_path),
     )
-    assert _wait_for(child_pidfile), "the fake worker never recorded its pid"
+    assert _wait_for_pid(child_pidfile), "the fake worker never recorded its pid"
     worker_pid = int(child_pidfile.read_text())
 
     deadline = time.monotonic() + 5.0
