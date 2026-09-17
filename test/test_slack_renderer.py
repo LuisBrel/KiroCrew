@@ -782,6 +782,56 @@ class TestStreamMachinery:
         streamed = [kw["text"] for m, kw in rec.calls if m == "append_stream"]
         assert streamed == ["A ", "B "], streamed
 
+    def test_flush_on_edit_interval_does_not_tear_a_word_in_half(self):
+        """A model fragment boundary landing mid-word must not split it.
+
+        The throttled flush sends what is in ``_stream_buffer`` when the
+        edit-interval timer fires, and that timer knows nothing about where a
+        word ends. Two model fragments ("...ch" then "ạy...", the split shape
+        seen on a Vietnamese reply) land far enough apart to each cross the 1s
+        throttle, so each is a flush of its own; without a boundary check Slack
+        renders the word torn across two appended, unfixable segments.
+        """
+        rec = _RecSlack()
+        # turn_start, chunk 1 (@1000, flushes), chunk 2 (@1002, past interval,
+        # flushes), on_done (@1003).
+        clock = _FakeClock([1000.0, 1000.0, 1002.0, 1003.0])
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, now=clock)
+        provider = _Provider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="Đang chạ"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="y trên máy.\n"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
+        streamed = [kw["text"] for m, kw in rec.calls if m == "append_stream"]
+        # The first flush holds "chạ" back rather than sending it torn; it is
+        # only released once "y" arrives and completes the word.
+        assert streamed == ["Đang ", "chạy trên máy.\n"], streamed
+        assert "".join(streamed) == "Đang chạy trên máy.\n"
+
+    def test_held_word_is_released_at_on_done_even_with_no_trailing_space(self):
+        """A turn that ends mid-word must still deliver the whole word.
+
+        The held tail exists only until the true end of the turn -- ``on_done``
+        flushes unconditionally so a turn that happens to stop right after a
+        throttled cut never leaves a fragment permanently stuck in the
+        renderer's buffer.
+        """
+        rec = _RecSlack()
+        clock = _FakeClock([1000.0, 1000.0, 1002.0])
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, now=clock)
+        provider = _Provider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="partial"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
+        streamed = [kw["text"] for m, kw in rec.calls if m == "append_stream"]
+        assert "".join(streamed) == "partial", streamed
+
     def test_append_failure_triggers_one_rotation(self):
         rec = _FlakyAppendSlack()
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)
