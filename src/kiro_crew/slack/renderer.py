@@ -123,6 +123,23 @@ PARTIAL_TURN_MARKER = (
 )
 
 
+def _split_trailing_word(text: str) -> tuple[str, str]:
+    """Split off a trailing run of non-whitespace so a caller can hold it back.
+
+    Returns ``(ready, held)``: ``ready`` ends on whitespace (or is empty),
+    ``held`` is the trailing word-in-progress to prepend to the next chunk.
+    Text that is entirely one unbroken run (no whitespace at all) is held
+    whole rather than sent partially -- a throttled flush is free to wait one
+    more tick for a token that has not finished yet.
+    """
+    if not text or text[-1].isspace():
+        return text, ""
+    for i in range(len(text) - 1, -1, -1):
+        if text[i].isspace():
+            return text[: i + 1], text[i + 1 :]
+    return "", text
+
+
 def _redact_all(text: str) -> str:
     """Both outbound redactors as one callable, in the canonical order."""
     text, _ = redact_exfiltration_urls(text)
@@ -370,6 +387,12 @@ class SlackRenderer(Renderer):
         # (see ``_filter_options_brackets`` / ``_resolve_comment_hold``).
         self._bracket_hold = ""
         self._stream_buffer = ""  # unsent text buffered between throttled flushes
+        # Trailing run of non-whitespace held back by a non-final flush so a
+        # throttled cut never lands mid-word (see ``_flush_stream_buffer``).
+        # Slack's stream append is final -- there is no un-appending a torn
+        # word half -- so the tail is kept here and re-prepended on the next
+        # flush instead of being sent early.
+        self._word_hold = ""
         self._last_edit = 0.0  # monotonic ts of the last stream edit (throttle)
         self._task_counter = 0
         self._active_task_id = ""
@@ -535,12 +558,30 @@ class SlackRenderer(Renderer):
             self._delivered += text
         return ok
 
-    async def _flush_stream_buffer(self) -> None:
-        """Strip thinking tags and flush the buffered stream text (if any)."""
-        if not self._stream_buffer:
+    async def _flush_stream_buffer(self, *, final: bool = False) -> None:
+        """Strip thinking tags and flush the buffered stream text (if any).
+
+        A non-final flush (the throttled ``on_text_chunk``/``on_tool_call``
+        paths) holds back a trailing run of non-whitespace: the timer that
+        drives this method fires on a wall-clock interval with no regard for
+        where the model happened to cut its last fragment, so without a
+        holdback a word (or, for multibyte scripts, a character split across
+        two model fragments) can be torn in half across two Slack appends --
+        appends are final on Slack's side, so a torn half can never be
+        stitched back together after the fact. ``final=True`` (``on_done``)
+        always flushes everything: the turn is ending and nothing later will
+        pick up a held tail.
+        """
+        if not self._stream_buffer and not (final and self._word_hold):
             return
         flush, _ = strip_thinking_tags(self._stream_buffer, strip_whitespace=False)
         self._stream_buffer = ""
+        flush = self._word_hold + flush
+        self._word_hold = ""
+        if not final:
+            flush, self._word_hold = _split_trailing_word(flush)
+            if not flush:
+                return
         if self._uploads_enabled():
             flush = await self._withhold_refs(flush)
             if not flush:
@@ -1061,6 +1102,13 @@ class SlackRenderer(Renderer):
             if self._ref_hold:
                 await self._append_stream(self._ref_hold)
                 self._ref_hold = ""
+            if self._word_hold:
+                # The earlier throttled on_tool_call flush above may have held
+                # a trailing word back; this stream is being abandoned rather
+                # than continued, so there is no later flush to release it --
+                # send it now or lose it.
+                await self._append_stream(self._word_hold)
+                self._word_hold = ""
             # A held comment is this message's tail: settle it against the
             # source before that is discarded, and append it when it is content.
             self._bracket_hold, released = _resolve_comment_hold(
@@ -1147,8 +1195,11 @@ class SlackRenderer(Renderer):
         self._bracket_hold, released = _resolve_comment_hold(self._bracket_hold, self._accumulated)
         self._stream_buffer += released
         # Flush any buffered (throttled) stream text before finalizing.
+        # final=True: this is the end of the turn, so any word held back by an
+        # earlier throttled flush must go out now rather than wait for a flush
+        # that will never come.
         if self._use_slack_stream:
-            await self._flush_stream_buffer()
+            await self._flush_stream_buffer(final=True)
         clean_text, options = extract_options(self._accumulated)
         # Trailing control-tag lines (``<!-- keep-visible -->`` and siblings)
         # are protocol: the stream's comment hold kept them off the appended
