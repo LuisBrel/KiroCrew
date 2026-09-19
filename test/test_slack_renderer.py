@@ -832,6 +832,50 @@ class TestStreamMachinery:
         streamed = [kw["text"] for m, kw in rec.calls if m == "append_stream"]
         assert "".join(streamed) == "partial", streamed
 
+    def test_a_script_written_without_spaces_still_streams_progressively(self):
+        """Whitespace is the only boundary here, so a script with none is sent.
+
+        Chinese, Japanese and Thai supply no whitespace for whole paragraphs. A
+        holdback that waited for one would re-hold the entire buffer on every
+        tick, so the reader would see nothing between newlines and the throttled
+        cadence the stream path exists for would be lost for exactly the
+        multibyte-script users a word-boundary guard is meant to help. Both
+        fragments below cross the throttle, so both must appear on their own.
+        """
+        rec = _RecSlack()
+        clock = _FakeClock([1000.0, 1000.0, 1002.0, 1003.0])
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, now=clock)
+        provider = _Provider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="正在机器上运行"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="第二段文字。\n"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
+        streamed = [kw["text"] for m, kw in rec.calls if m == "append_stream"]
+        assert streamed == ["正在机器上运行", "第二段文字。\n"], streamed
+
+    def test_an_over_long_run_is_sent_rather_than_held(self):
+        """The hold is bounded, so one unbroken run cannot stall the stream.
+
+        A run far longer than any word is not a token mid-flight; it is content
+        this rule cannot read -- a base64 blob, a minified line, a space-free
+        script after one leading space. Holding it would defer real output
+        waiting for a boundary that may never arrive, so it goes out as written.
+        Asserted on the boundary helper rather than through a turn because the
+        ref-hold can defer a long unbroken run for its own, unrelated reason,
+        which would make a stream-level assertion pass without this rule.
+        """
+        from kiro_crew.slack.renderer import _WORD_HOLD_MAX, _split_trailing_word
+
+        short = "y" * _WORD_HOLD_MAX
+        assert _split_trailing_word(f"pin {short}") == ("pin ", short)
+        over = "y" * (_WORD_HOLD_MAX + 1)
+        assert _split_trailing_word(f"pin {over}") == (f"pin {over}", "")
+        # No whitespace at all: nothing to hold against, so send as written.
+        assert _split_trailing_word("正在机器上运行") == ("正在机器上运行", "")
+
     def test_append_failure_triggers_one_rotation(self):
         rec = _FlakyAppendSlack()
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)

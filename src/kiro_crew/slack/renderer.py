@@ -123,21 +123,39 @@ PARTIAL_TURN_MARKER = (
 )
 
 
+#: Longest trailing run ``_split_trailing_word`` will hold back. Whitespace is
+#: the only word boundary available here, so the bound is what keeps the rule
+#: honest for scripts that never supply one -- see that function.
+_WORD_HOLD_MAX = 32
+
+
 def _split_trailing_word(text: str) -> tuple[str, str]:
     """Split off a trailing run of non-whitespace so a caller can hold it back.
 
     Returns ``(ready, held)``: ``ready`` ends on whitespace (or is empty),
     ``held`` is the trailing word-in-progress to prepend to the next chunk.
-    Text that is entirely one unbroken run (no whitespace at all) is held
-    whole rather than sent partially -- a throttled flush is free to wait one
-    more tick for a token that has not finished yet.
+
+    The holdback is BOUNDED, and both bounds exist for the same reason: a
+    "word" here is only "text since the last whitespace", which is not a word
+    at all in a script written without spaces. Chinese, Japanese and Thai
+    supply no boundary for whole paragraphs, so holding until one arrives would
+    re-hold the entire buffer on every tick and degrade those replies to
+    newline-granularity lumps -- losing exactly the throttled cadence the
+    stream path exists to provide. So a run with no whitespace before it, or
+    one longer than ``_WORD_HOLD_MAX``, is sent as written (the pre-holdback
+    behaviour). The reported defect (#11437) is Vietnamese, space-delimited,
+    and is fixed by the split-at-last-whitespace path alone; the bound caps the
+    cost of this guard at one short word for everyone else.
     """
     if not text or text[-1].isspace():
         return text, ""
     for i in range(len(text) - 1, -1, -1):
         if text[i].isspace():
-            return text[: i + 1], text[i + 1 :]
-    return "", text
+            held = text[i + 1 :]
+            # An over-long run is not a word mid-flight; it is a script this
+            # rule cannot read. Tearing it is the lesser harm against stalling.
+            return (text, "") if len(held) > _WORD_HOLD_MAX else (text[: i + 1], held)
+    return text, ""
 
 
 def _redact_all(text: str) -> str:
@@ -899,6 +917,32 @@ class SlackRenderer(Renderer):
             except Exception:
                 pass  # non-critical teardown; never raise from close()
         self._finalized = True
+
+    async def release_held_word(self) -> None:
+        """Send a word held back by a throttled flush when no flush will follow.
+
+        A held tail has exactly three exits, and the third is this one.
+        ``on_done`` releases it itself (``final=True``), and the ``wait``
+        boundary releases it before abandoning its stream -- but a turn that
+        DIES mid-stream reaches neither, and the tail would simply be dropped.
+        That loss is not confined to the screen: the dispatcher's
+        partial-progress rescue persists ``delivered_text``, so a dropped tail
+        is missing from the durable transcript the retry resumes from, which is
+        the opposite of what that rescue exists to do. Call this BEFORE reading
+        that ledger.
+
+        Best-effort and idempotent, like ``close()``: it runs on an exception
+        path, so it must not replace the real error with a bookkeeping one. With
+        no live stream to append to there is nothing that could show the tail,
+        and the ledger is right to stay silent about it.
+        """
+        held, self._word_hold = self._word_hold, ""
+        if not (held and self._use_slack_stream and self._stream_ts):
+            return
+        try:
+            await self._append_stream(held)
+        except Exception:
+            logger.warning("Slack: releasing a held word failed", exc_info=True)
 
     @property
     def delivered_text(self) -> str:
