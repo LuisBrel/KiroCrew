@@ -111,9 +111,14 @@ SKIP_DOWNLOAD_ENV = "KIROCREW_SKIP_MODEL_DOWNLOAD"
 #: saying "that private address is mine", which a configured URL cannot say for
 #: itself. :data:`MODEL_URL_ENV` is the same escape hatch for the catalog path.
 #:
-#: Relaxes ONLY the configured first hop. A redirect is an address the far end chose,
-#: so it stays screened however this is set -- there is no operator statement about a
-#: `Location` nobody has seen yet.
+#: Relaxes the configured ORIGIN, not only its first request. A hop that stays on
+#: that same origin -- same scheme, host and port -- keeps the exemption, because an
+#: artifact store answering `302` to its own blob path is the ordinary mirror shape
+#: and refusing it would reject the very install this hatch exists for. The operator
+#: named that origin, so a `Location` still on it is covered by what they said. The
+#: moment a hop leaves it the screen applies again, and it is sticky: no later hop in
+#: the chain can claim the exemption back, so nothing beyond the named origin is ever
+#: reached on the strength of this variable.
 CUSTOM_MODEL_ALLOW_PRIVATE_ENV = "KIROCREW_STT_CUSTOM_MODEL_ALLOW_PRIVATE"
 
 #: Read size while streaming a download. Large enough that the digest update and
@@ -392,10 +397,26 @@ def valid_custom_sha256(value: object) -> str:
     than after a multi-hundred-megabyte transfer: a digest that is not 64 hex
     characters cannot match anything, so accepting it would guarantee the
     download is thrown away.
+
+    Two carrier shapes are unwrapped first, because they are what a user
+    actually has in the clipboard and neither is ambiguous: a ``sha256:``
+    prefix, as published beside an artifact, and ``sha256sum``'s own
+    ``<hex>  <file>`` line. Unwrapping is not widening -- the result still has
+    to be exactly 64 hex characters -- and the alternative is worse than
+    strict: the field is cleared from the server's response on save, so a
+    near-valid paste vanished with the only feedback being that both fields
+    were needed, which reads as the app losing input.
     """
     if not isinstance(value, str):
         return ""
     digest = value.strip().lower()
+    # `sha256sum` / `shasum` print the digest, two spaces, then the file name.
+    # Take the first field; a name of its own could never be 64 hex.
+    digest = digest.split(maxsplit=1)[0] if digest.split(maxsplit=1) else ""
+    for prefix in ("sha256:", "sha-256:", "sha256="):
+        if digest.startswith(prefix):
+            digest = digest[len(prefix) :]
+            break
     if len(digest) != _SHA256_HEX_LEN:
         return ""
     return digest if all(c in "0123456789abcdef" for c in digest) else ""
