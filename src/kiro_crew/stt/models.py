@@ -368,10 +368,26 @@ def valid_custom_sha256(value: object) -> str:
     than after a multi-hundred-megabyte transfer: a digest that is not 64 hex
     characters cannot match anything, so accepting it would guarantee the
     download is thrown away.
+
+    Two carrier shapes are unwrapped first, because they are what a user
+    actually has in the clipboard and neither is ambiguous: a ``sha256:``
+    prefix, as published beside an artifact, and ``sha256sum``'s own
+    ``<hex>  <file>`` line. Unwrapping is not widening -- the result still has
+    to be exactly 64 hex characters -- and the alternative is worse than
+    strict: the field is cleared from the server's response on save, so a
+    near-valid paste vanished with the only feedback being that both fields
+    were needed, which reads as the app losing input.
     """
     if not isinstance(value, str):
         return ""
     digest = value.strip().lower()
+    # `sha256sum` / `shasum` print the digest, two spaces, then the file name.
+    # Take the first field; a name of its own could never be 64 hex.
+    digest = digest.split(maxsplit=1)[0] if digest.split(maxsplit=1) else ""
+    for prefix in ("sha256:", "sha-256:", "sha256="):
+        if digest.startswith(prefix):
+            digest = digest[len(prefix) :]
+            break
     if len(digest) != _SHA256_HEX_LEN:
         return ""
     return digest if all(c in "0123456789abcdef" for c in digest) else ""

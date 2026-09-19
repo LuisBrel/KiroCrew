@@ -677,10 +677,22 @@ def test_a_presigned_url_cannot_be_persisted_into_agent_readable_config():
         (_DIGEST, _DIGEST),
         (_DIGEST.upper(), _DIGEST),
         (f" {_DIGEST}\n", _DIGEST),
+        # The two shapes a user actually has in the clipboard. Rejecting these
+        # cleared the field on save with no error naming the reason, so a paste
+        # that was one prefix away from correct read as lost input.
+        (f"sha256:{_DIGEST}", _DIGEST),
+        (f"SHA-256:{_DIGEST}", _DIGEST),
+        (f"sha256={_DIGEST}", _DIGEST),
+        (f"{_DIGEST}  ggml-model.bin", _DIGEST),
+        # Unwrapping is not widening: the payload still has to be 64 hex.
+        (f"sha256:{_DIGEST[:-1]}", ""),
+        ("sha256:", ""),
+        (f"ggml-model.bin  {_DIGEST}", ""),
         (_DIGEST[:-1], ""),
         (_DIGEST + "a", ""),
         (_DIGEST[:-1] + "g", ""),
         ("", ""),
+        ("   ", ""),
         (None, ""),
         (0, ""),
     ],
