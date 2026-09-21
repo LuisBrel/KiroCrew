@@ -5112,6 +5112,13 @@ class CronService:
                     if job.last_retry_run_ts == job.last_run_ts:
                         job.last_retry_run_ts = started_at
                     job.last_run_ts = started_at
+                elif job.last_status is None:
+                    # An interrupted non-"every" run never reaches _execute's own
+                    # `job.last_run_ts = time.time()` (CancelledError from stop()
+                    # skips past it). Stamp it here so the registry reflects this
+                    # run rather than the one before it. No retry-pairing to
+                    # preserve: an interrupted run has no retry count to report.
+                    job.last_run_ts = finished_at
                 # One clear per result-less run. Scattering it over exit sites is
                 # what let the fire-time deny and script Skip paths keep a result.
                 if (job.command or job.script) and not being_cancelled:
@@ -5135,7 +5142,20 @@ class CronService:
                     logger.exception("Failed to merge result for job '%s'", job.name)
                 # Record history
                 try:
-                    status = "success" if job.last_status == "ok" else "failure"
+                    # A run that reaches here with last_status still None never
+                    # set "ok" (the success arm) or "error" (the except arm):
+                    # it was cancelled out from under _execute by a path that
+                    # doesn't populate self._cancelled_jobs (stop() cancels
+                    # self._running_tasks directly, so "not cancelled" above is
+                    # True for a gateway-stop teardown same as it is for an
+                    # ordinary run). Such a run reported neither a result nor a
+                    # cause, so it gets its own status rather than either arm.
+                    if job.last_status == "ok":
+                        status = "success"
+                    elif job.last_status == "error":
+                        status = "failure"
+                    else:
+                        status = "interrupted"
                     # Attribute last_result to this run only if the run
                     # actually produced it (set_run_result sets the marker).
                     # Reading it unconditionally recorded the PREVIOUS run's
@@ -5323,9 +5343,18 @@ class CronService:
     async def _execute(self, job: CronJob) -> None:
         """Run the job callback and update runtime fields (last_run_ts, last_status)."""
         logger.info("Cron: executing '%s' (%s)", job.name, job.id)
-        # Reset status for this run so a prior run's "error" can't leak into an
-        # "ok" decision below. Same for the fire-time denial marker.
+        # Reset per-run state before dispatch so neither field can carry a
+        # prior run's value into this run's outcome. last_status guards the
+        # "ok" decision below. last_error matters even for a run whose
+        # callback returns without setting last_status at all (torn down
+        # mid-run, a cancelled branch returning None): such a run reaches
+        # neither the "ok" nor the "except" arm below, so an unreset
+        # last_error would be quoted by the history recorder's fallback as
+        # THIS run's cause, and the failure-alert dedup hash -- derived from
+        # that same text -- would treat a new incident as a repeat of the
+        # old one.
         job.last_status = None
+        job.last_error = None
         job.fire_time_denied = False
         job.run_never_started = False
         # Transient retries the callback took this run. The gateway callback only
