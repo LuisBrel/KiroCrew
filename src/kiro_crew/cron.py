@@ -5008,8 +5008,9 @@ class CronService:
         # Apply jitter to spread execution unless strict_schedule is set or manual
         jitter = self._compute_jitter(job) if trigger != "manual" else 0
         self._job_jitter[job.id] = jitter
-        # Provisional; refined once the jitter sleep completes. Only read on
-        # the history path, which a cancelled-during-jitter run never reaches.
+        # Provisional; refined once the jitter sleep completes. A run cancelled
+        # during jitter still reaches the history path, and its duration is then
+        # measured from this stamp -- the only interval such a run ever had.
         exec_started_at = started_at
         # ``last_result`` is a cross-run context-carry field for AGENT jobs
         # (see build_cron_session_context): result-less runs leave the
@@ -5024,6 +5025,22 @@ class CronService:
         # strings, so a run re-producing the previous text looks identical to
         # one that produced nothing.)
         job.result_produced = False
+        # Per-run outcome state, reset HERE rather than in _execute: the jitter
+        # sleep below runs for up to 59 min, and a CancelledError there ends the
+        # run without _execute ever being entered. Reset inside _execute, such a
+        # run would reach the history recorder in the finally still holding the
+        # PREVIOUS run's values -- recorded as that run's own "success", quoting
+        # the earlier run's error text. last_status guards the success/failure
+        # decision; last_error is quoted as the row's summary and cause, and the
+        # failure-alert dedup hash is derived from that same text, so a stale one
+        # also makes a new incident read as a repeat of the old. fire_time_denied
+        # and run_never_started move with them: the callback that sets all four
+        # (slack/gateway.py) only ever runs on the far side of this sleep, so one
+        # reset site before it is enough and two cannot disagree.
+        job.last_status = None
+        job.last_error = None
+        job.fire_time_denied = False
+        job.run_never_started = False
         being_cancelled = False
         marker_write: "asyncio.Future[None] | None" = None
         try:
@@ -5144,8 +5161,9 @@ class CronService:
                 try:
                     # A run that reaches here with last_status still None never
                     # set "ok" (the success arm) or "error" (the except arm):
-                    # it was cancelled out from under _execute by a path that
-                    # doesn't populate self._cancelled_jobs (stop() cancels
+                    # it was cancelled out from under _execute, or before
+                    # _execute was entered at all, by a path that doesn't
+                    # populate self._cancelled_jobs (stop() cancels
                     # self._running_tasks directly, so "not cancelled" above is
                     # True for a gateway-stop teardown same as it is for an
                     # ordinary run). Such a run reported neither a result nor a
@@ -5343,20 +5361,6 @@ class CronService:
     async def _execute(self, job: CronJob) -> None:
         """Run the job callback and update runtime fields (last_run_ts, last_status)."""
         logger.info("Cron: executing '%s' (%s)", job.name, job.id)
-        # Reset per-run state before dispatch so neither field can carry a
-        # prior run's value into this run's outcome. last_status guards the
-        # "ok" decision below. last_error matters even for a run whose
-        # callback returns without setting last_status at all (torn down
-        # mid-run, a cancelled branch returning None): such a run reaches
-        # neither the "ok" nor the "except" arm below, so an unreset
-        # last_error would be quoted by the history recorder's fallback as
-        # THIS run's cause, and the failure-alert dedup hash -- derived from
-        # that same text -- would treat a new incident as a repeat of the
-        # old one.
-        job.last_status = None
-        job.last_error = None
-        job.fire_time_denied = False
-        job.run_never_started = False
         # Transient retries the callback took this run. The gateway callback only
         # INCREMENTS `_transient_attempts` (a runtime attribute on the live job);
         # this method is the one owner of reading it, clearing it and persisting
