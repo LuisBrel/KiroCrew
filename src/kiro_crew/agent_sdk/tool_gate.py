@@ -98,6 +98,16 @@ logger = logging.getLogger(__name__)
 #: own change; tracked at
 #: docs/system-specs/modules/harness-onboarding.md#worked-example-the-deepseek-harness,
 #: which records the run that surfaced it.
+#:
+#: :data:`Routing.OWNED_ADAPTER` is deliberately ABSENT. On the refusal question there
+#: is nothing to refuse: the guarantee is a line in an adapter Crew ships, not a
+#: setting an operator can leave permissive, so no probe exists whose verdict could
+#: come back non-ROUTED. On the mask question it stands where the other unenforced
+#: backends (``AGENT_SPEC``, ``SEEDED_SETTINGS``) stand: its children get no OS
+#: credential mask, and every tool call they run is a ``session/request_permission``
+#: round trip first. Adding it here would answer the mask question by side effect of
+#: the refusal question, which is the conflation the note above records; when the two
+#: are split, the owned adapter belongs on the mask side.
 ENFORCED_ROUTINGS: frozenset = frozenset(
     {
         Routing.SESSION_CONFIG,

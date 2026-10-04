@@ -1,0 +1,134 @@
+[
+  {
+    "agent_capabilities": {
+      "loadSession": false,
+      "mcpCapabilities": {
+        "acp": false,
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "embeddedContext": false,
+        "image": false
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "delete": {},
+        "list": {}
+      }
+    },
+    "agent_version": "0.2.0",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "frame": "response",
+    "id": 2,
+    "session_id": "lmstudio-session-1"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "usage_update",
+    "usage": [
+      440,
+      262144
+    ],
+    "usage_cost": null
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "path": "~/crew-probe/notes.txt"
+        },
+        "title": "read_file: {\"path\":\"notes.txt\"}",
+        "tool_call_id": "call_0",
+        "tool_input": "{\n  \"path\": \"~/crew-probe/notes.txt\"\n}",
+        "tool_kind": "read",
+        "wire_title": "read_file: {\"path\":\"notes.txt\"}"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "allow_always",
+            "label": "Always allow"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "path": "~/crew-probe/notes.txt"
+        },
+        "request_id": "kirocrew-permission-1",
+        "shell_classified": true,
+        "title": "read_file: {\"path\":\"notes.txt\"}",
+        "tool_call_id": "call_0",
+        "tool_input": "{\n  \"path\": \"~/crew-probe/notes.txt\"\n}",
+        "tool_kind": "read"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_always",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_0",
+        "tool_final": true,
+        "tool_output": "Read me through the adapter's built-in read_file tool.\n",
+        "tool_output_bytes": 55,
+        "tool_output_digest": "20f51850b398f4fa1f708f62fec4c3b81eef0a57864f6f8ced82c92c58674577",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Read notes.txt and echoed it through the probe server."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Read notes.txt and echoed it through the probe server.",
+      "thinking": false
+    }
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "stop_reason": "end_turn"
+  }
+]

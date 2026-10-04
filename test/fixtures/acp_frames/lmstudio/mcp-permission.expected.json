@@ -1,0 +1,79 @@
+[
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "server": "crew-probe",
+          "text": "corpus probe",
+          "tool": "crew_probe_echo"
+        },
+        "title": "crew_probe_echo: {\"text\":\"corpus probe\"}",
+        "tool_call_id": "call_1",
+        "tool_input": "{\n  \"text\": \"corpus probe\",\n  \"server\": \"crew-probe\",\n  \"tool\": \"crew_probe_echo\"\n}",
+        "tool_kind": "other",
+        "wire_title": "crew_probe_echo: {\"text\":\"corpus probe\"}"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "allow_always",
+            "label": "Always allow"
+          },
+          {
+            "id": "reject_once",
+            "label": "Reject"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "server": "crew-probe",
+          "text": "corpus probe",
+          "tool": "crew_probe_echo"
+        },
+        "request_id": "kirocrew-permission-2",
+        "shell_classified": true,
+        "title": "crew_probe_echo: {\"text\":\"corpus probe\"}",
+        "tool_call_id": "call_1",
+        "tool_input": "{\n  \"text\": \"corpus probe\",\n  \"server\": \"crew-probe\",\n  \"tool\": \"crew_probe_echo\"\n}",
+        "tool_kind": "other"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "allow_always",
+      "once": "allow_once",
+      "reject": "reject_once"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_1",
+        "tool_final": true,
+        "tool_output": "echo: corpus probe",
+        "tool_output_bytes": 18,
+        "tool_output_digest": "99d00e1362a2604eeca962b74739169e8314717d812f6e0344143b9f61c34108",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  }
+]

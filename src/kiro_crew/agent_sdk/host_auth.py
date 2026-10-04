@@ -68,6 +68,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_LMSTUDIO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
@@ -100,7 +101,17 @@ ENTITLEMENT_OWN_CREDENTIAL_FILE = "own_credential_file"
 #: declared source and not a flag any driver may set.
 ENTITLEMENT_HOST_VAULT = "host_vault"
 
-# Three sources, because three are constructed. A harness whose entitlement arrives
+#: Entitled by nothing: the backend serves a model the operator runs locally and
+#: has no account, no sign-in and no entitlement to query.
+#:
+#: Constructed for Kiro Crew's own LM Studio adapter. A local LM Studio server
+#: needs no key unless its operator turned the server's API-key check on; the
+#: adapter then reads ``LM_STUDIO_API_KEY`` from its inherited environment, and
+#: strips that name from every child it spawns. Crew's vault does not feed it,
+#: which is why this is not :data:`ENTITLEMENT_HOST_VAULT`.
+ENTITLEMENT_NONE = "none"
+
+# Four sources, because four are constructed. A harness whose entitlement arrives
 # from the ambient cloud environment (an AWS profile, an instance role) rather than
 # from a file it owns or from Crew's vault would add a fourth here, with its label,
 # when it exists.
@@ -116,6 +127,7 @@ ENTITLEMENT_LABELS: Dict[str, str] = {
     ENTITLEMENT_HOST_IDENTITY_STORE: "kiro-cli's own sign-in",
     ENTITLEMENT_OWN_CREDENTIAL_FILE: "the harness's own credential file",
     ENTITLEMENT_HOST_VAULT: "a key in Kiro Crew's secret vault",
+    ENTITLEMENT_NONE: "nothing -- a local server with no sign-in",
 }
 
 ENTITLEMENT_SOURCES: FrozenSet[str] = frozenset(
@@ -123,6 +135,7 @@ ENTITLEMENT_SOURCES: FrozenSet[str] = frozenset(
         ENTITLEMENT_HOST_IDENTITY_STORE,
         ENTITLEMENT_OWN_CREDENTIAL_FILE,
         ENTITLEMENT_HOST_VAULT,
+        ENTITLEMENT_NONE,
     }
 )
 
@@ -739,6 +752,32 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # "deepseek-official"; store DEEPSEEK_API_KEY ...``.
         signed_out_signature="no API key for provider route",
     ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_LMSTUDIO,
+        # None of its own. The adapter talks to a LOCAL LM Studio server that needs
+        # no credential by default, so no credential FILE on this host is read.
+        credential_leaves=(),
+        home_override_env_vars=(),
+        adapter_own_leaves=(),
+        # States the ACTION only, and asserts no state, because for this adapter
+        # there may be no sign-in to assert: an LM Studio server with its API-key
+        # check disabled needs none.
+        sign_in_remedy=(
+            "Start LM Studio's local server. It needs no key unless its API-key "
+            "check is on; in that case start Kiro Crew with LM_STUDIO_API_KEY set "
+            "in its environment."
+        ),
+        signed_out_message=(
+            "LM Studio's local server rejected the request. If its API-key check is "
+            "on, start Kiro Crew with LM_STUDIO_API_KEY set in its environment, then "
+            "start a new chat."
+        ),
+        # Excluded deliberately: there is no host sign-in and the server is local, so a
+        # ``kiro-cli logout`` says nothing about whether a running session can still
+        # reach its LM Studio server.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_NONE,
+    ),
 )
 
 
@@ -934,6 +973,7 @@ __all__ = [
     "AgentInteractiveLogin",
     "ENTITLEMENT_HOST_IDENTITY_STORE",
     "ENTITLEMENT_HOST_VAULT",
+    "ENTITLEMENT_NONE",
     "ENTITLEMENT_LABELS",
     "ENTITLEMENT_OWN_CREDENTIAL_FILE",
     "ENTITLEMENT_SOURCES",
