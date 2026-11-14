@@ -720,7 +720,7 @@ ACP_BACKEND_FORBIDDEN_MODES: dict = {
 #: (``test/fixtures/acp_frames/antigravity/turn-live-*.jsonl``) and shows which
 #: kinds ask there: ``execute`` (three calls), ``edit`` (one) and an MCP-marked
 #: call (``turn-live-mcp.jsonl``) each raised ``session/request_permission``, and
-#: every ``read`` -- two of them reaching ``completed`` -- raised none, which is
+#: every ``read`` -- three of them reaching ``completed`` -- raised none, which is
 #: why the read kinds stay out. Two ``other`` calls that were NOT MCP-marked asked
 #: as well (``invoke_subagent``, ``run_workflow``); ``other`` is still left out,
 #: because it is the kind a harness also uses for tools that legitimately run
