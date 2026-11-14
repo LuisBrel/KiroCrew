@@ -1120,7 +1120,8 @@ environment (`STRANDS_CLI_MCP_DISCOVERY=off`, `STRANDS_CLI_SKILL_DISCOVERY=off`)
 ## Worked example: Google Antigravity
 
 The run to read for a two-file distribution, a permission mode that can be switched
-off from the harness, and evidence that stops honestly before authentication. It is
+off from the harness, and a signed-in turn that shows which calls ask and which do
+not. It is
 in `ACP_BACKENDS_KNOWN` and it is selectable.
 
 | Stage | State |
@@ -1132,7 +1133,7 @@ in `ACP_BACKENDS_KNOWN` and it is selectable.
 | 5 auth declaration | Done — `own_credential_file`, the consumer and business token leaves under `~/.gemini/antigravity-acp/`, `GEMINI_HOME` re-anchored, and both leaves listed as adapter-owned and masked from agent files. `settings.json` is not a credential leaf: the 1.4.4 runtime holds only `auth.type` and `gcp.project`/`gcp.location` there, and API-key auth reads `GEMINI_API_KEY` from the launch environment. |
 | 6 install probe | Done — `agent_sdk/backend_install.py` names whichever archive member is absent; the run installs the `1.4.4` archive rather than accepting the interactive `agy` TUI as a substitute. |
 | 7 selectability | **Selectable**, on `Routing.SESSION_CONFIG`. Crew writes `mode=default` before the first prompt, refuses a session that does not advertise it, and stops a live session moved to `auto_edit` or `yolo`. |
-| 8 live spill | Partial by design. A live handshake, `session/new`, `session/load`, config-option writes and stdio MCP startup were captured. A stdio server was asked `server/discover` and `tools/list`. The required turn classes use a clearly labelled synthesized carrier because no authenticated Google account was available; no live model completion, authenticated tool result or total zero-tool ban is claimed. |
+| 8 live spill | Done. A live handshake, `session/new`, `session/load`, config-option writes and stdio MCP startup were captured. A stdio server was asked `server/discover` and `tools/list`. One signed-in session supplies every required turn class: shell, read, edit, refused calls and a stdio MCP call (`turn-live-tools`, `turn-live-refused`, `turn-live-mcp`). No total zero-tool ban is claimed, because that session's file reads ran without a permission request. |
 | verified range | Antigravity ACP **1.4.4** exactly. The handshake, mode and config-option read-back fail closed on another release, so each new release is refused until a change re-verifies its handshake and bumps `ANTIGRAVITY_VERIFIED_VERSION`; that is an ongoing maintenance cost, the same as Copilot's pin. The registry lists only `1.4.5`, which the pin refuses, so the install hint and the refusal message name the exact `1.4.4` archives on `dl.google.com` instead of the registry page, and say that Kiro Crew verifies `1.4.4` only and refuses other versions until they are verified. The backend card shows that hint as its install command (`install_command` in `dashboard/handlers/acp_backend_status.py`). Enterprise authentication policy remains unmeasured and is not claimed as verified enforcement. |
 
 Three things this run produced that the checklist did not ask for.
@@ -1152,13 +1153,18 @@ too, after that call ran (`ACP_BACKEND_MUST_ASK_TOOL_KINDS`, checked by
 `_tripwire_unasked_call`), and
 the prompt-command allowlist admits only `plan` and `usage`, so `/logout` cannot
 arrive through channel or subagent text. `default` advertises the prompt flow, but
-until an authenticated turn proves every native and MCP call asks, Crew does not
-claim that this harness can serve a `"tools": []` worker.
+a signed-in turn ran every file read without asking, so Crew does not claim that
+this harness can serve a `"tools": []` worker.
 
 **The third is where the evidence ends.** Authentication methods, prompt modalities,
-MCP startup and model/thinking options came from the live 1.4.4 runtime. A completed
-turn needs a Google sign-in or API key, which was not used. The corpus therefore
-pins dispatch from a synthesized turn while the handshake beside it remains live.
-Enterprise policies that may auto-proceed some terminal tools were visible in the
+MCP startup and model/thinking options came from the live 1.4.4 runtime, and one
+signed-in session supplies the turn corpus. In it `execute`, `edit`, the MCP call
+and the two non-MCP `other` calls (`invoke_subagent`, `run_workflow`) asked, and
+every `read` ran unasked, so the sensitive-path check never sees an Antigravity
+read. A read outside the workspace was refused by the runtime's own
+allowed-workspace check before any tool call was sent. `run_workflow` runs the
+Python in its `Script` argument, which no command or path rule reads, so Crew
+refuses it as a shell call whose command cannot be verified
+(`antigravity_runs_program`). Enterprise policies that may auto-proceed some terminal tools were visible in the
 runtime's source strings but were not driven against an enterprise account, so the
 contribution must not describe them as accepted.

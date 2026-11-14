@@ -576,9 +576,11 @@ token is discovered, and its unattributable-overhead model.
 | Tool-call titles | prefixed `Reading `/`Running: ` | prefixed | the tool name; the permission request carries Crew's gate envelope | no prefix, so sensitive-path gates must run on every target (`hooks.py`) | unobserved whether codex-acp prefixes them; the gate does not depend on it, running every check on every target (`hooks.py`) | the tool name (`bash`), with the concrete command arriving in a later `tool_call_update` — so a title alone is not the command, and the dispatch parser reads `rawInput` for that | the tool name (`bash`), with the command on a later `tool_call_update`. The permission frame's own `rawInput` is `{}`, and the two frames arrived in either order, so OpenCode's one-frame shell deferral applies here too (`acp/client_turn.py`) | the command text itself for bash (`echo gate-check`), the tool name otherwise, with `rawInput` `null` on the bash `tool_call` frame — so the permission frame's envelope, not the tool_call frame, is where the gate reads the arguments from (`acp/_dispatch_parts/permission_requests.py`). The permission frame is not ordered against the adapter's own `tool_call` frames: captured both before the `tool_call` and after its `in_progress` update | a rendered pair, not a bare name: `shell · echo goose-wire-probe` for a builtin and `crew-probe: crew probe echo` for an MCP tool, with the structured command in `rawInput` on the same frame — so the title is human copy and the parser reads `rawInput` | no prefix: `bash`, `write` and `read` arrive bare | a human description of the call (`Write hi to made.txt`), with `rawInput.command` for a shell call | the command for exec calls, the tool name for MCP calls, and a generated `Run <tool>?` title for other native tools; the gate reads `rawInput` and harness metadata rather than relying on the title |
 
 **Antigravity evidence boundary:** its live handshake advertises the `default`
-permission prompt flow and Crew pins and reads that mode back. An authenticated turn
-proving every native and MCP call reaches `session/request_permission` has not been
-captured, so Crew does not claim `ACP_BACKENDS_HONOR_ZERO_TOOL_BAN` for Antigravity.
+permission prompt flow and Crew pins and reads that mode back. On a signed-in turn
+its file reads completed without reaching `session/request_permission`, so Crew does
+not claim `ACP_BACKENDS_HONOR_ZERO_TOOL_BAN` for Antigravity, and the sensitive-path
+check never sees an Antigravity read. `run_workflow`, which runs the Python in its
+`Script` argument, is refused as a shell call whose command cannot be verified.
 The model picker likewise reads the bare `configOptions.model` ids with effort in
 `thinking_level`; the combined `models.availableModels` spelling is not accepted by
 the model switch.

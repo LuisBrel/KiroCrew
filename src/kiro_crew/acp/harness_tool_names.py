@@ -248,7 +248,9 @@ ANTIGRAVITY_TOOL_IDS_BY_KIRO_TOOL: dict[str, tuple[str, ...]] = {
     "glob": ("find_by_name", "find_file", "search_directory"),
     "web_fetch": ("read_url_content",),
     "web_search": ("search_web",),
-    "use_subagent": ("start_subagent",),
+    # ``invoke_subagent`` is the name a signed-in 1.4.4 turn stated
+    # (``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl``).
+    "use_subagent": ("start_subagent", "invoke_subagent"),
 }
 
 #: ACP kinds Antigravity uses when its first tool frame carries no exact name.

@@ -89,7 +89,10 @@ class AntigravityMirror(AgentConfigMirror):
                 _D.TRANSLATED,
                 "into the shared server allowlist that decides which MCP servers enter "
                 "the array; native-tool restrictions continue through Crew's permission "
-                "gate rather than being projected into a second Antigravity setting",
+                "gate rather than being projected into a second Antigravity setting. "
+                "File reads are the exception: Antigravity 1.4.4 runs them without a "
+                "permission request, so the gate and its sensitive-path check never "
+                "see them",
             ),
             Concern.DENIED_TOOLS: Ruling(
                 _D.TRANSLATED,

@@ -335,10 +335,10 @@ def stated_harness_tool_name(backend: str, update: dict[str, Any]) -> str:
 #:
 #: What the lists do NOT cover was seen there too:
 #: ``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl`` shows
-#: ``run_workflow`` stating its program under ``Script`` on a ``kind: other`` call.
-#: That name matches neither the command parts nor the path parts, so such a call
-#: arrives at :func:`antigravity_gate_params` with no command, and with a ``path``
-#: only from its separate ``Cwd`` argument -- never the file its program names.
+#: ``run_workflow`` stating a Python program under ``Script`` on a ``kind: other``
+#: call. No command or path rule reads a program, so such a call never reaches
+#: :func:`antigravity_gate_params`: :func:`antigravity_runs_program` marks it, and
+#: the permission parser refuses it as a shell call whose command cannot be verified.
 #:
 #: The shared readers look for neither spelling: they read ``command`` and the
 #: ``TARGET_PATH_KEYS`` spellings (``path``, ``file_path``, ``filePath``,
@@ -510,6 +510,51 @@ def antigravity_gate_params(params: dict[str, Any] | None, *, shell: bool) -> di
         ]
         out["path"] = merged if isinstance(prior, list) or len(merged) > 1 else merged[0]
     return out
+
+
+#: Antigravity tools that run a program from their arguments: ``run_workflow`` runs
+#: the Python in its ``Script`` argument (seen live in
+#: ``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl``). An argument
+#: named like a script marks any other tool the same way; over-reading only refuses.
+_ANTIGRAVITY_PROGRAM_TOOLS = frozenset({"run_workflow"})
+_ANTIGRAVITY_PROGRAM_NAME_PARTS = ("script",)
+#: What a program call keeps for the refusal and its display: the program, its
+#: paths and the stated purpose. Nothing that could read as a command survives.
+_ANTIGRAVITY_PROGRAM_KEPT_NAME_PARTS = (
+    *_ANTIGRAVITY_PROGRAM_NAME_PARTS,
+    *_ANTIGRAVITY_PATH_NAME_PARTS,
+    "description",
+)
+
+
+def antigravity_runs_program(params: object, tool_name: str) -> bool:
+    """True when an Antigravity call runs a program no command or path rule reads.
+
+    *tool_name* is the name the call's ``tool_call`` frame stated. Either signal is
+    enough: the stated name, or any argument named like a script.
+    """
+    if tool_name in _ANTIGRAVITY_PROGRAM_TOOLS:
+        return True
+    return isinstance(params, dict) and any(
+        _antigravity_name_has(key, _ANTIGRAVITY_PROGRAM_NAME_PARTS) for key in params
+    )
+
+
+def antigravity_program_params(params: object) -> dict[str, Any]:
+    """A program call's arguments with every one that could supply a command removed.
+
+    The call is judged as a shell call, and a shell call's command is read from its
+    arguments (``command``, or a ``service_name``/``operation_name`` pair). Keeping
+    only the program, path and purpose arguments leaves it no command, so the
+    unverifiable-shell tier refuses it on every approval policy. Returns a copy.
+    """
+    if not isinstance(params, dict):
+        return {}
+    return {
+        key: value
+        for key, value in params.items()
+        if _antigravity_name_has(key, _ANTIGRAVITY_PROGRAM_KEPT_NAME_PARTS)
+    }
 
 
 class _MetaIdentityChannel(NamedTuple):

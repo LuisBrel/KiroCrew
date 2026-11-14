@@ -516,9 +516,11 @@ def _antigravity_permission_event(
     with_tool_input: bool = False,
     inline: bool = False,
     backend: str = ACP_BACKEND_ANTIGRAVITY,
+    stated_tool: str = "",
 ):
     """*with_tool_input* also fills the rendered-input caches as the tool_call parser
-    does; *inline* puts the arguments on the permission frame and caches no params."""
+    does; *inline* puts the arguments on the permission frame and caches no params;
+    *stated_tool* is the tool name the call's tool_call frame stated."""
     from kiro_crew.acp._dispatch_parts.permission_requests import build_permission_event
 
     tool_call = {"toolCallId": "call-1", "title": "x y", "kind": kind}
@@ -542,6 +544,7 @@ def _antigravity_permission_event(
         shell_cache={"call-1": shell},
         raw_params_cache=None if inline else {"call-1": raw_input},
         mcp_server_name_cache={"call-1": mcp_server} if mcp_server else None,
+        harness_tool_name_cache={"call-1": stated_tool} if stated_tool else None,
         harness_backend=backend,
     )
     assert event is not None
@@ -871,6 +874,166 @@ def test_other_backends_keep_unlisted_arguments_as_sent(backend: str) -> None:
     event = _antigravity_permission_event(raw, kind="execute", shell=True, backend=backend)
 
     assert event.raw_tool_params == raw
+
+
+#: The ``run_workflow`` arguments a signed-in 1.4.4 turn sent, paths shortened
+#: (``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl``).
+_RUN_WORKFLOW_INPUT = {
+    "Cwd": "/w",
+    "Description": "List files in directory",
+    "Script": "import os\nprint(os.listdir('/w'))\n",
+    "WaitMsBeforeAsync": 5000,
+}
+
+
+@pytest.mark.parametrize("source", _ANTIGRAVITY_INPUT_PATHS)
+@pytest.mark.parametrize(
+    ("raw", "stated_tool"),
+    [
+        pytest.param(_RUN_WORKFLOW_INPUT, "run_workflow", id="live-call"),
+        pytest.param({"Cwd": "/w"}, "run_workflow", id="stated-name-only"),
+        pytest.param(_RUN_WORKFLOW_INPUT, "", id="script-argument-only"),
+        pytest.param({**_RUN_WORKFLOW_INPUT, "command": "printf ok"}, "run_workflow", id="command"),
+        pytest.param(
+            {**_RUN_WORKFLOW_INPUT, "CommandLine": "printf ok", "command_line": "printf ok"},
+            "run_workflow",
+            id="command-spellings",
+        ),
+        pytest.param(
+            {**_RUN_WORKFLOW_INPUT, "service_name": "s3", "operation_name": "ls"},
+            "run_workflow",
+            id="aws-pair",
+        ),
+    ],
+)
+def test_antigravity_program_call_is_refused_as_an_unverifiable_shell_call(
+    raw: dict, stated_tool: str, source: dict
+) -> None:
+    """``run_workflow`` runs Python, which no command or path rule reads. The gate
+    refuses it before any grant, and no other argument can hand the gate a command
+    to judge in the program's place."""
+    from kiro_crew.hook_runtime.tool_identity import ToolCall, hook_gate_kwargs
+    from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
+
+    original = dict(raw)
+    event = _antigravity_permission_event(
+        raw, kind="other", shell=False, stated_tool=stated_tool, **source
+    )
+
+    assert event.is_shell is True
+    assert event.shell_command is None
+    assert ToolCall.from_event(event).command is None
+    assert raw == original
+    decision = HookManager(HooksConfig(auto_approve_tools=["x y"])).on_tool_call(
+        event.title, **hook_gate_kwargs(event)
+    )
+    assert decision.action == TOOL_DENY
+    assert "shell command could not be verified" in (decision.reason or "")
+
+
+def test_the_live_run_workflow_call_is_refused_through_the_client() -> None:
+    """The recorded frames themselves: the tool_call names ``run_workflow`` in its
+    ``Run <name>?`` title, and its permission request is refused by the gate."""
+    from kiro_crew.hook_runtime.tool_identity import hook_gate_kwargs
+    from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
+
+    fixture = Path(__file__).parent / "fixtures/acp_frames/antigravity/turn-live-refused.jsonl"
+    frames = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()[1:]]
+    call = next(
+        f
+        for f in frames
+        if f.get("method") == "session/update"
+        and f["params"]["update"].get("title") == "Run run_workflow?"
+    )
+    call_id = call["params"]["update"]["toolCallId"]
+    ask = next(
+        f
+        for f in frames
+        if f.get("method") == "session/request_permission"
+        and f["params"]["toolCall"]["toolCallId"] == call_id
+    )
+    client = _mcp_client()
+    client._extract_tool_event(JsonRpcMessage.from_dict(call))
+    event = client._build_permission_event(JsonRpcMessage.from_dict(ask))
+
+    assert event is not None
+    assert event.is_shell is True and event.shell_command is None
+    assert "Script" in (event.raw_tool_params or {})
+    decision = HookManager(HooksConfig()).on_tool_call(event.title, **hook_gate_kwargs(event))
+    assert decision.action == TOOL_DENY
+    assert "shell command could not be verified" in (decision.reason or "")
+
+
+def test_antigravity_program_call_keeps_the_program_for_its_refusal() -> None:
+    event = _antigravity_permission_event(
+        {**_RUN_WORKFLOW_INPUT, "command": "printf ok"},
+        kind="other",
+        shell=False,
+        stated_tool="run_workflow",
+    )
+
+    assert event.raw_tool_params == {
+        "Cwd": "/w",
+        "Description": "List files in directory",
+        "Script": _RUN_WORKFLOW_INPUT["Script"],
+    }
+    assert "printf ok" not in (event.tool_input or "")
+    assert "os.listdir" in (event.tool_input or "")
+
+
+@pytest.mark.asyncio
+async def test_antigravity_program_call_is_refused_under_auto_approve() -> None:
+    from unittest.mock import MagicMock, patch
+
+    import kiro_crew.sel as sel_mod
+    from kiro_crew.llm_helpers import ToolApprovalPolicy, _resolve_permission
+    from kiro_crew.providers.acp_turns import _to_llm_event
+
+    provider = SimpleNamespace(approve_tool=AsyncMock(), reject_tool=AsyncMock())
+    event = _antigravity_permission_event(
+        _RUN_WORKFLOW_INPUT, kind="other", shell=False, stated_tool="run_workflow"
+    )
+    with patch.object(sel_mod, "sel", lambda: MagicMock()):
+        approved = await _resolve_permission(
+            provider,  # type: ignore[arg-type]
+            _to_llm_event(event),
+            ToolApprovalPolicy.AUTO_APPROVE,
+            None,
+        )
+
+    assert approved is False
+    provider.approve_tool.assert_not_awaited()
+    provider.reject_tool.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stated_tool", ["", "invoke_subagent"])
+def test_antigravity_call_with_no_program_is_not_made_a_shell_call(stated_tool: str) -> None:
+    raw = {"Subagents": [{"Prompt": "count the files"}]}
+    event = _antigravity_permission_event(raw, kind="other", shell=False, stated_tool=stated_tool)
+
+    assert event.is_shell is False
+    assert event.raw_tool_params == raw
+
+
+@pytest.mark.parametrize("backend", ["", "copilot"])
+def test_other_backends_keep_a_script_argument_off_the_shell_path(backend: str) -> None:
+    event = _antigravity_permission_event(
+        dict(_RUN_WORKFLOW_INPUT),
+        kind="other",
+        shell=False,
+        stated_tool="run_workflow",
+        backend=backend,
+    )
+
+    assert event.is_shell is False
+    assert event.raw_tool_params == _RUN_WORKFLOW_INPUT
+
+
+def test_antigravity_subagent_tool_is_named_as_kiro_clis_use_subagent() -> None:
+    from kiro_crew.acp.harness_tool_names import harness_tool_match_names
+
+    assert "use_subagent" in (harness_tool_match_names("antigravity#invoke_subagent") or ())
+    assert "use_subagent" in (harness_tool_match_names("antigravity#start_subagent") or ())
 
 
 # --- The unasked-call tripwire (``ACP_BACKEND_MUST_ASK_TOOL_KINDS``) -------------------

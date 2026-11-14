@@ -31,6 +31,8 @@ from kiro_crew.acp._dispatch_parts.tool_call_identity import (
     _permission_tool_id,
     antigravity_command_conflict,
     antigravity_gate_params,
+    antigravity_program_params,
+    antigravity_runs_program,
     is_shell_kind,
 )
 from kiro_crew.acp._dispatch_parts.tool_call_provenance import scoped_tool_cache_key
@@ -1009,7 +1011,25 @@ def build_permission_event(
     # Antigravity names its command and file targets with keys the gate does not
     # read; this adds the names it does (a copy, so the cached params stay as sent).
     # Not for an MCP call, whose arguments are the tool's own.
-    if harness_backend == ACP_BACKEND_ANTIGRAVITY and not _cached_server:
+    _antigravity_stated_tool = (
+        harness_tool_name_cache.get(_ck, "")
+        if harness_tool_name_cache is not None and tool_call_id
+        else ""
+    )
+    if (
+        harness_backend == ACP_BACKEND_ANTIGRAVITY
+        and not _cached_server
+        and antigravity_runs_program(_resolved_raw_params, _antigravity_stated_tool)
+    ):
+        # A program no command or path rule reads (``run_workflow``'s Python) is
+        # judged as a shell call with no command the gate can verify, which the
+        # unverifiable-shell tier refuses on every approval policy. The arguments
+        # that could supply a command are dropped, so none stands in for the program.
+        is_shell = True
+        _resolved_raw_params = antigravity_program_params(_resolved_raw_params)
+        tool_input = redact_text(_dumps_degraded(_resolved_raw_params, indent=2))
+        tool_input_redacted = True
+    elif harness_backend == ACP_BACKEND_ANTIGRAVITY and not _cached_server:
         _stated_params = _resolved_raw_params
         _resolved_raw_params = antigravity_gate_params(_resolved_raw_params, shell=is_shell)
         if is_shell and tool_input:

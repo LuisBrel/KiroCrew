@@ -430,6 +430,6 @@ ACP_BACKENDS_FORK_AT_MESSAGE = frozenset({ACP_BACKEND_CLAUDE})
 #
 # antigravity is NOT a member: membership needs a capture of the disposal error and
 # of a ``session/load`` in a second process, and Antigravity ACP 1.4.4 has neither
-# (no cancelled or authenticated turn was captured, ``test/fixtures/acp_frames/
-# antigravity/``), so its prompt errors stay ordinary turn failures.
+# (no cancelled turn was captured, ``test/fixtures/acp_frames/antigravity/``), so its
+# prompt errors stay ordinary turn failures.
 ACP_BACKENDS_RELOAD_DISPOSED_SESSION = frozenset({ACP_BACKEND_STRANDS})

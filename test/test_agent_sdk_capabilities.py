@@ -697,10 +697,9 @@ def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
     # ``_deny_zero_tools`` sees each one. Copilot CLI 1.0.100 reads a file inside the
     # session's own directory without asking (measured, see the set's comment), so a
     # total ban cannot be honoured there even though the three facts hold.
-    reads_unasked = {sdk_backends.ACP_BACKEND_COPILOT}
-    # Antigravity advertises the default permission flow, but no authenticated turn
-    # proves every native and MCP call asks, so its ban is not claimed.
-    asks_unproven = {sdk_backends.ACP_BACKEND_ANTIGRAVITY}
+    # Antigravity ACP 1.4.4 ran every file read of a signed-in turn without asking
+    # (``acp_frames/antigravity/turn-live-tools.jsonl``).
+    reads_unasked = {sdk_backends.ACP_BACKEND_COPILOT, sdk_backends.ACP_BACKEND_ANTIGRAVITY}
     # A second ground, beside the refusal: a zero-tool session that MOUNTS NO TOOL,
     # so no call exists for a pre-approval to run. claude's session options carry an
     # empty ``tools`` with ``strictMcpConfig`` and an empty wire array, measured on
@@ -719,7 +718,6 @@ def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
                 and backend not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
                 and backend not in reads_unasked
                 and backend not in sdk_backends.ACP_BACKENDS_UNASKED_NATIVE_TOOLS
-                and backend not in asks_unproven
             )
         )
         actual = backend in sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN

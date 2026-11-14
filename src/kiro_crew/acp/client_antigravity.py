@@ -3,8 +3,8 @@
 The standalone Antigravity runtime advertises its per-tool permission flow in
 ``default`` mode on release 1.4.4, while ``auto_edit`` and ``yolo`` suppress
 those requests. Crew pins the verified release at the handshake so a later
-runtime cannot silently change the wire shape it checks. An authenticated turn
-proving every native and MCP call asks has not been captured.
+runtime cannot silently change the wire shape it checks. A signed-in 1.4.4 turn
+showed that file reads run without asking.
 """
 
 from __future__ import annotations

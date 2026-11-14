@@ -12,9 +12,9 @@ Antigravity advertises the per-tool ``session/request_permission`` flow in its
 default mode. Crew writes that mode after ``session/new`` and ``session/load``
 through the shared ``Routing.SESSION_CONFIG`` path. The harness also offers
 ``auto_edit`` and ``yolo``; both suppress permission requests in the harness
-itself, so Crew refuses either as a mid-session configuration change. An
-authenticated turn proving every native and MCP call takes the default flow has
-not been captured, so the adapter does not claim a zero-tool contract.
+itself, so Crew refuses either as a mid-session configuration change. A
+signed-in 1.4.4 turn showed that file reads run without a permission request in
+the default flow, so the adapter does not claim a zero-tool contract.
 """
 
 from __future__ import annotations

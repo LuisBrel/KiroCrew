@@ -435,12 +435,12 @@ ACP_BACKENDS_UNASKED_NATIVE_TOOLS = frozenset({ACP_BACKEND_MIMOCODE})
 # mirrored, enforced and served by ``AcpClient``, but its ``memory``, ``history``
 # and ``task`` tools never ask.
 #
-# antigravity is NOT a member yet although its routing is enforced and it is
-# ``AcpClient``-served: no authenticated turn has shown that every native and MCP
-# call reaches ``session/request_permission``. Its live handshake advertises the
-# ``default`` permission flow, but an advertisement is not a completed turn. The
-# knowledge/research pool therefore does not select it as a zero-tool-safe worker
-# until a live zero-tool capture lands.
+# antigravity is NOT a member although its routing is enforced and it is
+# ``AcpClient``-served: on a signed-in 1.4.4 turn its file reads completed without
+# reaching ``session/request_permission``
+# (``test/fixtures/acp_frames/antigravity/turn-live-tools.jsonl``), so a refusal at
+# the permission request never meets them. The knowledge/research pool therefore
+# does not select it as a zero-tool-safe worker.
 ACP_BACKENDS_HONOR_ZERO_TOOL_BAN = (
     frozenset(
         {
