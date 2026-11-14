@@ -322,11 +322,29 @@ def stated_harness_tool_name(backend: str, update: dict[str, Any]) -> str:
 #: strings in the helper ``localharness_external.exe`` only (none is a whole token
 #: in ``agy_acp_server.exe``, and ``search_path`` is not one in the helper either);
 #: on macOS and Linux they are in both executables. The counts are the same in
-#: 1.4.4 and 1.4.5. They have not yet been seen on the wire. The shared readers
-#: look for neither: they read ``command`` and the ``TARGET_PATH_KEYS`` spellings
-#: (``path``, ``file_path``, ``filePath``, ``targetFile``). The runtime defines
-#: more argument names than these, so the lists are not trusted to be complete:
-#: any argument NAMED like a path or a command is read too (below).
+#: 1.4.4 and 1.4.5.
+#:
+#: CONFIRMED ON THE WIRE, on the signed-in 1.4.4 turns in
+#: ``test/fixtures/acp_frames/antigravity/turn-live-tools.jsonl``: a shell call
+#: states ``CommandLine`` beside ``Cwd``; an edit states ``TargetFile`` beside
+#: ``TargetContent`` and the ``StartLine``/``EndLine`` pair, and repeats the edited
+#: path in the frame's ``locations[].path`` and ``content[].path``. A ``read``
+#: states ``file_path`` -- NOT listed below, and caught by the name rule instead --
+#: and that capture's reads raised no ``session/request_permission`` at all, so a
+#: read's path never reaches this gate there.
+#:
+#: What the lists do NOT cover was seen there too:
+#: ``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl`` shows
+#: ``run_workflow`` stating its program under ``Script`` on a ``kind: other`` call.
+#: That name matches neither the command parts nor the path parts, so such a call
+#: arrives at :func:`antigravity_gate_params` with no command, and with a ``path``
+#: only from its separate ``Cwd`` argument -- never the file its program names.
+#:
+#: The shared readers look for neither spelling: they read ``command`` and the
+#: ``TARGET_PATH_KEYS`` spellings (``path``, ``file_path``, ``filePath``,
+#: ``targetFile``). The runtime defines more argument names than these, so the
+#: lists are not trusted to be complete: any argument NAMED like a path or a
+#: command is read too (below).
 _ANTIGRAVITY_COMMAND_KEYS = ("CommandLine", "command_line")
 _ANTIGRAVITY_PATH_KEYS = (
     "AbsolutePath",
@@ -456,7 +474,9 @@ def antigravity_gate_params(params: dict[str, Any] | None, *, shell: bool) -> di
     Without this a shell call carries no ``command`` and the unverifiable-shell tier
     refuses it, and a file tool carries no path the sensitive-path check can see.
     Returns a copy; the cached trusted params are never edited. The spellings were
-    read from the pinned runtime's strings, not from a signed-in session.
+    read from the pinned runtime's strings and then seen on a signed-in 1.4.4 turn:
+    ``CommandLine`` reaches ``command`` and ``TargetFile`` reaches ``path``
+    (``test/fixtures/acp_frames/antigravity/turn-live-tools.jsonl``).
 
     ``command`` is set only on a shell call (*shell*), and only when every spelling
     present, an existing ``command`` included, states the same string. Any
@@ -602,6 +622,9 @@ _MCP_IDENTITY_META_CHANNELS: tuple[_MetaIdentityChannel, ...] = (
     # Google Antigravity states an MCP call in the tool frame's ``_meta.mcp``
     # object. Both halves are harness-authored; eager MCP tools carry the same
     # pair, so an identity does not depend on the dispatch-envelope spelling.
+    # Captured live in ``test/fixtures/acp_frames/antigravity/turn-live-mcp.jsonl``:
+    # a ``probe`` stdio server's ``echo_probe``, its arguments under
+    # ``rawInput.arguments`` and repeated flat on ``rawInput``.
     # Bounded like the KAS row: the client caches both halves per open call for
     # the permission event, so an unbounded half would be held at whatever size
     # the frame sent for as long as the call stays open. A half over the bound

@@ -1114,7 +1114,13 @@ async def test_a_process_kept_after_failed_tree_cleanup_keeps_its_asks(unasked) 
 
 @pytest.mark.asyncio
 async def test_a_denied_call_that_reports_completed_is_not_read_as_unasked(unasked) -> None:
-    """How 1.4.4 reports a rejected call is not captured, so a denial is still an ask."""
+    """A denial is still an ask, and a later report must not read as unasked.
+
+    Live 1.4.4 reports a rejected call as a ``tool_call_update`` whose status is
+    ``failed`` (``test/fixtures/acp_frames/antigravity/turn-live-refused.jsonl``),
+    so this guards the shape the runtime has not been seen to send rather than one
+    it did.
+    """
     build, _ = unasked
     client = build()
     client._send_response = AsyncMock()
