@@ -715,10 +715,18 @@ ACP_BACKEND_FORBIDDEN_MODES: dict = {
 #: for a call the harness marks as an MCP call (``_meta.is_mcp_tool_call`` or
 #: ``_meta.mcp``), whatever its ``kind``. Read-only kinds are left out on purpose:
 #: Antigravity 1.4.4's ``default`` mode is described only as the "Default
-#: permission prompt flow", no signed-in capture shows which kinds it asks for, and
-#: a read that runs unasked must not end a healthy session. ``execute`` and the
-#: MCP call are pinned by ``test/fixtures/acp_frames/antigravity/turn-synthesized.jsonl``;
-#: the rest are inferred, so this is the one row to change when a capture lands.
+#: permission prompt flow", and a read that runs unasked must not end a healthy
+#: session. A signed-in 1.4.4 turn has since been captured
+#: (``test/fixtures/acp_frames/antigravity/turn-live-*.jsonl``) and shows which
+#: kinds ask there: ``execute`` (three calls), ``edit`` (one) and an MCP-marked
+#: call (``turn-live-mcp.jsonl``) each raised ``session/request_permission``, and
+#: every ``read`` -- two of them reaching ``completed`` -- raised none, which is
+#: why the read kinds stay out. Two ``other`` calls that were NOT MCP-marked asked
+#: as well (``invoke_subagent``, ``run_workflow``); ``other`` is still left out,
+#: because it is the kind a harness also uses for tools that legitimately run
+#: unasked, so adding it is a decision to make against the capture rather than a
+#: fact the capture settles. ``delete``, ``move`` and ``fetch`` remain inferred:
+#: no live call of those kinds was recorded.
 ACP_BACKEND_MUST_ASK_TOOL_KINDS: dict = {
     ACP_BACKEND_ANTIGRAVITY: frozenset({"execute", "edit", "delete", "move", "fetch", "mcp"}),
 }
